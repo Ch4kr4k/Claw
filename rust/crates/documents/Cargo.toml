@@ -1,0 +1,21 @@
+[package]
+name = "documents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+calamine = { version = "0.36", features = ["dates"] }
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+pdf-extract = "0.12"
+quick-xml = "0.41"
+serde_json.workspace = true
+umya-spreadsheet = "3"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+target/
+.omx/
+.clawd-agents/
+# Claw Code local artifacts
+.claw/settings.local.json
+.claw/sessions/
+.clawhip/
+.sandbox-home/
+.sandbox-tmp/
+.claude/sessions/
+.claw-rag/

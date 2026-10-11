@@ -1,0 +1,572 @@
+//! Interactive picker for the `AskUserQuestion` tool, like Claude Code's:
+//! the model asks a question with options (its recommendation marked), the
+//! user picks one with the arrow keys or a number, ticks several in
+//! multi-select mode, or types an answer of their own.
+//!
+//! Key handling ([`Picker::handle_key`]) is separate from drawing so it can
+//! be tested without a terminal.
+
+use std::io::{self, IsTerminal, Write};
+
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
+use runtime::turn_keys::screen;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::render::{current_theme, ThemeName, OUTPUT_MARGIN};
+
+const OTHER_LABEL: &str = "Type something else…";
+const RECOMMENDED_SUFFIX: &str = "(Recommended)";
+
+/// The tool input. `options` items may be plain strings or objects.
+#[derive(Debug, Deserialize)]
+pub struct AskInput {
+    pub question: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<AskOptionInput>,
+    #[serde(default, alias = "multiSelect")]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AskOptionInput {
+    Label(String),
+    Detailed {
+        label: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        recommended: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Choice {
+    label: String,
+    description: Option<String>,
+    recommended: bool,
+}
+
+impl From<AskOptionInput> for Choice {
+    fn from(option: AskOptionInput) -> Self {
+        let (label, description, recommended) = match option {
+            AskOptionInput::Label(label) => (label, None, false),
+            AskOptionInput::Detailed {
+                label,
+                description,
+                recommended,
+            } => (label, description, recommended),
+        };
+        let marked = label.trim_end().ends_with(RECOMMENDED_SUFFIX);
+        let label = label
+            .trim_end()
+            .trim_end_matches(RECOMMENDED_SUFFIX)
+            .trim_end()
+            .to_string();
+        Self {
+            label,
+            description: description.filter(|d| !d.trim().is_empty()),
+            recommended: recommended || marked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Chosen(Vec<String>),
+    Typed(String),
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyOutcome {
+    Continue,
+    Done(Answer),
+}
+
+/// What is shown and selected. The last row is always "Type something else".
+struct Picker {
+    header: Option<String>,
+    question: String,
+    choices: Vec<Choice>,
+    multi: bool,
+    cursor: usize,
+    checked: Vec<bool>,
+    /// `Some` while the user types a custom answer.
+    typing: Option<String>,
+}
+
+impl Picker {
+    fn new(input: AskInput) -> Self {
+        let choices = input
+            .options
+            .into_iter()
+            .map(Choice::from)
+            .collect::<Vec<_>>();
+        let cursor = choices.iter().position(|c| c.recommended).unwrap_or(0);
+        let checked = vec![false; choices.len()];
+        let typing = choices.is_empty().then(String::new);
+        Self {
+            header: input.header.filter(|h| !h.trim().is_empty()),
+            question: input.question,
+            multi: input.multi_select && !choices.is_empty(),
+            cursor,
+            checked,
+            choices,
+            typing,
+        }
+    }
+
+    /// Rows the cursor can be on: the choices plus "Type something else".
+    fn rows(&self) -> usize {
+        self.choices.len() + 1
+    }
+
+    fn is_other(&self, row: usize) -> bool {
+        row == self.choices.len()
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> KeyOutcome {
+        if key.kind == KeyEventKind::Release {
+            return KeyOutcome::Continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('c' | 'd')) {
+            return KeyOutcome::Done(Answer::Cancelled);
+        }
+        if let Some(text) = &mut self.typing {
+            match key.code {
+                KeyCode::Enter if !text.trim().is_empty() => {
+                    return KeyOutcome::Done(Answer::Typed(text.trim().to_string()));
+                }
+                KeyCode::Esc if self.choices.is_empty() => {
+                    return KeyOutcome::Done(Answer::Cancelled);
+                }
+                KeyCode::Esc => self.typing = None,
+                KeyCode::Backspace => {
+                    text.pop();
+                }
+                KeyCode::Char('u') if ctrl => text.clear(),
+                KeyCode::Char(ch) if !ctrl => text.push(ch),
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor = (self.cursor + self.rows() - 1) % self.rows();
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                self.cursor = (self.cursor + 1) % self.rows();
+            }
+            KeyCode::Char(digit @ '1'..='9') => {
+                let row = digit as usize - '1' as usize;
+                if row < self.rows() {
+                    self.cursor = row;
+                    if !self.multi {
+                        return self.select();
+                    }
+                    return self.toggle();
+                }
+            }
+            KeyCode::Char(' ') if self.multi => return self.toggle(),
+            KeyCode::Enter => return self.select(),
+            KeyCode::Esc => return KeyOutcome::Done(Answer::Cancelled),
+            _ => {}
+        }
+        KeyOutcome::Continue
+    }
+
+    fn toggle(&mut self) -> KeyOutcome {
+        if self.is_other(self.cursor) {
+            self.typing = Some(String::new());
+        } else {
+            self.checked[self.cursor] = !self.checked[self.cursor];
+        }
+        KeyOutcome::Continue
+    }
+
+    fn select(&mut self) -> KeyOutcome {
+        if self.is_other(self.cursor) {
+            self.typing = Some(String::new());
+            return KeyOutcome::Continue;
+        }
+        if self.multi {
+            let chosen = self
+                .choices
+                .iter()
+                .zip(&self.checked)
+                .filter(|(_, checked)| **checked)
+                .map(|(choice, _)| choice.label.clone())
+                .collect::<Vec<_>>();
+            if chosen.is_empty() {
+                // Enter with nothing ticked picks the highlighted option.
+                return KeyOutcome::Done(Answer::Chosen(vec![self.choices[self.cursor]
+                    .label
+                    .clone()]));
+            }
+            return KeyOutcome::Done(Answer::Chosen(chosen));
+        }
+        KeyOutcome::Done(Answer::Chosen(vec![self.choices[self.cursor]
+            .label
+            .clone()]))
+    }
+
+    /// The picker's screen lines (without the left margin), fitted to `width`.
+    fn lines(&self, width: usize, colored: bool) -> Vec<String> {
+        let paint = |style: &str, text: &str| {
+            if colored {
+                format!("{style}{text}\x1b[0m")
+            } else {
+                text.to_string()
+            }
+        };
+        let fit = |text: &str, room: usize| -> String {
+            if text.chars().count() <= room {
+                text.to_string()
+            } else {
+                let mut cut = text
+                    .chars()
+                    .take(room.saturating_sub(1))
+                    .collect::<String>();
+                cut.push('…');
+                cut
+            }
+        };
+        let mut lines = Vec::new();
+        let header = self
+            .header
+            .as_ref()
+            .map(|h| format!("[{}] ", fit(h, 16)))
+            .unwrap_or_default();
+        let question_room = width.saturating_sub(header.chars().count());
+        let mut question_lines = wrap_words(&self.question, question_room.max(10)).into_iter();
+        let first = question_lines.next().unwrap_or_default();
+        lines.push(format!(
+            "{}{}",
+            paint("\x1b[2m", &header),
+            paint("\x1b[1m", &first)
+        ));
+        for rest in question_lines {
+            lines.push(format!(
+                "{}{}",
+                " ".repeat(header.chars().count()),
+                paint("\x1b[1m", &rest)
+            ));
+        }
+        for row in 0..self.rows() {
+            let selected = row == self.cursor;
+            let pointer = if selected { "❯ " } else { "  " };
+            let checkbox = if self.multi && !self.is_other(row) {
+                if self.checked[row] {
+                    "[x] "
+                } else {
+                    "[ ] "
+                }
+            } else if self.multi {
+                "    "
+            } else {
+                ""
+            };
+            let (label, description) = if self.is_other(row) {
+                match (&self.typing, selected) {
+                    (Some(text), true) => (format!("> {text}▏"), None),
+                    _ => (OTHER_LABEL.to_string(), None),
+                }
+            } else {
+                let choice = &self.choices[row];
+                let label = if choice.recommended {
+                    format!("{} {RECOMMENDED_SUFFIX}", choice.label)
+                } else {
+                    choice.label.clone()
+                };
+                (label, choice.description.clone())
+            };
+            let number = format!("{}. ", row + 1);
+            let lead = format!("{pointer}{checkbox}{number}");
+            let room = width.saturating_sub(lead.chars().count());
+            let text = fit(&label, room);
+            let style = if selected { "\x1b[36m" } else { "" };
+            lines.push(paint(style, &format!("{lead}{text}")));
+            if let Some(description) = description {
+                let indent = " ".repeat(lead.chars().count());
+                let room = width.saturating_sub(indent.chars().count());
+                for line in wrap_words(&description, room.max(10)).into_iter().take(2) {
+                    lines.push(format!("{indent}{}", paint("\x1b[2m", &line)));
+                }
+            }
+        }
+        let hint = if self.typing.is_some() {
+            "type your answer · Enter send · Esc back"
+        } else if self.multi {
+            "↑↓ move · Space toggle · Enter confirm · Esc cancel"
+        } else {
+            "↑↓ move · Enter select · 1-9 jump · Esc cancel"
+        };
+        lines.push(paint("\x1b[2m", &fit(hint, width)));
+        lines
+    }
+}
+
+/// Splits `text` into lines of at most `width` characters at spaces.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// Shows the picker and returns the tool result for the model. Without a
+/// terminal it answers right away that nobody can be asked.
+pub fn ask_user(input: &Value) -> Result<String, String> {
+    let input: AskInput = serde_json::from_value(input.clone())
+        .map_err(|error| format!("invalid AskUserQuestion input: {error}"))?;
+    let question = input.question.clone();
+    if !io::stdin().is_terminal() || !runtime::turn_keys::stdout_is_terminal() {
+        return Ok(no_user_result(&question));
+    }
+    let _keys_paused = runtime::turn_keys::pause();
+    crate::render::stop_thinking();
+    let answer = run_picker(Picker::new(input)).map_err(|error| error.to_string())?;
+    Ok(answer_result(&question, &answer))
+}
+
+fn run_picker(mut picker: Picker) -> io::Result<Answer> {
+    let colored = current_theme() != ThemeName::None;
+    let mut stdout = io::stdout();
+    writeln!(stdout)?;
+    terminal::enable_raw_mode()?;
+    let result: io::Result<(Answer, usize)> = (|| {
+        let mut drawn = 0_usize;
+        loop {
+            let width = terminal::size().map_or(80, |(cols, _)| usize::from(cols));
+            let width = width.saturating_sub(2 * OUTPUT_MARGIN).max(20);
+            let lines = picker.lines(width, colored);
+            let mut frame = String::new();
+            if drawn > 0 {
+                frame.push_str(&format!("\x1b[{drawn}A"));
+            }
+            frame.push('\r');
+            for line in &lines {
+                frame.push_str(&format!("\x1b[2K{}{line}\r\n", " ".repeat(OUTPUT_MARGIN)));
+            }
+            // Clear rows left over from a taller previous frame.
+            for _ in lines.len()..drawn {
+                frame.push_str("\x1b[2K\r\n");
+            }
+            let extra = drawn.saturating_sub(lines.len());
+            if extra > 0 {
+                frame.push_str(&format!("\x1b[{extra}A"));
+            }
+            if drawn == 0 && screen::active() {
+                // Full-screen mode draws it in the bottom pane, cursor hidden.
+                frame.insert_str(0, "\x1b[?25l");
+            }
+            screen::write_pane(frame.as_bytes())?;
+            drawn = lines.len();
+            if let Event::Key(key) = event::read()? {
+                if let KeyOutcome::Done(answer) = picker.handle_key(key) {
+                    return Ok((answer, drawn));
+                }
+            }
+        }
+    })();
+    terminal::disable_raw_mode()?;
+    let (answer, drawn) = result?;
+    // Replace the picker with a one-line summary of the answer.
+    let summary = match &answer {
+        Answer::Chosen(labels) => format!("└ {}", labels.join(", ")),
+        Answer::Typed(text) => format!("└ {text}"),
+        Answer::Cancelled => "└ no answer".to_string(),
+    };
+    // The `[ask] question` tool line above already shows the question.
+    let summary = format!("{}\x1b[36m{summary}\x1b[0m\n", " ".repeat(OUTPUT_MARGIN));
+    let mut frame = String::new();
+    if screen::active() {
+        screen::clear_pane();
+    } else {
+        frame.push_str(&format!("\x1b[{drawn}A\r"));
+        for _ in 0..drawn {
+            frame.push_str("\x1b[2K\n");
+        }
+        frame.push_str(&format!("\x1b[{drawn}A\r"));
+    }
+    frame.push_str(&summary);
+    stdout.write_all(frame.as_bytes())?;
+    stdout.flush()?;
+    Ok(answer)
+}
+
+fn answer_result(question: &str, answer: &Answer) -> String {
+    let value = match answer {
+        Answer::Chosen(labels) => json!({
+            "question": question,
+            "answer": labels.join(", "),
+            "answers": labels,
+            "status": "answered",
+        }),
+        Answer::Typed(text) => json!({
+            "question": question,
+            "answer": text,
+            "custom": true,
+            "status": "answered",
+        }),
+        Answer::Cancelled => json!({
+            "question": question,
+            "answer": null,
+            "status": "cancelled",
+            "note": "The user dismissed the question. Do not ask it again right away; continue with a sensible default and say which one you chose, or ask in plain text.",
+        }),
+    };
+    serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
+fn no_user_result(question: &str) -> String {
+    serde_json::to_string_pretty(&json!({
+        "question": question,
+        "answer": null,
+        "status": "unavailable",
+        "note": "No interactive user is attached (non-terminal run). Choose the option you would recommend, say so in your reply, and continue.",
+    }))
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
+
+    use super::{Answer, AskInput, KeyOutcome, Picker};
+
+    fn picker(input: serde_json::Value) -> Picker {
+        Picker::new(serde_json::from_value::<AskInput>(input).expect("input"))
+    }
+
+    fn press(picker: &mut Picker, code: KeyCode) -> KeyOutcome {
+        picker.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn cursor_starts_on_the_recommended_option_and_enter_selects_it() {
+        let mut p = picker(json!({
+            "question": "Which database?",
+            "options": [
+                {"label": "SQLite", "description": "zero setup"},
+                {"label": "PostgreSQL", "recommended": true},
+            ]
+        }));
+        assert_eq!(p.cursor, 1);
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            KeyOutcome::Done(Answer::Chosen(vec!["PostgreSQL".to_string()]))
+        );
+    }
+
+    #[test]
+    fn recommended_suffix_in_a_plain_label_is_recognised() {
+        let p = picker(json!({"question": "q", "options": ["A", "B (Recommended)"]}));
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.choices[1].label, "B");
+        assert!(p.choices[1].recommended);
+    }
+
+    #[test]
+    fn number_keys_pick_directly() {
+        let mut p = picker(json!({"question": "q", "options": ["A", "B", "C"]}));
+        assert_eq!(
+            press(&mut p, KeyCode::Char('3')),
+            KeyOutcome::Done(Answer::Chosen(vec!["C".to_string()]))
+        );
+    }
+
+    #[test]
+    fn multi_select_toggles_checkboxes_and_returns_all_ticked() {
+        let mut p = picker(json!({
+            "question": "Which tests?",
+            "options": ["Unit", "Integration", "E2E"],
+            "multiSelect": true
+        }));
+        press(&mut p, KeyCode::Char(' '));
+        press(&mut p, KeyCode::Down);
+        press(&mut p, KeyCode::Down);
+        press(&mut p, KeyCode::Char(' '));
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            KeyOutcome::Done(Answer::Chosen(vec!["Unit".to_string(), "E2E".to_string()]))
+        );
+    }
+
+    #[test]
+    fn last_row_lets_the_user_type_their_own_answer() {
+        let mut p = picker(json!({"question": "q", "options": ["A", "B"]}));
+        press(&mut p, KeyCode::Up);
+        assert!(p.is_other(p.cursor));
+        press(&mut p, KeyCode::Enter);
+        for ch in "MySQL".chars() {
+            press(&mut p, KeyCode::Char(ch));
+        }
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            KeyOutcome::Done(Answer::Typed("MySQL".to_string()))
+        );
+    }
+
+    #[test]
+    fn esc_while_typing_goes_back_and_esc_again_cancels() {
+        let mut p = picker(json!({"question": "q", "options": ["A"]}));
+        press(&mut p, KeyCode::Char('2'));
+        assert!(p.typing.is_some());
+        assert_eq!(press(&mut p, KeyCode::Esc), KeyOutcome::Continue);
+        assert!(p.typing.is_none());
+        assert_eq!(
+            press(&mut p, KeyCode::Esc),
+            KeyOutcome::Done(Answer::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_question_without_options_is_a_text_box() {
+        let mut p = picker(json!({"question": "Project name?"}));
+        assert!(p.typing.is_some());
+        press(&mut p, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            KeyOutcome::Done(Answer::Typed("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn lines_show_recommendation_checkboxes_and_fit_the_width() {
+        let p = picker(json!({
+            "question": "Which tests should I add?",
+            "header": "Tests",
+            "options": [
+                {"label": "Unit", "description": "fast checks for each function", "recommended": true},
+                "Integration"
+            ],
+            "multi_select": true
+        }));
+        let lines = p.lines(40, false);
+        assert_eq!(lines[0], "[Tests] Which tests should I add?");
+        assert_eq!(lines[1], "❯ [ ] 1. Unit (Recommended)");
+        assert_eq!(lines[2], "         fast checks for each function");
+        assert_eq!(lines[3], "  [ ] 2. Integration");
+        assert_eq!(lines[4], "      3. Type something else…");
+        assert!(lines.iter().all(|line| line.chars().count() <= 40));
+    }
+}

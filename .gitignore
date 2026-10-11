@@ -1,0 +1,29 @@
+__pycache__/
+archive/
+.omx/
+.clawd-agents/
+# Claude Code local artifacts
+.claude/settings.local.json
+.claude/sessions/
+# Claw Code local artifacts
+.claw/settings.local.json
+.claw/sessions/
+.claw/rules.local/
+.clawhip/
+status-help.txt
+# Legacy Python port session scratch artifacts
+.port_sessions/
+# Build output at any depth (rust/target, crate-level targets)
+target/
+./rust/target
+# Claw sandbox dirs created in the working directory, agent sessions at any depth
+.sandbox-home/
+.sandbox-tmp/
+**/.claude/sessions/
+**/.claw/sessions/
+**/.claw/checkpoints/
+# RAG service index
+.claw-rag/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
