@@ -27,3 +27,15 @@ target/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+# Hidden config files that may contain secrets, keys, or sensitive settings
+.claude.json
+.claw.json
+.claude-workspace.json
+.omc/
+.omx/
+# Claw workspace local configs (root and per-crate)
+rust/.clawd-todos.json
+rust/.claw.json
+
+# Explicitly track all dotfiles except .gitignore (which is tracked by default)
+!.gitignore
