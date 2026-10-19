@@ -6,6 +6,18 @@ archive/
 .claude/settings.local.json
 .claude/sessions/
 # Claw Code local artifacts
+.claude
+.claude.json
+.claw
+.claw.json
+.clawd-todos.json
+.dockerignore
+.git
+.github
+.omx
+.port_sessions
+.sandbox-home
+.sandbox-tmp
 .claw/settings.local.json
 .claw/sessions/
 .claw/rules.local/

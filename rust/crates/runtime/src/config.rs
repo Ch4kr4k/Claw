@@ -274,6 +274,12 @@ pub struct RuntimePermissionRuleConfig {
     /// commands only need approval when they run as root or are destructive.
     /// `"always"`: every command asks.
     risky_bash_only: bool,
+    /// `bashApproval: "destructive"` or `"sudo-and-destructive"`: those bash
+    /// commands ask in every permission mode, full access included.
+    risky_bash_asks_in_every_mode: bool,
+    /// Running as root (`sudo`, `doas`, ...) counts as risky. False only for
+    /// `bashApproval: "destructive"`.
+    root_bash_is_risky: bool,
 }
 
 impl Default for RuntimePermissionRuleConfig {
@@ -284,6 +290,8 @@ impl Default for RuntimePermissionRuleConfig {
             ask: Vec::new(),
             denied_tools: Vec::new(),
             risky_bash_only: true,
+            risky_bash_asks_in_every_mode: false,
+            root_bash_is_risky: true,
         }
     }
 }
@@ -1470,6 +1478,8 @@ impl RuntimePermissionRuleConfig {
             ask,
             denied_tools,
             risky_bash_only: false,
+            risky_bash_asks_in_every_mode: false,
+            root_bash_is_risky: true,
         }
     }
 
@@ -1483,6 +1493,27 @@ impl RuntimePermissionRuleConfig {
     #[must_use]
     pub fn risky_bash_only(&self) -> bool {
         self.risky_bash_only
+    }
+
+    /// Risky bash commands need approval in every mode, full access included
+    /// (`bashApproval: "sudo-and-destructive"`, or `"destructive"` when
+    /// `root_is_risky` is false).
+    #[must_use]
+    pub fn with_risky_bash_asking_in_every_mode(mut self, root_is_risky: bool) -> Self {
+        self.risky_bash_only = true;
+        self.risky_bash_asks_in_every_mode = true;
+        self.root_bash_is_risky = root_is_risky;
+        self
+    }
+
+    #[must_use]
+    pub fn risky_bash_asks_in_every_mode(&self) -> bool {
+        self.risky_bash_asks_in_every_mode
+    }
+
+    #[must_use]
+    pub fn root_bash_is_risky(&self) -> bool {
+        self.root_bash_is_risky
     }
 
     #[must_use]
@@ -2038,6 +2069,21 @@ fn parse_optional_permission_rules(
         return Ok(RuntimePermissionRuleConfig::default());
     };
 
+    let bash_approval =
+        optional_string(permissions, "bashApproval", "merged settings.permissions")?;
+    // (risky only, risky asks in every mode, root is risky)
+    let (risky_bash_only, risky_bash_asks_in_every_mode, root_bash_is_risky) =
+        match bash_approval {
+            None | Some("risky") => (true, false, true),
+            Some("sudo-and-destructive") => (true, true, true),
+            Some("destructive") => (true, true, false),
+            Some("always") => (false, false, true),
+            Some(other) => {
+                return Err(ConfigError::Parse(format!(
+                    "merged settings.permissions: bashApproval must be \"always\", \"risky\", \"sudo-and-destructive\" or \"destructive\", got \"{other}\""
+                )))
+            }
+        };
     Ok(RuntimePermissionRuleConfig {
         allow: optional_string_array(permissions, "allow", "merged settings.permissions")?
             .unwrap_or_default(),
@@ -2051,19 +2097,9 @@ fn parse_optional_permission_rules(
             "merged settings.permissions",
         )?
         .unwrap_or_default(),
-        risky_bash_only: match optional_string(
-            permissions,
-            "bashApproval",
-            "merged settings.permissions",
-        )? {
-            None | Some("risky") => true,
-            Some("always") => false,
-            Some(other) => {
-                return Err(ConfigError::Parse(format!(
-                    "merged settings.permissions: bashApproval must be \"always\" or \"risky\", got \"{other}\""
-                )))
-            }
-        },
+        risky_bash_only,
+        risky_bash_asks_in_every_mode,
+        root_bash_is_risky,
     })
 }
 

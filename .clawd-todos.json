@@ -1,0 +1,12 @@
+[
+  {
+    "content": "Add gitignore pattern to include all dotfiles except .gitignore",
+    "activeForm": "Asking user for file grouping preferences",
+    "status": "completed"
+  },
+  {
+    "content": "Do separate git add and commits for different file groups",
+    "activeForm": "Asking user for file grouping preferences",
+    "status": "in_progress"
+  }
+]

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# llama-gpu — start llama.cpp's `llama-server` (OpenAI-compatible API on
+# 127.0.0.1:8080/v1) for claw, tuned for a 4 GB GPU (GTX 1650).
+# Runs in router mode: the models (and their sampling) are listed in
+# ~/.config/llama-gpu/models.ini, and each request loads the model it names,
+# so claw's `/model local/<name>` switches models. Only one model is loaded at a
+# time (--models-max 1); a switch unloads the other one first.
+# The default model id must match "model" in ~/.claw/settings.json; avoid a
+# "qwen/" prefix in claw, which routes to DashScope instead of this server.
+# Kept in the repo as scripts/wrappers/llama-gpu (models: llama-models.ini);
+# install with scripts/install-wrappers.sh. A running server keeps its
+# settings: after changing them, `systemctl --user restart llama-gpu`.
+set -euo pipefail
+
+# llama.cpp tree whose build/bin/llama-server runs: the llama-abominated fork
+# (branch async-overlap; overlaps expert uploads with compute, ~+8% prefill;
+# see its ASYNC_PREFETCH.md). GGML_SCHED_PREFETCH=0 turns the prefetch off;
+# keep the weights mmapped (no load-mode = none), pinned memory costs decode
+# speed. Stock build: LLAMA_DIR=$HOME/ws/src/cpp/nn/llama. Models are read
+# from the paths in the preset, not from this tree.
+LLAMA_DIR="${LLAMA_DIR:-$HOME/ws/src/cpp/nn/llama-abominated}"
+PRESET="${LLAMA_MODELS_PRESET:-$HOME/.config/llama-gpu/models.ini}"
+
+# Batches of at least this many tokens run the RAM-resident experts on the GPU,
+# which first copies them over PCIe (~20 GB); smaller ones stay on the CPU.
+# llama.cpp's default of 32 makes short follow-up turns slow. llama-bench,
+# Qwen3.6-35B-A3B, -ub 1024: 128 tokens 30 tok/s on the GPU vs 70 on the CPU;
+# 512: 70 vs 85; 768: 89 vs 83 (crossover ~690). Re-measure for a new model.
+export GGML_OP_OFFLOAD_MIN_BATCH="${GGML_OP_OFFLOAD_MIN_BATCH:-640}"
+
+PORT="${LLAMA_PORT:-8080}"
+if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "llama-server is already running on port $PORT (systemd: llama-gpu.service)." >&2
+    echo "Logs: journalctl --user -u llama-gpu -f   Restart: systemctl --user restart llama-gpu" >&2
+    exit 0
+fi
+
+# At boot the GPU may not be ready yet; llama-server then logs
+# "failed to initialize CUDA" and silently runs everything on the CPU (~3 tok/s).
+# Fail instead, so systemd's Restart=on-failure retries once CUDA is up.
+# LLAMA_ALLOW_CPU=1 skips the check.
+if [[ "${LLAMA_ALLOW_CPU:-0}" != 1 ]] &&
+    ! "$LLAMA_DIR/build/bin/llama-server" --list-devices 2>/dev/null | grep -q 'CUDA0'; then
+    echo "llama-gpu: no CUDA device yet (driver not ready?); exiting so systemd retries." >&2
+    exit 1
+fi
+
+exec "$LLAMA_DIR/build/bin/llama-server" \
+    --models-preset "$PRESET" --models-max 1 \
+    --host 127.0.0.1 --port "$PORT" \
+    -c "${LLAMA_CONTEXT_LENGTH:-32768}" \
+    "$@"

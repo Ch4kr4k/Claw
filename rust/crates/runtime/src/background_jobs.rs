@@ -16,6 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_BUFFER_BYTES: usize = 1_000_000;
+/// How often a monitor's new output is turned into a notice.
+const MONITOR_POLL: Duration = Duration::from_millis(250);
+/// Lines of one batch shown in its notice (the latest ones).
+const MONITOR_MAX_LINES_PER_NOTICE: usize = 40;
+/// A monitor printing more than this is stopped: it would flood the agent.
+pub const MONITOR_MAX_LINES_PER_MINUTE: usize = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
@@ -66,6 +72,8 @@ struct Job {
     child: Mutex<Child>,
     output: Mutex<OutputBuffer>,
     state: Mutex<JobState>,
+    /// Queue the usual "job exited" notice (monitors send their own).
+    announce_exit: bool,
 }
 
 /// Snapshot of a job for listings.
@@ -104,7 +112,95 @@ pub fn global_background_jobs() -> &'static BackgroundJobs {
 
 impl BackgroundJobs {
     /// Spawns `command` with piped output and registers it. Returns the job id.
-    pub fn start(&self, mut command: Command, display: &str) -> std::io::Result<String> {
+    pub fn start(&self, command: Command, display: &str) -> std::io::Result<String> {
+        self.start_job(command, display, true)
+    }
+
+    /// Like [`Self::start`], for the `Monitor` tool: each batch of new output
+    /// lines is queued as a notice (so the agent can react to it, even while
+    /// the prompt is idle), as is the exit. It is stopped after `timeout`, or
+    /// when it prints more than [`MONITOR_MAX_LINES_PER_MINUTE`] lines a
+    /// minute.
+    pub fn start_monitor(
+        &'static self,
+        command: Command,
+        display: &str,
+        description: &str,
+        timeout: Duration,
+    ) -> std::io::Result<String> {
+        let id = self.start_job(command, display, false)?;
+        let poll_id = id.clone();
+        let description = description.to_string();
+        thread::spawn(move || self.watch_monitor(&poll_id, &description, timeout));
+        Ok(id)
+    }
+
+    fn watch_monitor(&self, id: &str, description: &str, timeout: Duration) {
+        let started = Instant::now();
+        let mut window = (Instant::now(), 0_usize);
+        loop {
+            thread::sleep(MONITOR_POLL);
+            let Ok(read) = self.read_new(id, Duration::ZERO) else {
+                return;
+            };
+            let lines: Vec<&str> = read
+                .output
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            if !lines.is_empty() {
+                if window.0.elapsed() > Duration::from_secs(60) {
+                    window = (Instant::now(), 0);
+                }
+                window.1 += lines.len();
+                let shown = lines.len().min(MONITOR_MAX_LINES_PER_NOTICE);
+                let mut notice = format!(
+                    "Monitor {id} ({description}):\n{}",
+                    lines[lines.len() - shown..].join("\n")
+                );
+                if shown < lines.len() {
+                    notice.push_str(&format!(
+                        "\n[{} earlier lines left out]",
+                        lines.len() - shown
+                    ));
+                }
+                self.push_notice(notice);
+                if window.1 > MONITOR_MAX_LINES_PER_MINUTE {
+                    let _ = self.kill(id);
+                    self.push_notice(format!(
+                        "Monitor {id} ({description}) was stopped: more than {MONITOR_MAX_LINES_PER_MINUTE} lines a minute. Start it again with a tighter filter (grep --line-buffered …)."
+                    ));
+                    return;
+                }
+            }
+            match read.state {
+                JobState::Running if started.elapsed() >= timeout => {
+                    let _ = self.kill(id);
+                    self.push_notice(format!(
+                        "Monitor {id} ({description}) timed out after {}s and was stopped; start it again to keep watching.",
+                        timeout.as_secs()
+                    ));
+                    return;
+                }
+                JobState::Running => {}
+                JobState::Killed => return,
+                JobState::Exited(_) => {
+                    self.push_notice(format!(
+                        "Monitor {id} ({description}) ended: {}.",
+                        read.state
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn start_job(
+        &self,
+        mut command: Command,
+        display: &str,
+        announce_exit: bool,
+    ) -> std::io::Result<String> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -130,6 +226,7 @@ impl BackgroundJobs {
             child: Mutex::new(child),
             output: Mutex::new(OutputBuffer::default()),
             state: Mutex::new(JobState::Running),
+            announce_exit,
         });
         let mut readers = Vec::new();
         if let Some(stdout) = stdout {
@@ -330,6 +427,9 @@ fn spawn_waiter(
             return; // stopped on purpose; nothing to report
         }
         *state = JobState::Exited(status.and_then(|s| s.code()));
+        if !job.announce_exit {
+            return;
+        }
         let shown: String = job.command.chars().take(80).collect();
         notices
             .lock()

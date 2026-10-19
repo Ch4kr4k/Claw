@@ -13,7 +13,10 @@ path = "src/main.rs"
 api = { path = "../api" }
 commands = { path = "../commands" }
 crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 pulldown-cmark = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+resvg = "0.45"
 runtime = { path = "../runtime" }
 plugins = { path = "../plugins" }
 serde = { version = "1", features = ["derive"] }

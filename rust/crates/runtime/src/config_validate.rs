@@ -153,6 +153,18 @@ struct DeprecatedField {
 
 const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
+        name: "mcpServerStates",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "autoMemoryEnabled",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "editorMode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "$schema",
         expected: FieldType::String,
     },
@@ -199,6 +211,22 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "aliases",
         expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "modelServers",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "customProviders",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "leanGate",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "memoryReflectOnExit",
+        expected: FieldType::Bool,
     },
     FieldSpec {
         name: "providerFallbacks",

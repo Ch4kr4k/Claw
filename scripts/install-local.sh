@@ -4,6 +4,7 @@
 # Usage:
 #   scripts/install-local.sh            # build + install `claw`
 #   scripts/install-local.sh --all      # also install claw-analog
+#   scripts/install-local.sh --desktop  # also install the claw-desktop app
 #   scripts/install-local.sh --debug    # use a debug build instead of release
 #
 # Environment:
@@ -12,7 +13,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,10p' "$0" | sed 's/^# //; s/^#//'
+    sed -n '2,11p' "$0" | sed 's/^# //; s/^#//'
 }
 
 PROFILE="release"
@@ -20,7 +21,8 @@ BINS=(claw)
 
 for arg in "$@"; do
     case "$arg" in
-        --all) BINS=(claw claw-analog) ;;
+        --all) BINS+=(claw-analog) ;;
+        --desktop) BINS+=(claw-desktop) ;;
         --debug) PROFILE="debug" ;;
         --help|-h) usage; exit 0 ;;
         *)
@@ -51,11 +53,28 @@ cargo "${cargo_args[@]}"
 mkdir -p "$DEST"
 for bin in "${BINS[@]}"; do
     src="$RUST_DIR/target/$PROFILE/$bin"
-    install -m 0755 "$src" "$DEST/$bin"
-    echo "✓ Installed $DEST/$bin" >&2
+    dest="$DEST"
+    # A launcher script (e.g. ~/.local/bin/claw exec'ing ~/.local/lib/claw/claw)
+    # must not be replaced by the binary: install next to what it runs instead.
+    if [[ -z "${PREFIX_BIN:-}" && -f "$dest/$bin" ]] \
+        && [[ "$(head -c 2 "$dest/$bin")" == "#!" ]]; then
+        dest="$HOME/.local/lib/$bin"
+        mkdir -p "$dest"
+        echo "note: $DEST/$bin is a launcher script; installing the binary to $dest" >&2
+    fi
+    # `claw desktop` and the app menu entry run the claw-desktop beside the
+    # real claw binary, so it goes there when claw sits behind a launcher.
+    if [[ "$bin" == "claw-desktop" && -z "${PREFIX_BIN:-}" && -f "$DEST/claw" ]] \
+        && [[ "$(head -c 2 "$DEST/claw")" == "#!" ]]; then
+        dest="$HOME/.local/lib/claw"
+        mkdir -p "$dest"
+    fi
+    install -m 0755 "$src" "$dest/$bin"
+    echo "✓ Installed $dest/$bin" >&2
 done
 
+# The binary behind the launcher (~/.local/lib/claw) is not meant to be on PATH.
 case ":$PATH:" in
     *":$DEST:"*) ;;
-    *) echo "note: $DEST is not on your PATH" >&2 ;;
+    *) [[ "$DEST" == "$HOME/.local/lib/claw" ]] || echo "note: $DEST is not on your PATH" >&2 ;;
 esac

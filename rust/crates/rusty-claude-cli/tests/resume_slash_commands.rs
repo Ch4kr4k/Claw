@@ -571,8 +571,8 @@ fn resumed_no_command_emits_restored_json() {
 }
 
 #[test]
-fn resumed_removed_placeholder_command_reports_unknown_json() {
-    let temp_dir = unique_temp_dir("resume-stub-json");
+fn resumed_live_only_command_reports_interactive_only_json() {
+    let temp_dir = unique_temp_dir("resume-live-only-json");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
     let session_path = temp_dir.join("session.jsonl");
     workspace_session(&temp_dir)
@@ -590,10 +590,42 @@ fn resumed_removed_placeholder_command_reports_unknown_json() {
         ],
     );
 
-    // Placeholder commands were removed from the spec list, so they are
-    // reported like any other unknown slash command.
+    // `/allowed-tools` (`/permissions`) exists but needs a live session.
     assert!(!output.status.success());
     // #819/#820/#823: JSON abort envelopes route to stdout
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["status"], "error");
+    assert_eq!(parsed["kind"], "interactive_only", "{parsed}");
+    assert!(
+        parsed["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("claw --resume")),
+        "{parsed}"
+    );
+}
+
+#[test]
+fn resumed_unknown_command_reports_unknown_json() {
+    let temp_dir = unique_temp_dir("resume-unknown-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    workspace_session(&temp_dir)
+        .save_to_path(&session_path)
+        .expect("persist ok");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/no-such-command-here",
+        ],
+    );
+
+    assert!(!output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("utf8");
     let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
     assert_eq!(parsed["status"], "error");

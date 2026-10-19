@@ -1,7 +1,7 @@
 # Switching Model Providers
 
-How to point `claw` at Claude (Anthropic), OpenAI, OpenRouter, xAI, DashScope
-or any other OpenAI-compatible service, and how to switch back to your local
+How to point `claw` at Claude (Anthropic), OpenAI, Z.ai, OpenRouter,
+DeepSeek, Gemini, Groq, Mistral, xAI, DashScope or any other OpenAI-compatible service, and how to switch back to your local
 Ollama models. For everything else about using `claw`, see
 [`MANUAL.md`](./MANUAL.md).
 
@@ -28,9 +28,10 @@ Because the model name decides, you can keep **all** your keys exported at
 once. They don't conflict.
 
 > **Your setup:** the `claw` command in `~/.local/bin` is a wrapper script that
-> always sets `OLLAMA_HOST`, so it can only talk to Ollama. To use a cloud
-> provider, run the real binary, `~/.local/lib/claw/claw`, without
-> `OLLAMA_HOST`. Section 4 sets up short commands for that.
+> points `local/` models at the `llama-gpu` server (`CLAW_LOCAL_BASE_URL`) and
+> unsets `OLLAMA_HOST`, so every other model name goes to its cloud provider.
+> Inside the REPL, `/model` switches between local and API models (see
+> section 6); exporting the keys (section 2) is all a cloud model needs.
 
 ## 2. Store your API keys
 
@@ -69,7 +70,7 @@ Which variable to use:
 | Anthropic API key (`sk-ant-…`) from console.anthropic.com | `ANTHROPIC_API_KEY` |
 | Bearer token from a proxy or OAuth flow | `ANTHROPIC_AUTH_TOKEN` (not `ANTHROPIC_API_KEY`) |
 | OpenAI key (`sk-…`) | `OPENAI_API_KEY` |
-| OpenRouter key (`sk-or-v1-…`) | `OPENAI_API_KEY`, plus `OPENAI_BASE_URL=https://openrouter.ai/api/v1` |
+| OpenRouter key (`sk-or-v1-…`) | `OPENROUTER_API_KEY` (models `openrouter/<vendor>/<model>`) |
 | xAI key | `XAI_API_KEY` |
 | DashScope key | `DASHSCOPE_API_KEY` |
 
@@ -104,18 +105,37 @@ env -u OLLAMA_HOST -u OPENAI_BASE_URL ~/.local/lib/claw/claw --model gpt-4.1
 Use any OpenAI model name that starts with `gpt-` (e.g. `gpt-4.1-mini`,
 `gpt-5.4`), or `openai/<name>` for others.
 
-### OpenRouter (many providers, one key)
+### Z.ai, OpenRouter, DeepSeek, Gemini, Groq, Mistral, NVIDIA
+
+These are built in: each has its own key variable and a model prefix, so they
+work side by side with Anthropic and OpenAI. `/login` sets any of them up,
+lists the provider's live models (from its `/models` endpoint), and saves the
+choice in `~/.claw/settings.json`.
+
+| Provider | Key | Base URL variable (default) | Model |
+|---|---|---|---|
+| Z.ai (GLM) | `ZAI_API_KEY` | `ZAI_BASE_URL` (`https://api.z.ai/api/paas/v4`) | `zai/glm-4.6` |
+| OpenRouter | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` (`https://openrouter.ai/api/v1`) | `openrouter/anthropic/claude-sonnet-4` |
+| DeepSeek | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` (`https://api.deepseek.com/v1`) | `deepseek/deepseek-v4-pro` |
+| Google Gemini | `GEMINI_API_KEY` | `GEMINI_BASE_URL` (`https://generativelanguage.googleapis.com/v1beta/openai`) | `gemini/gemini-2.5-pro` |
+| Groq | `GROQ_API_KEY` | `GROQ_BASE_URL` (`https://api.groq.com/openai/v1`) | `groq/llama-3.3-70b-versatile` |
+| Mistral | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` (`https://api.mistral.ai/v1`) | `mistral/mistral-large-latest` |
+| NVIDIA NIM | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` (`https://integrate.api.nvidia.com/v1`; self-hosted NIM: `http://<host>:8000/v1`) | `nvidia/qwen/qwen3-coder-480b-a35b-instruct` |
+
+The prefix is removed before the request is sent (OpenRouter receives
+`anthropic/claude-sonnet-4`). Bare names (`glm-4.6`, `deepseek-v4-pro`,
+`gemini-2.5-pro`, `mistral-large-latest`) also route there, but only while
+that provider's key is set. Model ids change often: `/login` shows the
+current ones. For Z.ai's GLM Coding Plan set
+`ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4`; in China,
+`https://open.bigmodel.cn/api/paas/v4`.
 
 ```bash
-env -u OLLAMA_HOST OPENAI_BASE_URL=https://openrouter.ai/api/v1 \
-  OPENAI_API_KEY="$OPENROUTER_API_KEY" \
-  ~/.local/lib/claw/claw --model openai/gpt-4.1-mini
+env -u OLLAMA_HOST ZAI_API_KEY=... ~/.local/lib/claw/claw --model zai/glm-4.6
 ```
 
-For OpenRouter models from other vendors, prefix the slug with `local/` so
-`claw` doesn't route it to that vendor's own API:
-`--model local/anthropic/claude-sonnet-4` or
-`--model local/meta-llama/llama-3.3-70b-instruct`.
+A model without a known output limit on these providers asks for 32K tokens
+(8K on Groq and Mistral); a reply that reaches it is continued automatically.
 
 ### xAI (Grok)
 
@@ -125,7 +145,7 @@ Use the `xai/` prefix (bare `grok…` names are rejected with a hint):
 env -u OLLAMA_HOST ~/.local/lib/claw/claw --model xai/grok-3
 ```
 
-(Or use Grok through OpenRouter: `--model local/x-ai/grok-3`.)
+(Or use Grok through OpenRouter: `--model openrouter/x-ai/grok-3`.)
 
 ### Alibaba DashScope (Qwen, Kimi)
 
@@ -136,19 +156,38 @@ env -u OLLAMA_HOST ~/.local/lib/claw/claw --model qwen/qwen-plus
 env -u OLLAMA_HOST ~/.local/lib/claw/claw --model kimi/kimi-k2.5
 ```
 
-### Any other OpenAI-compatible service (DeepSeek, Groq, Together, vLLM, LM Studio…)
+### Any other OpenAI-compatible service (Together, Fireworks, a remote vLLM, LM Studio…)
 
-Set the service's base URL and key, and put `local/` in front of its model
-name:
+Give it its own prefix in `~/.claw/settings.json` (or the project's
+`.claw/settings.json`), so it works side by side with `local/` (your
+llama-gpu server) and every built-in provider:
 
-```bash
-env -u OLLAMA_HOST OPENAI_BASE_URL=https://api.deepseek.com/v1 \
-  OPENAI_API_KEY="$DEEPSEEK_API_KEY" \
-  ~/.local/lib/claw/claw --model local/deepseek-chat
+```json
+"customProviders": {
+  "together": { "baseUrl": "https://api.together.xyz/v1", "apiKeyEnv": "TOGETHER_API_KEY" },
+  "gpubox":   { "baseUrl": "http://gpu-box:8000/v1", "apiKey": "token-abc", "label": "vLLM on gpu-box" }
+}
 ```
 
-`local/` forces the OpenAI-compatible client and is removed before the
-request is sent, so the service receives `deepseek-chat`.
+```bash
+claw --model together/meta-llama/Llama-3.3-70B-Instruct-Turbo
+claw --model gpubox/Qwen/Qwen3-32B
+```
+
+- The prefix is removed before sending (`together/meta-llama/…` is sent as
+  `meta-llama/…`).
+- The key comes from `apiKeyEnv` (default `<NAME>_API_KEY`, here
+  `TOGETHER_API_KEY` / `GPUBOX_API_KEY`), else `apiKey` written in the
+  entry. Prefer the variable: settings files get copied around.
+- `<NAME>_BASE_URL` overrides `baseUrl`; `maxOutputTokens` sets the reply
+  budget (default 8192); `label` is the name `/login` shows.
+- Names of built-in providers and `local` are reserved; such entries are
+  ignored.
+- `/model gpubox/Qwen/Qwen3-32B` switches to it inside a session; `local/`
+  models keep going to your local server.
+
+`local/` with `CLAW_LOCAL_BASE_URL` (and `CLAW_LOCAL_API_KEY`) still works for
+a single extra endpoint, but then `local/` no longer reaches llama-gpu.
 
 ## 4. Switch with one word
 
@@ -215,9 +254,60 @@ Short names of your own can go in settings too:
 { "aliases": { "fast": "claude-haiku-5-5", "smart": "claude-opus-5-5" } }
 ```
 
-Inside the REPL, `/model <name>` switches models for the session, but not
-providers: under the `claw` wrapper it still goes to Ollama. Start
-`claw-claude` (or another alias) to change provider.
+Inside the REPL, `/model <name>` switches models, and providers, for the rest
+of the session; the history carries over. Under the `claw` wrapper:
+
+```text
+/model coder          # local/qwen36-35b-a3b on llama-gpu (alias; the default)
+/model uncensored     # local/qwen35-4b-uncensored on llama-gpu (alias)
+/model sonnet         # Anthropic, needs ANTHROPIC_API_KEY
+/model gpt-4.1        # OpenAI, needs OPENAI_API_KEY
+```
+
+The local models are the sections of `~/.config/llama-gpu/models.ini`;
+`llama-gpu` runs llama.cpp in router mode, which loads the model a request
+names and unloads the previous one (one at a time on the 4 GB GPU). To add a
+local model, add a section to `scripts/wrappers/llama-models.ini`, run
+`scripts/install-wrappers.sh` and `systemctl --user restart llama-gpu`.
+
+## 6b. Start and stop a model server with claw
+
+claw can start a provider's server when it starts and stop it when the last
+claw using it exits (terminal sessions, desktop chats, sub-agents all count).
+Configure it per provider in `~/.claw/settings.json`, keyed by the model's
+prefix (`local` for `local/...`, `ollama`, ...; `default` matches any
+model). Cloud APIs need no entry.
+
+```json
+"modelServers": {
+  "local": {
+    "start": "systemctl --user start llama-gpu",
+    "stop": "systemctl --user stop llama-gpu",
+    "health": "http://127.0.0.1:8080/health",
+    "stopOnExit": true
+  }
+}
+```
+
+- `start` runs only when `health` does not answer (without `health`, on
+  every first use). claw waits up to 20 s for `health` to come up.
+- The entry only applies while the provider points at that server: when
+  `local/` models are sent elsewhere (`CLAW_LOCAL_BASE_URL` set to NVIDIA,
+  Together, a remote vLLM, ...), its host and port differ from `health` and
+  claw leaves `llama-gpu` alone. Cloud providers (Anthropic, OpenAI, Z.ai,
+  DeepSeek, DashScope, ...) never match an entry unless you add one.
+- `stopOnExit: false` starts the server but leaves it running.
+- A launcher can override the entry for the provider in use:
+  `CLAW_SERVER_START`, `CLAW_SERVER_STOP`, `CLAW_SERVER_HEALTH`,
+  `CLAW_SERVER_STOP_ON_EXIT=0`; `CLAW_MANAGE_SERVER=0` turns it off.
+- Each claw holds a lease in `~/.claw/run/model-server/<provider>/`. A claw
+  that exits normally stops the server if it was the last; one that is
+  killed or loses its terminal is noticed by a small watcher
+  (`claw __model-server-watch`) within about 15 s.
+- With this, the `llama-gpu` service does not need to start at login
+  (`systemctl --user disable llama-gpu`). Its models also unload after 15
+  idle minutes (`sleep-idle-seconds = 900` in `llama-models.ini`) and load
+  again on the next request.
 
 ## 7. Check what you're connected to
 

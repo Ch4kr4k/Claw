@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Claw
+GenericName=AI coding assistant
+Comment=Chat with claw: your local and API models, with access to your files and shell
+Exec=@BIN@
+Icon=claw
+Terminal=false
+Categories=Development;Utility;
+Keywords=ai;chat;claw;llm;assistant;
+StartupWMClass=claw-desktop

@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use crate::lane_events::{LaneEvent, ShipMergeMethod, ShipProvenance};
 use crate::sandbox::{
     build_linux_sandbox_command, resolve_sandbox_status_for_request, FilesystemIsolationMode,
-    SandboxConfig, SandboxStatus,
+    SandboxStatus,
 };
 use crate::ConfigLoader;
 
@@ -68,13 +68,60 @@ pub struct BashCommandOutput {
     pub sandbox_status: Option<SandboxStatus>,
 }
 
+thread_local! {
+    // The model cannot supply this authorization in JSON. ConversationRuntime
+    // installs it only after the explicit host permission check, and the shell
+    // consumes it once before spawning, on the same execution thread.
+    static HOST_APPROVAL: std::cell::RefCell<Option<(BashCommandInput, std::path::PathBuf)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct HostExecutionScope;
+
+impl HostExecutionScope {
+    pub(crate) fn for_authorized_call(tool_name: &str, input: &str) -> Self {
+        let grant = if crate::permissions::is_host_execution_request(tool_name, input) {
+            serde_json::from_str::<BashCommandInput>(input)
+                .ok()
+                .zip(env::current_dir().ok())
+        } else {
+            None
+        };
+        HOST_APPROVAL.with(|approval| *approval.borrow_mut() = grant);
+        Self
+    }
+}
+
+impl Drop for HostExecutionScope {
+    fn drop(&mut self) {
+        HOST_APPROVAL.with(|approval| *approval.borrow_mut() = None);
+    }
+}
+
+fn consume_host_approval(input: &BashCommandInput, cwd: &std::path::Path) -> bool {
+    HOST_APPROVAL.with(|approval| {
+        approval
+            .borrow_mut()
+            .take()
+            .is_some_and(|(approved, approved_cwd)| approved == *input && approved_cwd == cwd)
+    })
+}
+
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    // With the sandbox switched off in settings every command already runs on
+    // the host, so asking to leave the sandbox needs no separate approval.
+    if input.dangerously_disable_sandbox == Some(true)
+        && configured_sandbox_enabled(&cwd)
+        && !consume_host_approval(&input, &cwd)
+    {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "host execution requires explicit approval for this exact command; ordinary Bash approvals do not authorize disabling the sandbox"));
+    }
+    let sandbox_status = sandbox_status_for_input(&input, &cwd)?;
 
     if input.run_in_background.unwrap_or(false) {
-        let command = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let command = prepare_command(&input.command, &cwd, &sandbox_status)?;
         let job_id =
             crate::background_jobs::global_background_jobs().start(command, &input.command)?;
 
@@ -99,9 +146,71 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
         });
     }
 
+    let abort = TURN_ABORT.with(|signal| signal.borrow().clone());
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    runtime.block_on(execute_bash_async(input, sandbox_status, cwd, abort))
 }
+
+thread_local! {
+    /// The abort signal of the turn running tools on this thread.
+    static TURN_ABORT: std::cell::RefCell<Option<crate::HookAbortSignal>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While it lives, shell commands run on this thread stop when `signal`
+/// is aborted (Esc or Ctrl+C in the REPL, Stop in the desktop app).
+pub struct TurnAbortScope(Option<crate::HookAbortSignal>);
+
+impl TurnAbortScope {
+    #[must_use]
+    pub fn enter(signal: &crate::HookAbortSignal) -> Self {
+        Self(TURN_ABORT.with(|current| current.replace(Some(signal.clone()))))
+    }
+}
+
+impl Drop for TurnAbortScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        TURN_ABORT.with(|current| *current.borrow_mut() = previous);
+    }
+}
+
+/// Why a command was ended early.
+enum Ended {
+    Timeout,
+    Stopped,
+}
+
+/// Resolves when `abort` is set; never without one.
+async fn aborted(abort: Option<crate::HookAbortSignal>) {
+    let Some(abort) = abort else {
+        return std::future::pending().await;
+    };
+    while !abort.is_aborted() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Signals the command's whole process group (the shell and everything it
+/// started), so a stopped command does not leave children running.
+#[cfg(unix)]
+fn signal_group(pid: Option<u32>, kill: bool) {
+    let Some(pid) = pid
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return;
+    };
+    let signal = if kill {
+        rustix::process::Signal::KILL
+    } else {
+        rustix::process::Signal::TERM
+    };
+    let _ = rustix::process::kill_process_group(pid, signal);
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: Option<u32>, _kill: bool) {}
 
 /// Detect git push to main and emit ship provenance event
 fn detect_and_emit_ship_prepared(command: &str) {
@@ -169,25 +278,61 @@ async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
+    abort: Option<crate::HookAbortSignal>,
 ) -> io::Result<BashCommandOutput> {
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
 
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
-
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            (result?, false)
-        } else {
-            return Ok(timeout_output(&input, timeout_ms, sandbox_status));
+    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status)?;
+    // Its own process group, so stopping it reaches everything it started.
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let deadline = async {
+        match input.timeout {
+            Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
+            None => std::future::pending().await,
         }
-    } else {
-        (command.output().await?, false)
     };
-
-    let (output, interrupted) = output_result;
+    let (output, ended) = tokio::select! {
+        result = &mut output => (result?, None),
+        () = deadline => (stop_group(pid, &mut output).await?, Some(Ended::Timeout)),
+        () = aborted(abort) => (stop_group(pid, &mut output).await?, Some(Ended::Stopped)),
+    };
+    if let (Some(Ended::Timeout), Some(timeout_ms)) = (&ended, input.timeout) {
+        return Ok(timeout_output(&input, timeout_ms, sandbox_status));
+    }
+    let interrupted = ended.is_some();
     let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    let mut stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    if interrupted {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str("[claw] The user stopped this command.");
+    }
+    if sandbox_status.active {
+        if let Some(note) = hidden_device_note(&input.command) {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&note);
+        }
+    }
+    if output.status.code() != Some(0) {
+        if let Some(note) = no_terminal_note(&stdout, &stderr) {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(note);
+        }
+    }
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
     let return_code_interpretation = output.status.code().and_then(|code| {
         if code == 0 {
@@ -214,6 +359,23 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+/// Asks the command's process group to end, then kills it if it has not
+/// within three seconds, and returns what it printed.
+async fn stop_group<F>(
+    pid: Option<u32>,
+    output: &mut std::pin::Pin<&mut F>,
+) -> io::Result<std::process::Output>
+where
+    F: std::future::Future<Output = io::Result<std::process::Output>>,
+{
+    signal_group(pid, false);
+    if let Ok(result) = timeout(Duration::from_secs(3), output.as_mut()).await {
+        return result;
+    }
+    signal_group(pid, true);
+    output.as_mut().await
 }
 
 fn timeout_output(
@@ -277,11 +439,30 @@ fn test_timeout_provenance(
     })
 }
 
-fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
-    let config = ConfigLoader::default_for(cwd).load().map_or_else(
-        |_| SandboxConfig::default(),
-        |runtime_config| runtime_config.sandbox().clone(),
-    );
+/// Whether the settings ask for the shell sandbox (the default). Settings
+/// that cannot be read count as enabled, so an error never skips approval.
+pub fn configured_sandbox_enabled(cwd: &std::path::Path) -> bool {
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_or(true, |config| {
+            config
+                .sandbox()
+                .resolve_request(None, None, None, None, None)
+                .enabled
+        })
+}
+
+fn sandbox_status_for_input(
+    input: &BashCommandInput,
+    cwd: &std::path::Path,
+) -> io::Result<SandboxStatus> {
+    let config = ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| io::Error::other(format!("cannot load sandbox settings: {error}")))?
+        .sandbox()
+        .clone();
+    let baseline = config.resolve_request(None, None, None, None, None);
+    validate_sandbox_overrides(input, &baseline)?;
     let request = config.resolve_request(
         input.dangerously_disable_sandbox.map(|disabled| !disabled),
         input.namespace_restrictions,
@@ -289,73 +470,234 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
         input.filesystem_mode,
         input.allowed_mounts.clone(),
     );
-    resolve_sandbox_status_for_request(&request, cwd)
+    Ok(resolve_sandbox_status_for_request(&request, cwd))
+}
+
+fn validate_sandbox_overrides(
+    input: &BashCommandInput,
+    baseline: &crate::sandbox::SandboxRequest,
+) -> io::Result<()> {
+    if !baseline.enabled || input.dangerously_disable_sandbox == Some(true) {
+        return Ok(());
+    }
+    let weaker_filesystem = match input.filesystem_mode {
+        Some(FilesystemIsolationMode::Off) => {
+            baseline.filesystem_mode != FilesystemIsolationMode::Off
+        }
+        Some(FilesystemIsolationMode::AllowList) => {
+            baseline.filesystem_mode == FilesystemIsolationMode::WorkspaceOnly
+        }
+        _ => false,
+    };
+    if (input.namespace_restrictions == Some(false) && baseline.namespace_restrictions)
+        || (input.isolate_network == Some(false) && baseline.network_isolation)
+        || weaker_filesystem
+        || input
+            .allowed_mounts
+            .as_ref()
+            .is_some_and(|mounts| *mounts != baseline.allowed_mounts)
+    {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied,
+            "tool arguments cannot weaken configured sandbox protections or change allowedMounts; request explicit host approval with dangerouslyDisableSandbox=true"));
+    }
+    Ok(())
 }
 
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
-    create_dirs: bool,
-) -> Command {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
-    }
-
-    if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-        let mut prepared = Command::new(launcher.program);
-        prepared.args(launcher.args);
-        prepared.current_dir(cwd);
-        prepared.envs(launcher.env);
-        return prepared;
-    }
-
-    let mut prepared = Command::new("sh");
-    prepared.arg("-lc").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
-    }
+) -> io::Result<Command> {
+    let mut prepared =
+        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status)? {
+            let mut prepared = Command::new(launcher.program);
+            prepared.args(launcher.args).envs(launcher.env);
+            prepared
+        } else {
+            let mut prepared = Command::new("sh");
+            prepared.arg("-c").arg(command);
+            prepared
+        };
+    // No terminal to type an SSH key passphrase on: ssh asks through claw.
     prepared
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .envs(crate::askpass::child_env());
+    Ok(prepared)
 }
 
 fn prepare_tokio_command(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
-    create_dirs: bool,
-) -> TokioCommand {
-    if create_dirs {
-        prepare_sandbox_dirs(cwd);
-    }
-
-    let mut prepared =
-        if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
-            let mut cmd = TokioCommand::new(launcher.program);
-            cmd.args(launcher.args);
-            cmd.envs(launcher.env);
-            cmd
-        } else {
-            let mut cmd = TokioCommand::new("sh");
-            cmd.arg("-lc").arg(command);
-            if sandbox_status.filesystem_active {
-                cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
-            }
-            cmd
-        };
-
-    prepared.current_dir(cwd);
-    prepared.stdin(Stdio::null());
-    prepared
-}
-
-fn prepare_sandbox_dirs(cwd: &std::path::Path) {
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+) -> io::Result<TokioCommand> {
+    let prepared = prepare_command(command, cwd, sandbox_status)?;
+    let mut command = TokioCommand::from(prepared);
+    command.kill_on_drop(true);
+    Ok(command)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_bash, BashCommandInput};
+    use super::BashCommandInput;
+
+    fn execute_bash(input: BashCommandInput) -> std::io::Result<super::BashCommandOutput> {
+        let _scope = super::HostExecutionScope::for_authorized_call(
+            "bash",
+            &serde_json::to_string(&input).unwrap(),
+        );
+        super::execute_bash(input)
+    }
     use crate::sandbox::FilesystemIsolationMode;
+
+    fn host_input() -> BashCommandInput {
+        serde_json::from_value(
+            serde_json::json!({"command":"printf approved", "dangerouslyDisableSandbox":true}),
+        )
+        .unwrap()
+    }
+
+    /// Points `CLAW_CONFIG_HOME` at an empty folder for the test's lifetime,
+    /// so the user's own settings (say, the sandbox switched off) cannot leak in.
+    struct IsolatedConfigHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl IsolatedConfigHome {
+        fn new() -> Self {
+            let lock = crate::test_env_lock();
+            let dir = std::env::temp_dir().join(format!(
+                "claw-bash-config-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_nanos())
+            ));
+            std::fs::create_dir_all(dir.join(".claw")).unwrap();
+            let previous = std::env::var_os("CLAW_CONFIG_HOME");
+            std::env::set_var("CLAW_CONFIG_HOME", dir.join(".claw"));
+            Self {
+                _lock: lock,
+                previous,
+                dir,
+            }
+        }
+    }
+
+    impl Drop for IsolatedConfigHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+                None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn stopping_the_turn_ends_the_command_and_its_children() {
+        let _config = IsolatedConfigHome::new();
+        let marker = std::env::temp_dir().join(format!("claw-stop-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let input: BashCommandInput = serde_json::from_value(serde_json::json!({
+            "command": format!("(sleep 3; touch {}) & sleep 30", marker.display()),
+            "dangerouslyDisableSandbox": true
+        }))
+        .unwrap();
+        let signal = crate::HookAbortSignal::new();
+        let stopper = signal.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            stopper.abort();
+        });
+        let started = std::time::Instant::now();
+        let output = {
+            let _scope = super::TurnAbortScope::enter(&signal);
+            execute_bash(input).expect("runs")
+        };
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(output.interrupted);
+        assert!(
+            output.stderr.contains("The user stopped this command"),
+            "{}",
+            output.stderr
+        );
+        // The background child was in the same group and was stopped too.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        assert!(!marker.exists(), "child kept running after Stop");
+    }
+
+    #[test]
+    fn host_execution_requires_exact_single_use_approval() {
+        let _config = IsolatedConfigHome::new();
+        let input = host_input();
+        assert_eq!(
+            super::execute_bash(input.clone()).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let cwd = std::env::current_dir().unwrap();
+        {
+            let _scope = super::HostExecutionScope::for_authorized_call(
+                "bash",
+                &serde_json::to_string(&input).unwrap(),
+            );
+            let mut different = input.clone();
+            different.command.push_str("; printf extra");
+            assert!(!super::consume_host_approval(&different, &cwd));
+            assert!(!super::consume_host_approval(&input, &cwd));
+        }
+        {
+            let _scope = super::HostExecutionScope::for_authorized_call(
+                "bash",
+                &serde_json::to_string(&input).unwrap(),
+            );
+            assert!(!super::consume_host_approval(
+                &input,
+                &cwd.join("different")
+            ));
+        }
+        {
+            let _scope = super::HostExecutionScope::for_authorized_call(
+                "bash",
+                &serde_json::to_string(&input).unwrap(),
+            );
+            let output = super::execute_bash(input.clone()).unwrap();
+            assert_eq!(output.stdout, "approved");
+            assert!(!output.sandbox_status.unwrap().enabled);
+            assert!(super::execute_bash(input.clone()).is_err());
+        }
+        {
+            let _scope = super::HostExecutionScope::for_authorized_call(
+                "bash",
+                &serde_json::to_string(&input).unwrap(),
+            );
+        }
+        assert!(super::execute_bash(input).is_err());
+    }
+
+    #[test]
+    fn model_cannot_weaken_sandbox_with_tool_arguments() {
+        let mut baseline =
+            crate::sandbox::SandboxConfig::default().resolve_request(None, None, None, None, None);
+        baseline.network_isolation = true;
+        for change in [
+            serde_json::json!({"namespaceRestrictions":false}),
+            serde_json::json!({"isolateNetwork":false}),
+            serde_json::json!({"filesystemMode":"off"}),
+            serde_json::json!({"filesystemMode":"allow-list"}),
+            serde_json::json!({"allowedMounts":["/"]}),
+        ] {
+            let mut value = serde_json::json!({"command":"true"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            let input = serde_json::from_value(value).unwrap();
+            assert!(super::validate_sandbox_overrides(&input, &baseline).is_err());
+        }
+    }
 
     #[test]
     fn executes_simple_command() {
@@ -365,12 +707,19 @@ mod tests {
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
-            namespace_restrictions: Some(false),
+            namespace_restrictions: None,
             isolate_network: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: None,
-        })
-        .expect("bash command should execute");
+        });
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if error.to_string().contains("sandbox unavailable") => {
+                // Hosts without Bubblewrap/namespaces must fail closed.
+                return;
+            }
+            Err(error) => panic!("bash command failed: {error}"),
+        };
 
         assert_eq!(output.stdout, "hello");
         assert!(!output.interrupted);
@@ -402,8 +751,8 @@ mod tests {
             timeout: Some(1),
             description: None,
             run_in_background: Some(false),
-            dangerously_disable_sandbox: Some(false),
-            namespace_restrictions: Some(false),
+            dangerously_disable_sandbox: Some(true),
+            namespace_restrictions: None,
             isolate_network: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: None,
@@ -443,6 +792,86 @@ mod tests {
 }
 
 /// Maximum output bytes before truncation (16 KiB, matching upstream).
+/// What the sandbox's minimal `/dev` (bwrap `--dev`) provides; every other
+/// device node, such as `/dev/i2c-*`, `/dev/video*` or `/dev/ttyUSB*`, is
+/// absent inside it even when it exists on the host.
+const SANDBOX_DEV_ENTRIES: &[&str] = &[
+    "null",
+    "zero",
+    "full",
+    "random",
+    "urandom",
+    "tty",
+    "console",
+    "pts",
+    "ptmx",
+    "shm",
+    "fd",
+    "stdin",
+    "stdout",
+    "stderr",
+    "core",
+    "mqueue",
+    "hugepages",
+];
+
+/// A note for a sandboxed command that names a host device the sandbox
+/// hides, so the model does not conclude from `No such file or directory`
+/// (or an empty glob) that the device is missing on the machine.
+fn hidden_device_note(command: &str) -> Option<String> {
+    let mut hidden: Vec<&str> = Vec::new();
+    for (start, _) in command.match_indices("/dev/") {
+        let rest = &command[start + "/dev/".len()..];
+        let end = rest
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '*' | '?' | '/'))
+            })
+            .unwrap_or(rest.len());
+        let path = &rest[..end];
+        // `/dev/pts/0` is provided, `/dev/i2c-1`, `/dev/i2c*` and `/dev/` are not.
+        let first = path.split('/').next().unwrap_or("");
+        let provided = SANDBOX_DEV_ENTRIES.contains(&first);
+        if !provided {
+            let shown = &command[start..start + "/dev/".len() + end];
+            if !hidden.contains(&shown) {
+                hidden.push(shown);
+            }
+        }
+    }
+    if hidden.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[sandbox] This command ran in claw's sandbox, whose /dev holds only basic devices (null, zero, random, tty, pts, shm). Host devices such as {} are hidden here even if they exist on the machine, so \"No such file or directory\" or an empty listing says nothing about the host. To check or use them, rerun the command with dangerouslyDisableSandbox=true (the user is asked to approve it).",
+        hidden.join(", ")
+    ))
+}
+
+/// A note for a command that failed because it wanted a terminal to ask
+/// the user something (`emerge --ask`, `sudo` asking for a password, ...).
+/// Commands run with stdin closed and no terminal, so the model should
+/// rerun them non-interactively; claw does the asking itself.
+fn no_terminal_note(stdout: &str, stderr: &str) -> Option<&'static str> {
+    const SIGNS: [&str; 7] = [
+        "should only be used in a terminal",
+        "not a terminal",
+        "no tty present",
+        "a terminal is required",
+        "inappropriate ioctl for device",
+        "input is not a terminal",
+        "a password is required",
+    ];
+    let lower = format!("{stdout}\n{stderr}").to_lowercase();
+    if lower.contains("permission denied (publickey") {
+        return Some(
+            "[claw] ssh could not use a key. When a key has a passphrase, claw asks the user for it on the terminal as ssh needs it, so a refusal here means they cancelled, mistyped it, or the key is not on the server. Do not start ssh-agent, pass the passphrase to ssh-add or write askpass scripts; ask the user to rerun it or to run `! ssh-add` themselves.",
+        );
+    }
+    SIGNS.iter().any(|sign| lower.contains(sign)).then_some(
+        "[claw] Commands run without a terminal, so they cannot prompt or read answers. Rerun it non-interactively: drop `--ask`/`-a` (emerge), add `-y`/`--yes`/`--noconfirm`, or use `sudo -n`. claw already asks the user before risky commands, so no extra confirmation step is needed.",
+    )
+}
+
 const MAX_OUTPUT_BYTES: usize = 16_384;
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
@@ -463,6 +892,39 @@ fn truncate_output(s: &str) -> String {
 #[cfg(test)]
 mod truncation_tests {
     use super::*;
+
+    #[test]
+    fn notes_host_devices_the_sandbox_hides() {
+        let note = super::hidden_device_note("ls -la /dev/i2c* && cat /dev/i2c-3 2>/dev/null")
+            .expect("i2c devices are hidden in the sandbox");
+        assert!(note.contains("/dev/i2c*, /dev/i2c-3"), "{note}");
+        assert!(note.contains("dangerouslyDisableSandbox=true"));
+        assert!(super::hidden_device_note("ls /dev/").is_some());
+    }
+
+    #[test]
+    fn notes_commands_that_wanted_a_terminal() {
+        let note = super::no_terminal_note(
+            "",
+            "!!! \"--ask\" should only be used in a terminal. Exiting.",
+        )
+        .expect("emerge --ask needs a terminal");
+        assert!(note.contains("--ask"));
+        assert_eq!(super::no_terminal_note("ok", "file not found"), None);
+        let note = super::no_terminal_note("", "git@github.com: Permission denied (publickey).")
+            .expect("ssh key refusals get a note");
+        assert!(note.contains("Do not start ssh-agent"), "{note}");
+    }
+
+    #[test]
+    fn no_device_note_for_devices_the_sandbox_provides() {
+        assert_eq!(super::hidden_device_note("cargo build 2>/dev/null"), None);
+        assert_eq!(
+            super::hidden_device_note("head -c8 /dev/urandom > /dev/stderr; tty </dev/pts/0"),
+            None
+        );
+        assert_eq!(super::hidden_device_note("echo devices"), None);
+    }
 
     #[test]
     fn short_output_unchanged() {

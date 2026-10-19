@@ -50,7 +50,8 @@ impl ProviderClient {
                         Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
                             OpenAiCompatConfig::dashscope()
                         }
-                        _ => OpenAiCompatConfig::openai(),
+                        _ => providers::hosted::hosted_openai_provider_for_model(&resolved_model)
+                            .map_or_else(OpenAiCompatConfig::openai, |hosted| hosted.config),
                     };
                     Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
                 }

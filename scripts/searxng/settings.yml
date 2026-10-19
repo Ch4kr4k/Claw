@@ -1,0 +1,24 @@
+# SearXNG settings for claw's WebSearch (installed to ~/.config/searxng/ by
+# scripts/install-searxng.sh). Only differences from SearXNG's defaults are
+# listed; the default engines (Google, DuckDuckGo, Brave, Bing, Wikipedia, …)
+# stay on, so one engine blocking us does not empty the results.
+use_default_settings: true
+
+general:
+  instance_name: "claw search"
+
+server:
+  # Replaced with a random value at install time.
+  secret_key: "@SECRET_KEY@"
+  # Only reachable from this machine (the container publishes on 127.0.0.1),
+  # so SearXNG's rate limiter for public instances is not needed.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  # claw reads `format=json`.
+  formats:
+    - html
+    - json

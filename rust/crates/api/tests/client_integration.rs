@@ -167,7 +167,9 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
     let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
     let error = client
         .send_message(&MessageRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            // A 200K-token model: ~150K input plus 64K output does not fit.
+            // (claude-sonnet-4-6 has a 1M window, where this would pass.)
+            model: "claude-haiku-4-5".to_string(),
             max_tokens: 64_000,
             messages: vec![InputMessage {
                 role: "user".to_string(),

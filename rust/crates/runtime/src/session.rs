@@ -242,6 +242,11 @@ impl Session {
         self
     }
 
+    /// Stops saving this session to disk (incognito chats).
+    pub fn clear_persistence(&mut self) {
+        self.persistence = None;
+    }
+
     #[must_use]
     pub fn persistence_path(&self) -> Option<&Path> {
         self.persistence.as_ref().map(|value| value.path.as_path())

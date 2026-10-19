@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# llama-gpu-switch — choose which llama.cpp build the llama-gpu service runs,
+# then restart it. The model list and settings (~/.config/llama-gpu/models.ini)
+# stay the same; only the llama-server binary changes.
+#
+#   llama-gpu-switch fork     # llama-abominated fork, ~/ws/src/cpp/nn/llama-abominated (default)
+#   llama-gpu-switch stock    # previous setup: stock llama.cpp, ~/ws/src/cpp/nn/llama
+#   llama-gpu-switch status   # show which build is running
+#
+# `stock` writes a systemd drop-in that sets LLAMA_DIR for the service;
+# `fork` removes it, so the llama-gpu wrapper's default (the fork) applies.
+# Kept in the repo as scripts/wrappers/llama-gpu-switch; installed by
+# scripts/install-wrappers.sh.
+set -euo pipefail
+
+STOCK_DIR="$HOME/ws/src/cpp/nn/llama"
+FORK_DIR="$HOME/ws/src/cpp/nn/llama-abominated"
+DROPIN_DIR="$HOME/.config/systemd/user/llama-gpu.service.d"
+DROPIN="$DROPIN_DIR/llama-dir.conf"
+PORT="${LLAMA_PORT:-8080}"
+
+usage() {
+    sed -n '2,13p' "$0" | sed 's/^# //; s/^#//'
+}
+
+running_binary() {
+    local pid
+    pid="$(systemctl --user show -p MainPID --value llama-gpu 2>/dev/null || true)"
+    if [[ -n "$pid" && "$pid" != 0 ]]; then
+        readlink "/proc/$pid/exe" 2>/dev/null || true
+    fi
+}
+
+status() {
+    local exe
+    exe="$(running_binary)"
+    case "$exe" in
+        "$FORK_DIR"/*) echo "llama-gpu runs the fork: $exe" ;;
+        "$STOCK_DIR"/*) echo "llama-gpu runs stock llama.cpp: $exe" ;;
+        "") echo "llama-gpu is not running" ;;
+        *) echo "llama-gpu runs: $exe" ;;
+    esac
+    if [[ -f "$DROPIN" ]]; then
+        echo "configured: stock (drop-in $DROPIN)"
+    else
+        echo "configured: fork (wrapper default)"
+    fi
+}
+
+use_dir() {
+    local dir="$1"
+    if [[ ! -x "$dir/build/bin/llama-server" ]]; then
+        echo "error: $dir/build/bin/llama-server is missing; build that tree first" >&2
+        exit 1
+    fi
+}
+
+restart() {
+    systemctl --user daemon-reload
+    systemctl --user restart llama-gpu
+    echo "restarted llama-gpu; waiting for the default model to load..." >&2
+    for _ in $(seq 1 120); do
+        if curl -s "http://127.0.0.1:$PORT/models" | grep -q '"loaded"'; then
+            status
+            return
+        fi
+        if ! systemctl --user is-active -q llama-gpu; then
+            echo "error: llama-gpu stopped; see journalctl --user -u llama-gpu -n 50" >&2
+            exit 1
+        fi
+        sleep 2
+    done
+    echo "warning: model still loading after 4 minutes; check: journalctl --user -u llama-gpu -f" >&2
+}
+
+case "${1:-}" in
+    fork)
+        use_dir "$FORK_DIR"
+        rm -f "$DROPIN"
+        rmdir "$DROPIN_DIR" 2>/dev/null || true
+        restart
+        ;;
+    stock)
+        use_dir "$STOCK_DIR"
+        mkdir -p "$DROPIN_DIR"
+        printf '[Service]\nEnvironment=LLAMA_DIR=%s\n' "$STOCK_DIR" >"$DROPIN"
+        restart
+        ;;
+    status) status ;;
+    -h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

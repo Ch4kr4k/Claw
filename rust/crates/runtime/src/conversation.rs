@@ -5,7 +5,8 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session, estimate_session_tokens, truncate_large_tool_results, CompactionConfig,
+    CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -17,6 +18,16 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// How many times one turn asks the model to go on after a reply was cut
+/// off at the output-token limit, before the turn ends anyway.
+const MAX_CUT_OFF_CONTINUATIONS: usize = 3;
+const CUT_OFF_CONTINUE_PROMPT: &str = "<system-reminder>\nYour previous reply was cut off at the \
+     output-token limit. Continue exactly where it stopped, without repeating what you already \
+     wrote. Keep each reply and each tool call smaller.\n</system-reminder>";
+const CUT_OFF_TOOL_CALL_RESULT: &str = "This tool call was cut off: the reply reached the \
+     output-token limit before the tool input was complete, so it was not run. Send less in \
+     one call: for a large file, write the first part with write_file and add the rest in \
+     further edit_file calls.";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +51,9 @@ pub enum AssistantEvent {
     },
     Usage(TokenUsage),
     PromptCache(PromptCacheEvent),
+    /// The reply stopped at the output-token limit (or a full context
+    /// window) rather than because the model was done.
+    OutputLimitReached,
     MessageStop,
 }
 
@@ -51,6 +65,17 @@ pub struct PromptCacheEvent {
     pub previous_cache_read_input_tokens: u32,
     pub current_cache_read_input_tokens: u32,
     pub token_drop: u32,
+}
+
+/// Whether a provider stop reason means the reply hit the output-token
+/// limit (Anthropic `max_tokens`, OpenAI-compatible `length`) instead of
+/// ending on its own.
+#[must_use]
+pub fn is_output_limit_stop_reason(stop_reason: &str) -> bool {
+    matches!(
+        stop_reason,
+        "max_tokens" | "length" | "model_context_window_exceeded"
+    )
 }
 
 /// Minimal streaming API contract required by [`ConversationRuntime`].
@@ -362,7 +387,12 @@ where
         }
         output = merge_hook_feedback(post_hook_result.messages(), output, post_hook_stopped);
 
-        ConversationMessage::tool_result(call.tool_use_id, call.tool_name, output, is_error)
+        let mut message =
+            ConversationMessage::tool_result(call.tool_use_id, call.tool_name, output, is_error);
+        if !is_error {
+            crate::tool_images::attach_tool_images(&mut message);
+        }
+        message
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -464,15 +494,35 @@ where
 
     /// Like [`Self::run_turn`], with extra blocks (e.g. images) appended to
     /// the user message.
-    #[allow(clippy::too_many_lines)]
     pub fn run_turn_with_attachments(
         &mut self,
         user_input: impl Into<String>,
         attachments: Vec<ContentBlock>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.drive_turn(user_input.into(), Some(attachments), prompter)
+    }
+
+    /// Picks up a turn whose request is already in the session, e.g. after
+    /// it failed on a full context window and the session was compacted:
+    /// the work it did is kept and `turn_request` is not sent a second time.
+    pub fn continue_turn(
+        &mut self,
+        turn_request: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.drive_turn(turn_request.into(), None, prompter)
+    }
+
+    /// Runs the agent loop for `user_input`. With `attachments` the request
+    /// is a new user message; without, the session already holds it.
+    #[allow(clippy::too_many_lines)]
+    fn drive_turn(
+        &mut self,
+        user_input: String,
+        attachments: Option<Vec<ContentBlock>>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
-
         // ROADMAP #38: Session-health canary - probe if context was compacted
         if self.session.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -486,15 +536,20 @@ where
 
         self.record_turn_started(&user_input);
         let turn_request = user_input.clone();
-        self.session
-            .push_user_blocks(user_input, attachments)
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Some(attachments) = attachments {
+            self.session
+                .push_user_blocks(user_input, attachments)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        } else {
+            keep_turn_request(&mut self.session, &turn_request);
+        }
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut auto_compaction = None;
+        let mut cut_off_continuations = 0;
 
         loop {
             iterations += 1;
@@ -517,6 +572,9 @@ where
                     return Err(error);
                 }
             };
+            let reply_cut_off = events
+                .iter()
+                .any(|event| matches!(event, AssistantEvent::OutputLimitReached));
             let (assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
@@ -529,7 +587,7 @@ where
                 self.usage_tracker.record(usage);
             }
             prompt_cache_events.extend(turn_prompt_cache_events);
-            let pending_tool_uses = assistant_message
+            let mut pending_tool_uses = assistant_message
                 .blocks
                 .iter()
                 .filter_map(|block| match block {
@@ -539,6 +597,16 @@ where
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            // A reply cut off at the token limit ends inside its last tool
+            // call: that input is unfinished JSON and must not be run.
+            let cut_off_tool_use = if reply_cut_off
+                && pending_tool_uses.last().is_some_and(|(_, _, input)| {
+                    serde_json::from_str::<serde_json::Value>(input).is_err()
+                }) {
+                pending_tool_uses.pop()
+            } else {
+                None
+            };
             self.record_assistant_iteration(
                 iterations,
                 &assistant_message,
@@ -556,7 +624,16 @@ where
                 auto_compaction = Some(compaction);
             }
 
-            if pending_tool_uses.is_empty() {
+            if pending_tool_uses.is_empty() && cut_off_tool_use.is_none() {
+                if reply_cut_off && cut_off_continuations < MAX_CUT_OFF_CONTINUATIONS {
+                    cut_off_continuations += 1;
+                    self.session
+                        .push_message(crate::session::ConversationMessage::user_text(
+                            CUT_OFF_CONTINUE_PROMPT,
+                        ))
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
                 break;
             }
 
@@ -564,7 +641,8 @@ where
             // runs alone, in order. Hooks, permission prompts and session writes
             // all stay on this thread, in the original order.
             let groups = group_for_parallel_execution(pending_tool_uses, |tool_name| {
-                self.tool_executor.can_run_in_parallel(tool_name)
+                !tool_name.eq_ignore_ascii_case("bash")
+                    && self.tool_executor.can_run_in_parallel(tool_name)
             });
             for group in groups {
                 let mut prepared = Vec::with_capacity(group.len());
@@ -588,12 +666,19 @@ where
                 for (tool_name, _) in &allowed {
                     self.record_tool_started(iterations, tool_name);
                 }
+                // Esc/Stop ends shell commands this turn is running.
+                let _abort_scope = crate::bash::TurnAbortScope::enter(&self.hook_abort_signal);
                 let mut results = if allowed.len() > 1 {
                     self.tool_executor.execute_batch(&allowed)
                 } else {
                     allowed
                         .iter()
-                        .map(|(tool_name, input)| self.tool_executor.execute(tool_name, input))
+                        .map(|(tool_name, input)| {
+                            let _host_scope = crate::bash::HostExecutionScope::for_authorized_call(
+                                tool_name, input,
+                            );
+                            self.tool_executor.execute(tool_name, input)
+                        })
                         .collect()
                 }
                 .into_iter();
@@ -616,9 +701,26 @@ where
                     self.session
                         .push_message(result_message.clone())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    crate::tool_images::drop_old_tool_images(
+                        &mut self.session.messages,
+                        crate::tool_images::KEEP_TOOL_IMAGES,
+                    );
                     self.record_tool_finished(iterations, &result_message);
                     tool_results.push(result_message);
                 }
+            }
+            if let Some((tool_use_id, tool_name, _)) = cut_off_tool_use {
+                let result_message = ConversationMessage::tool_result(
+                    tool_use_id,
+                    tool_name,
+                    CUT_OFF_TOOL_CALL_RESULT.to_string(),
+                    true,
+                );
+                self.session
+                    .push_message(result_message.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.record_tool_finished(iterations, &result_message);
+                tool_results.push(result_message);
             }
 
             // Background shells or agents that finished while the tools ran
@@ -627,7 +729,7 @@ where
                 let notices = crate::global_background_jobs().drain_notices();
                 if !notices.is_empty() {
                     self.session
-                        .push_message(ConversationMessage::user_text(format!(
+                        .push_message(crate::session::ConversationMessage::user_text(format!(
                             "<system-reminder>\n{}\n</system-reminder>",
                             notices.join("\n")
                         )))
@@ -640,7 +742,7 @@ where
             for text in crate::turn_keys::take_queued_for_running_turn() {
                 crate::turn_keys::announce_sent_to_running_turn(&text);
                 self.session
-                    .push_message(ConversationMessage::user_text(text))
+                    .push_message(crate::session::ConversationMessage::user_text(text))
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
             }
         }
@@ -706,24 +808,67 @@ where
         // crossed the threshold long before the context was full, and once
         // crossed it compacted after every step.
         let latest = self.usage_tracker.current_turn_usage();
+        // The reply is in the session now too, so it counts toward the next
+        // request: a long reply (a whole file written) can by itself push
+        // that request past a small window.
         let context_tokens = latest
             .input_tokens
             .saturating_add(latest.cache_creation_input_tokens)
-            .saturating_add(latest.cache_read_input_tokens);
-        if context_tokens < self.auto_compaction_input_tokens_threshold {
+            .saturating_add(latest.cache_read_input_tokens)
+            .saturating_add(latest.output_tokens);
+        let threshold = self.auto_compaction_input_tokens_threshold;
+        if context_tokens < threshold {
             return None;
         }
 
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
-                max_estimated_tokens: 0,
-                ..CompactionConfig::default()
-            },
-        );
+        // What the request spends outside the session (system prompt, tool
+        // definitions). The compacted session has to land well under the
+        // threshold: keeping a fixed 4 messages left a small window above
+        // it right after compacting (two file reads plus a ~13k prompt), so
+        // every step compacted again, the model saw only its last two calls
+        // plus the re-attached request, and started the task over.
+        let session_tokens =
+            u32::try_from(estimate_session_tokens(&self.session)).unwrap_or(u32::MAX);
+        let overhead = context_tokens.saturating_sub(session_tokens);
+        let target = overhead + threshold.saturating_sub(overhead) / 2;
+        let size = |session: &Session| {
+            overhead
+                .saturating_add(u32::try_from(estimate_session_tokens(session)).unwrap_or(u32::MAX))
+        };
 
-        if result.removed_message_count == 0 {
-            return None;
+        // When the prompt alone (nearly) fills the threshold no compaction
+        // gets under it: keep the usual 4 messages rather than strip the
+        // session bare.
+        let room = threshold.saturating_sub(overhead);
+        let schedule: &[usize] = if room >= threshold / 8 {
+            &[4, 2, 1]
+        } else {
+            &[4]
+        };
+        let mut compacted = None;
+        for &preserve_recent_messages in schedule {
+            let result = compact_session(
+                &self.session,
+                CompactionConfig {
+                    preserve_recent_messages,
+                    max_estimated_tokens: 0,
+                },
+            );
+            if result.removed_message_count == 0 {
+                continue;
+            }
+            let fits = size(&result.compacted_session) <= target;
+            compacted = Some(result);
+            if fits {
+                break;
+            }
+        }
+        let mut result = compacted?;
+        if size(&result.compacted_session) > target {
+            // The kept messages hold large tool output: cut it to an even
+            // share of the room left (~4 characters per token).
+            let room_chars = target.saturating_sub(overhead) as usize * 4;
+            truncate_large_tool_results(&mut result.compacted_session, (room_chars / 2).max(2_000));
         }
 
         self.session = result.compacted_session;
@@ -884,23 +1029,34 @@ pub fn set_auto_compaction_threshold_override(tokens: Option<u32>) {
 /// else the environment, else the default.
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
+    configured_auto_compaction_threshold().unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+/// The threshold the user chose (`/autocompact`, or the environment), if
+/// any. Without one, a caller that knows the model's window can derive a
+/// better threshold than the default.
+#[must_use]
+pub fn configured_auto_compaction_threshold() -> Option<u32> {
     let set = AUTO_COMPACTION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if set > 0 {
-        return set;
+        return Some(set);
     }
-    parse_auto_compaction_threshold(
+    parse_configured_threshold(
         std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
             .ok()
             .as_deref(),
     )
 }
 
-#[must_use]
-fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+fn parse_configured_threshold(value: Option<&str>) -> Option<u32> {
     value
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
-        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+#[cfg(test)]
+fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+    parse_configured_threshold(value).unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
 fn build_assistant_message(
@@ -938,6 +1094,7 @@ fn build_assistant_message(
             }
             AssistantEvent::Usage(value) => usage = Some(value),
             AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
+            AssistantEvent::OutputLimitReached => {}
             AssistantEvent::MessageStop => {
                 finished = true;
             }
@@ -1176,6 +1333,79 @@ mod tests {
                 .iter()
                 .map(|(tool_name, input)| Ok(format!("{tool_name} {input}")))
                 .collect()
+        }
+    }
+
+    struct HostCallClient {
+        sent: bool,
+    }
+    impl ApiClient for HostCallClient {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            if std::mem::replace(&mut self.sent, true) {
+                return Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ]);
+            }
+            Ok(vec![
+                AssistantEvent::ToolUse {
+                    id: "host".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"printf host-approved","dangerouslyDisableSandbox":true}"#
+                        .to_string(),
+                },
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    struct ApproveHost;
+    impl PermissionPrompter for ApproveHost {
+        fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+            assert_eq!(request.tool_name, "bash");
+            assert!(request
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("outside Claw's sandbox"));
+            PermissionPromptDecision::Allow
+        }
+    }
+
+    #[test]
+    fn host_executor_only_receives_approved_calls() {
+        for approved in [false, true] {
+            let executor = StaticToolExecutor::new().register("bash", |input| {
+                let input = serde_json::from_str(input).unwrap();
+                crate::execute_bash(input)
+                    .map(|output| output.stdout)
+                    .map_err(|error| ToolError::new(error.to_string()))
+            });
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                HostCallClient { sent: false },
+                executor,
+                PermissionPolicy::new(PermissionMode::Allow),
+                vec![],
+            );
+            let mut prompt = ApproveHost;
+            let prompter = if approved {
+                Some(&mut prompt as &mut dyn PermissionPrompter)
+            } else {
+                None
+            };
+            let summary = runtime.run_turn("test host execution", prompter).unwrap();
+            match &summary.tool_results[0].blocks[0] {
+                ContentBlock::ToolResult {
+                    is_error, output, ..
+                } => {
+                    assert_eq!(*is_error, !approved);
+                    if approved {
+                        assert_eq!(output, "host-approved");
+                    }
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
         }
     }
 
@@ -1778,6 +2008,174 @@ mod tests {
         assert_eq!(runtime.usage().cumulative_usage().total_tokens(), 21);
     }
 
+    /// Replays one scripted reply per request and records the requests.
+    struct CutOffApi {
+        replies: Vec<Vec<AssistantEvent>>,
+        requests: Vec<ApiRequest>,
+    }
+
+    impl ApiClient for CutOffApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.requests.push(request);
+            Ok(self.replies.remove(0))
+        }
+    }
+
+    #[test]
+    fn continues_a_reply_cut_off_at_the_output_limit() {
+        let api = CutOffApi {
+            replies: vec![
+                vec![
+                    AssistantEvent::TextDelta("first half".to_string()),
+                    AssistantEvent::OutputLimitReached,
+                    AssistantEvent::MessageStop,
+                ],
+                vec![
+                    AssistantEvent::TextDelta(" second half".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("write it", None).expect("turn runs");
+
+        assert_eq!(summary.assistant_messages.len(), 2);
+        let continue_request = &runtime.api_client_mut().requests[1];
+        let last = continue_request.messages.last().expect("a message");
+        assert_eq!(last.role, MessageRole::User);
+        assert!(matches!(
+            &last.blocks[0],
+            ContentBlock::Text { text } if text.contains("cut off at the output-token limit")
+        ));
+    }
+
+    #[test]
+    fn stops_continuing_cut_off_replies_after_the_limit() {
+        let cut_off = || {
+            vec![
+                AssistantEvent::TextDelta("more".to_string()),
+                AssistantEvent::OutputLimitReached,
+                AssistantEvent::MessageStop,
+            ]
+        };
+        let api = CutOffApi {
+            replies: (0..=super::MAX_CUT_OFF_CONTINUATIONS)
+                .map(|_| cut_off())
+                .collect(),
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("write it", None).expect("turn ends");
+
+        assert_eq!(
+            summary.assistant_messages.len(),
+            super::MAX_CUT_OFF_CONTINUATIONS + 1
+        );
+    }
+
+    #[test]
+    fn does_not_run_a_tool_call_cut_off_at_the_output_limit() {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let ran_in_tool = ran.clone();
+        let api = CutOffApi {
+            replies: vec![
+                vec![
+                    AssistantEvent::ToolUse {
+                        id: "t1".to_string(),
+                        name: "write_file".to_string(),
+                        input: r##"{"path":"a.md","content":"# Tit"##.to_string(),
+                    },
+                    AssistantEvent::OutputLimitReached,
+                    AssistantEvent::MessageStop,
+                ],
+                vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new().register("write_file", move |_input| {
+                ran_in_tool.set(ran_in_tool.get() + 1);
+                Ok("written".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("write it", None).expect("turn runs");
+
+        assert_eq!(ran.get(), 0);
+        assert_eq!(summary.tool_results.len(), 1);
+        assert!(matches!(
+            &summary.tool_results[0].blocks[0],
+            ContentBlock::ToolResult { output, is_error: true, .. }
+                if output.contains("tool call was cut off")
+        ));
+    }
+
+    #[test]
+    fn auto_compaction_counts_the_reply_tokens() {
+        let mut session = Session::new();
+        for index in 0..6 {
+            session
+                .push_message(crate::session::ConversationMessage::user_text(format!(
+                    "question {index}"
+                )))
+                .expect("push");
+            session
+                .push_message(crate::session::ConversationMessage::assistant(vec![
+                    ContentBlock::Text {
+                        text: format!("answer {index}"),
+                    },
+                ]))
+                .expect("push");
+        }
+        let api = CutOffApi {
+            replies: vec![vec![
+                AssistantEvent::TextDelta("long reply".to_string()),
+                AssistantEvent::Usage(TokenUsage {
+                    input_tokens: 600,
+                    output_tokens: 500,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+                AssistantEvent::MessageStop,
+            ]],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            session,
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1_000);
+
+        let summary = runtime.run_turn("next", None).expect("turn runs");
+
+        assert!(summary.auto_compaction.is_some());
+    }
+
     #[test]
     fn compacts_session_after_turns() {
         struct SimpleApi;
@@ -1989,6 +2387,135 @@ mod tests {
             events.push(AssistantEvent::MessageStop);
             Ok(events)
         }
+    }
+
+    #[test]
+    fn continue_turn_resumes_without_sending_the_request_again() {
+        struct ReplyApiClient;
+        impl ApiClient for ReplyApiClient {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("finished".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut session = Session::new();
+        session
+            .push_user_text("list the tools")
+            .expect("push request");
+        session
+            .push_message(crate::session::ConversationMessage::tool_result(
+                "tool-1",
+                "read_file",
+                "contents",
+                false,
+            ))
+            .expect("push tool result");
+        let mut runtime = ConversationRuntime::new(
+            session,
+            ReplyApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .continue_turn("list the tools", None)
+            .expect("turn should continue");
+
+        let requests = runtime
+            .session()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .count();
+        assert_eq!(requests, 1);
+        assert_eq!(runtime.session().messages.len(), 3);
+    }
+
+    /// Like a local server: each request reports its real size, a fixed
+    /// prompt overhead plus the history it was sent.
+    struct SizedReadLoopApi {
+        tool_steps: usize,
+        calls: usize,
+        overhead: u32,
+    }
+
+    impl ApiClient for SizedReadLoopApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.calls += 1;
+            let mut sent = Session::new();
+            sent.messages = request.messages;
+            let context = self.overhead + crate::compact::estimate_session_tokens(&sent) as u32;
+            let mut events = if self.calls <= self.tool_steps {
+                vec![AssistantEvent::ToolUse {
+                    id: format!("tool-{}", self.calls),
+                    name: "read_file".to_string(),
+                    input: format!(r#"{{"path":"/w/main.cpp","offset":{}}}"#, self.calls),
+                }]
+            } else {
+                vec![AssistantEvent::TextDelta("done".to_string())]
+            };
+            events.push(AssistantEvent::Usage(TokenUsage {
+                input_tokens: context,
+                output_tokens: 60,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }));
+            events.push(AssistantEvent::MessageStop);
+            Ok(events)
+        }
+    }
+
+    #[test]
+    fn auto_compaction_does_not_fire_on_every_step_of_a_small_window() {
+        let _queue = crate::turn_keys::exclusive_queue();
+        // The wd session: a 32k window, ~13.4k tokens of system prompt and
+        // tools, and 12k-character file reads. Keeping a fixed 4 messages
+        // stayed over the threshold, so every step compacted again (22
+        // times in one turn) and the model kept starting over.
+        let steps = 20;
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SizedReadLoopApi {
+                tool_steps: steps,
+                calls: 0,
+                overhead: 13_400,
+            },
+            StaticToolExecutor::new().register("read_file", |_| Ok("x".repeat(12_000))),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(22_528);
+
+        runtime
+            .run_turn("make people terms search the people category", None)
+            .expect("turn should succeed");
+        let compactions = runtime
+            .session()
+            .compaction
+            .as_ref()
+            .map_or(0, |compaction| compaction.count);
+        assert!(compactions > 0, "the window does fill up");
+        assert!(
+            (compactions as usize) * 2 <= steps,
+            "compacted {compactions} times in {steps} steps"
+        );
+        let first = &runtime.session().messages[0];
+        let ContentBlock::Text { text } = &first.blocks[0] else {
+            panic!("summary message should be text");
+        };
+        assert!(text.contains("read_file /w/main.cpp (offset 1)"), "{text}");
+        assert!(
+            text.len() < 8_000,
+            "summary stays bounded: {} chars",
+            text.len()
+        );
     }
 
     #[test]

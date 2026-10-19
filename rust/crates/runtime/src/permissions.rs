@@ -105,6 +105,14 @@ pub struct PermissionPolicy {
     /// Judge bash commands by content: approval only for privileged or
     /// destructive ones (`bashApproval: "risky"`).
     risky_bash_only: bool,
+    /// Risky bash commands ask in every mode, full access included
+    /// (`bashApproval: "sudo-and-destructive"` / `"destructive"`).
+    risky_bash_asks_in_every_mode: bool,
+    /// Running as root counts as risky; false for `bashApproval: "destructive"`.
+    root_bash_is_risky: bool,
+    /// The shell sandbox is enabled in settings. When it is off, a request to
+    /// run outside it is an ordinary command and needs no extra approval.
+    sandbox_enabled: bool,
     /// #159: simple tool-name denials. Tools in this list are unconditionally
     /// denied regardless of permission mode, checked before the rule-based
     /// deny/allow/ask evaluation.
@@ -121,8 +129,18 @@ impl PermissionPolicy {
             deny_rules: Vec::new(),
             ask_rules: Vec::new(),
             risky_bash_only: false,
+            risky_bash_asks_in_every_mode: false,
+            root_bash_is_risky: true,
+            sandbox_enabled: true,
             denied_tools: Vec::new(),
         }
+    }
+
+    /// Whether the shell sandbox is enabled in settings (the default).
+    #[must_use]
+    pub fn with_sandbox_enabled(mut self, enabled: bool) -> Self {
+        self.sandbox_enabled = enabled;
+        self
     }
 
     #[must_use]
@@ -139,6 +157,8 @@ impl PermissionPolicy {
     #[must_use]
     pub fn with_permission_rules(mut self, config: &RuntimePermissionRuleConfig) -> Self {
         self.risky_bash_only = config.risky_bash_only();
+        self.risky_bash_asks_in_every_mode = config.risky_bash_asks_in_every_mode();
+        self.root_bash_is_risky = config.root_bash_is_risky();
         self.allow_rules = config
             .allow()
             .iter()
@@ -183,7 +203,7 @@ impl PermissionPolicy {
         let base = self.required_mode_for(tool_name);
         if tool_name == "bash" && self.risky_bash_only {
             if let Some(command) = bash_command_of(input) {
-                return bash_command_requirement(&command);
+                return bash_command_requirement(&command, self.root_bash_is_risky);
             }
         }
         // Outside the current directory, only changing a file that already
@@ -238,10 +258,33 @@ impl PermissionPolicy {
             };
         }
 
+        if self.sandbox_enabled && is_host_execution_request(tool_name, input) {
+            if context.override_decision() == Some(PermissionOverride::Deny) {
+                return PermissionOutcome::Deny {
+                    reason: "host execution denied by hook".to_string(),
+                };
+            }
+            if self.active_mode() == PermissionMode::ReadOnly {
+                return PermissionOutcome::Deny {
+                    reason: "host execution is unavailable in read-only mode".to_string(),
+                };
+            }
+            return Self::prompt_or_deny(tool_name, input, self.active_mode(),
+                PermissionMode::DangerFullAccess,
+                Some("Run this exact command on the host, outside Claw's sandbox. This approval is separate from ordinary Bash permissions.".to_string()), prompter);
+        }
+
         let current_mode = self.active_mode();
         let required_mode = self.required_mode_for_input(tool_name, input);
         let ask_rule = Self::find_matching_restriction(&self.ask_rules, tool_name, input);
-        let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
+        // A bash allow rule only counts when it also covers every risky
+        // command in a chain: `bash(git:*)` must not approve `git status; rm -rf ~`.
+        let allow_rule =
+            Self::find_matching_rule(&self.allow_rules, tool_name, input).filter(|_| {
+                tool_name != "bash"
+                    || bash_command_of(input)
+                        .is_none_or(|command| self.uncovered_bash_risk(&command).is_none())
+            });
 
         match context.override_decision() {
             Some(PermissionOverride::Deny) => {
@@ -281,6 +324,16 @@ impl PermissionPolicy {
                         prompter,
                     );
                 }
+                if let Some(reason) = self.risky_bash_reason(tool_name, input) {
+                    return Self::prompt_or_deny(
+                        tool_name,
+                        input,
+                        current_mode,
+                        required_mode,
+                        Some(reason),
+                        prompter,
+                    );
+                }
                 if allow_rule.is_some()
                     || current_mode == PermissionMode::Allow
                     || current_mode >= required_mode
@@ -306,6 +359,17 @@ impl PermissionPolicy {
             );
         }
 
+        if let Some(reason) = self.risky_bash_reason(tool_name, input) {
+            return Self::prompt_or_deny(
+                tool_name,
+                input,
+                current_mode,
+                required_mode,
+                Some(reason),
+                prompter,
+            );
+        }
+
         if allow_rule.is_some()
             || current_mode == PermissionMode::Allow
             || current_mode >= required_mode
@@ -320,7 +384,7 @@ impl PermissionPolicy {
             let risk = (tool_name == "bash")
                 .then(|| bash_command_of(input))
                 .flatten()
-                .and_then(|command| bash_command_risk(&command));
+                .and_then(|command| bash_risk(&command, self.root_bash_is_risky));
             let reason = Some(risk.unwrap_or_else(|| {
                 format!(
                     "tool '{tool_name}' requires approval to escalate from {} to {}",
@@ -345,6 +409,41 @@ impl PermissionPolicy {
                 current_mode.as_str()
             ),
         }
+    }
+
+    /// With `bashApproval: "sudo-and-destructive"` or `"destructive"`, why a
+    /// bash call must be approved whatever the mode: it runs as root (unless
+    /// `"destructive"`) or destroys data, disks, processes or git history.
+    /// Allow rules covering each risky command still pre-approve it.
+    fn risky_bash_reason(&self, tool_name: &str, input: &str) -> Option<String> {
+        if !self.risky_bash_asks_in_every_mode || tool_name != "bash" {
+            return None;
+        }
+        bash_command_of(input).and_then(|command| self.uncovered_bash_risk(&command))
+    }
+
+    /// Why `command` is risky despite the bash allow rules, or `None` when
+    /// they cover it. Each risky command in a chain needs a rule matching
+    /// that command (`bash(shutdown:*)` covers `shutdown -h +5`, not
+    /// `shutdown now; rm -rf ~`); a pattern spanning the whole command
+    /// (`rm -rf /`, a fork bomb) needs a rule matching the whole command.
+    fn uncovered_bash_risk(&self, command: &str) -> Option<String> {
+        let covered = |subject: &str| {
+            self.allow_rules.iter().any(|rule| {
+                rule.tool_name.eq_ignore_ascii_case("bash") && rule.matches_subject(subject)
+            })
+        };
+        if let crate::bash_validation::ValidationResult::Warn { message }
+        | crate::bash_validation::ValidationResult::Block { reason: message } =
+            crate::bash_validation::check_destructive(command)
+        {
+            if !covered(command.trim()) {
+                return Some(message);
+            }
+        }
+        risk_segments(command).into_iter().find_map(|segment| {
+            bash_risk(&segment, self.root_bash_is_risky).filter(|_| !covered(&segment))
+        })
     }
 
     fn prompt_or_deny(
@@ -399,6 +498,7 @@ impl PermissionPolicy {
         rules.iter().find(|rule| {
             rule.matches(tool_name, input)
                 || (tool_name == "bash"
+                    && rule.tool_name.eq_ignore_ascii_case("bash")
                     && extract_permission_subject(input).is_some_and(|command| {
                         shell_command_segments(&command)
                             .iter()
@@ -406,6 +506,20 @@ impl PermissionPolicy {
                     }))
         })
     }
+}
+
+/// An explicit request for the host executor, never inferred from `sudo`.
+#[must_use]
+pub fn is_host_execution_request(tool_name: &str, input: &str) -> bool {
+    tool_name.eq_ignore_ascii_case("bash")
+        && serde_json::from_str::<Value>(input)
+            .ok()
+            .is_some_and(|value| {
+                value
+                    .get("dangerouslyDisableSandbox")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            })
 }
 
 /// The `command` field of a bash tool input.
@@ -432,37 +546,60 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
 /// git history. Every command in a chain or pipeline is checked.
 #[must_use]
 pub fn bash_command_risk(command: &str) -> Option<String> {
+    bash_risk(command, true)
+}
+
+/// Like [`bash_command_risk`], but running as root alone is not a risk: only
+/// destructive commands are, also behind `sudo`, `doas` or `pkexec`.
+#[must_use]
+pub fn bash_command_destructive_risk(command: &str) -> Option<String> {
+    bash_risk(command, false)
+}
+
+/// Options of `sudo`/`doas` that take a value as the next word.
+const PRIVILEGE_OPTIONS_WITH_VALUE: &[&str] =
+    &["-u", "-g", "-C", "-D", "-p", "-r", "-t", "-U", "-h"];
+
+fn bash_risk(command: &str, root_is_risky: bool) -> Option<String> {
     if let crate::bash_validation::ValidationResult::Warn { message }
     | crate::bash_validation::ValidationResult::Block { reason: message } =
         crate::bash_validation::check_destructive(command)
     {
         return Some(message);
     }
-    // Split at quotes too (finds `bash -c 'sudo ...'`), and without splitting
-    // at quotes (keeps `find . -name '*.o' -delete` in one piece).
-    let unquoted_segments = command
-        .split([';', '&', '|', '\n', '(', ')', '`'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string);
-    for segment in shell_command_segments(command)
-        .into_iter()
-        .chain(unquoted_segments)
-    {
-        let words = segment.split_whitespace().collect::<Vec<_>>();
+    for segment in risk_segments(command) {
+        let mut words = segment.split_whitespace().collect::<Vec<_>>();
+        let base_name = |word: &str| word.rsplit('/').next().unwrap_or(word).to_string();
+        if !root_is_risky {
+            // Judge what runs as root, not the act of running as root.
+            while words
+                .first()
+                .is_some_and(|word| PRIVILEGE_COMMANDS.contains(&base_name(word).as_str()))
+            {
+                let mut index = 1;
+                while index < words.len() && words[index].starts_with('-') {
+                    if PRIVILEGE_OPTIONS_WITH_VALUE.contains(&words[index]) {
+                        index += 1;
+                    }
+                    index += 1;
+                }
+                words.drain(..index.min(words.len()));
+            }
+        }
         let Some(first) = words
             .first()
-            .map(|word| word.rsplit('/').next().unwrap_or(word))
+            .map(|word| base_name(word.trim_start_matches(['\'', '"'])))
         else {
             continue;
         };
+        let first = first.as_str();
         let has = |flag: &str| words.contains(&flag);
         let has_short = |letter: char| {
             words.iter().any(|word| {
                 word.starts_with('-') && !word.starts_with("--") && word.contains(letter)
             })
         };
-        if PRIVILEGE_COMMANDS.contains(&first) {
+        if root_is_risky && PRIVILEGE_COMMANDS.contains(&first) {
             return Some(format!("runs as root ({first}): {segment}"));
         }
         if DESTRUCTIVE_COMMANDS.contains(&first) || first.starts_with("mkfs") {
@@ -496,9 +633,33 @@ pub fn bash_command_risk(command: &str) -> Option<String> {
     None
 }
 
+/// The commands of a chain or pipeline that [`bash_risk`] judges one by one.
+/// Split at quotes too (finds `bash -c 'sudo ...'`), and without splitting
+/// at quotes (keeps `find . -name '*.o' -delete` in one piece).
+fn risk_segments(command: &str) -> Vec<String> {
+    let unquoted_segments = command
+        .split([';', '&', '|', '\n', '(', ')', '`'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string);
+    shell_command_segments(command)
+        .into_iter()
+        .chain(unquoted_segments)
+        .collect()
+}
+
+/// Programs whose arguments only name what they act on (a process, a
+/// time): "always" covers the program, whatever the target.
+const TARGET_ONLY_PROGRAMS: &[&str] = &[
+    "kill", "pkill", "killall", "shutdown", "reboot", "poweroff", "halt",
+];
+
 /// What "always allow in this session" remembers for a bash command: the
 /// first two words of the command that made it need approval (`sudo emerge`,
 /// `rm -rf`), so approving `sudo emerge` does not also approve `sudo rm`.
+/// A second word that is only a target is left out, or the key would never
+/// match again: `kill 1234`, `pkill llama-server` and `rm build/` are
+/// remembered as `kill`, `pkill` and `rm`.
 #[must_use]
 pub fn bash_approval_key(command: &str) -> String {
     let segments = shell_command_segments(command);
@@ -508,11 +669,18 @@ pub fn bash_approval_key(command: &str) -> String {
         .or_else(|| segments.first());
     risky
         .map(|segment| {
-            segment
-                .split_whitespace()
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" ")
+            let words: Vec<&str> = segment.split_whitespace().take(2).collect();
+            match words.as_slice() {
+                [program, second]
+                    if TARGET_ONLY_PROGRAMS
+                        .contains(&program.rsplit('/').next().unwrap_or(program))
+                        || second.chars().all(|c| c.is_ascii_digit())
+                        || second.contains('/') =>
+                {
+                    (*program).to_string()
+                }
+                _ => words.join(" "),
+            }
         })
         .unwrap_or_else(|| command.trim().to_string())
 }
@@ -520,8 +688,8 @@ pub fn bash_approval_key(command: &str) -> String {
 /// The mode a bash command needs: full access (so the user is asked in the
 /// default mode) when [`bash_command_risk`] flags it, read-only when every
 /// command in it only reads, workspace-write otherwise.
-fn bash_command_requirement(command: &str) -> PermissionMode {
-    if bash_command_risk(command).is_some() {
+fn bash_command_requirement(command: &str, root_is_risky: bool) -> PermissionMode {
+    if bash_risk(command, root_is_risky).is_some() {
         return PermissionMode::DangerFullAccess;
     }
     let read_only = shell_command_segments(command).iter().all(|segment| {
@@ -805,6 +973,74 @@ mod tests {
     }
 
     #[test]
+    fn host_execution_always_needs_explicit_permission_and_respects_denials() {
+        let input =
+            r#"{"command":"sudo emerge --pretend app-misc/test","dangerouslyDisableSandbox":true}"#;
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["bash(*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        for mode in [
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::Prompt,
+            PermissionMode::Allow,
+            PermissionMode::DangerFullAccess,
+        ] {
+            let policy = PermissionPolicy::new(mode).with_permission_rules(&rules);
+            let context = PermissionContext::new(Some(PermissionOverride::Allow), None);
+            assert!(matches!(
+                policy.authorize_with_context("bash", input, &context, None),
+                PermissionOutcome::Deny { .. }
+            ));
+            let mut prompter = RecordingPrompter {
+                seen: Vec::new(),
+                allow: true,
+            };
+            assert_eq!(
+                policy.authorize_with_context("bash", input, &context, Some(&mut prompter)),
+                PermissionOutcome::Allow
+            );
+            assert_eq!(prompter.seen.len(), 1);
+            assert!(prompter.seen[0]
+                .reason
+                .as_ref()
+                .unwrap()
+                .contains("outside Claw's sandbox"));
+            prompter.allow = false;
+            assert!(matches!(
+                policy.authorize("bash", input, Some(&mut prompter)),
+                PermissionOutcome::Deny { .. }
+            ));
+        }
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["bash(sudo:*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::Allow).with_permission_rules(&rules);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+        assert!(matches!(
+            policy.authorize("bash", input, Some(&mut prompter)),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(prompter.seen.is_empty());
+        assert!(matches!(
+            PermissionPolicy::new(PermissionMode::ReadOnly).authorize(
+                "bash",
+                input,
+                Some(&mut prompter)
+            ),
+            PermissionOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
     fn allows_tools_when_active_mode_meets_requirement() {
         let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
             .with_tool_requirement("read_file", PermissionMode::ReadOnly)
@@ -894,6 +1130,25 @@ mod tests {
         assert!(matches!(
             policy.authorize("bash", r#"{"command":"rm -rf /tmp/x"}"#, None),
             PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
+        ));
+    }
+
+    #[test]
+    fn whole_tool_deny_rule_does_not_block_bash() {
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["WebSearch".to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = PermissionPolicy::new(PermissionMode::Allow).with_permission_rules(&rules);
+        assert_eq!(
+            policy.authorize("bash", r#"{"command":"echo hi"}"#, None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("WebSearch", r#"{"query":"x"}"#, None),
+            PermissionOutcome::Deny { .. }
         ));
     }
 
@@ -1071,6 +1326,36 @@ mod tests {
     }
 
     #[test]
+    fn prefix_allow_rules_cover_only_the_risky_commands_they_match() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["bash(shutdown:*)".to_string(), "bash(git:*)".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_risky_bash_asking_in_every_mode(true);
+        let full_access = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+        let read_only = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+        let allowed = |policy: &PermissionPolicy, command: &str| {
+            let input = serde_json::json!({ "command": command }).to_string();
+            policy.authorize("bash", &input, None) == PermissionOutcome::Allow
+        };
+
+        assert!(allowed(&full_access, "shutdown -h +5"));
+        assert!(allowed(&full_access, "shutdown -r now"));
+        assert!(allowed(&full_access, "sync && shutdown now"));
+        assert!(!allowed(&full_access, "shutdown now; rm -rf ~"));
+        assert!(!allowed(&full_access, "shutdown now $(pkill sshd)"));
+        assert!(!allowed(&full_access, "sudo shutdown now"));
+        assert!(allowed(&read_only, "git status"));
+        assert!(!allowed(&read_only, "git status; rm -rf build"));
+    }
+
+    #[test]
     fn rules_match_tool_names_with_capitals() {
         let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
             .with_tool_requirement("WebSearch", PermissionMode::DangerFullAccess)
@@ -1208,6 +1493,124 @@ mod tests {
     }
 
     #[test]
+    fn destructive_only_approval_asks_for_destruction_in_every_mode_but_not_for_root() {
+        let rules =
+            RuntimePermissionRuleConfig::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .with_risky_bash_asking_in_every_mode(false);
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&rules);
+        let asks = |command: &str| {
+            let input = serde_json::json!({ "command": command }).to_string();
+            matches!(
+                policy.authorize("bash", &input, None),
+                PermissionOutcome::Deny { .. }
+            )
+        };
+
+        for command in [
+            "sudo emerge --sync",
+            "cd /etc && sudo vim hosts",
+            "echo x | doas tee /etc/motd",
+            "sudo -u portage ls /var/db/repos",
+            "sudo systemctl restart sshd",
+            "cargo build --release",
+        ] {
+            assert!(!asks(command), "should run without asking: {command}");
+        }
+        for command in [
+            "rm -rf build",
+            "sudo rm -rf /var/tmp/portage",
+            "sudo -u root rm notes.txt",
+            "doas shred secret.key",
+            "find . -name '*.o' -delete",
+            "git reset --hard HEAD~1",
+            "git push --force origin main",
+            "sudo dd if=/dev/zero of=/dev/sda",
+            "sudo mkfs.ext4 /dev/sdb1",
+            "sudo emerge --depclean",
+            "pkill firefox",
+            "su -c 'rm -rf /opt/old'",
+        ] {
+            assert!(asks(command), "should ask first: {command}");
+        }
+
+        // Writing files anywhere needs no approval in full-access mode.
+        let outside = serde_json::json!({ "path": "/etc/hosts", "content": "x" }).to_string();
+        assert_eq!(
+            policy.authorize("write_file", &outside, None),
+            PermissionOutcome::Allow
+        );
+        // A whole-command allow rule still pre-approves a destructive command.
+        let allowed = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(
+                &RuntimePermissionRuleConfig::new(
+                    vec!["bash(rm -rf target:*)".to_string()],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .with_risky_bash_asking_in_every_mode(false),
+            );
+        let input = serde_json::json!({ "command": "rm -rf target" }).to_string();
+        assert_eq!(
+            allowed.authorize("bash", &input, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn sudo_and_destructive_approval_asks_for_root_and_destruction_in_full_access() {
+        let rules =
+            RuntimePermissionRuleConfig::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .with_risky_bash_asking_in_every_mode(true);
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+        let asks = |command: &str| {
+            let input = serde_json::json!({ "command": command }).to_string();
+            matches!(
+                policy.authorize("bash", &input, None),
+                PermissionOutcome::Deny { .. }
+            )
+        };
+        for command in ["cargo build --release", "emerge -pv vim", "cp a /tmp/b"] {
+            assert!(!asks(command), "should run without asking: {command}");
+        }
+        for command in [
+            "sudo id -u",
+            "cd /etc && sudo vim hosts",
+            "echo x | doas tee /etc/motd",
+            "rm notes.txt",
+            "git push --force origin main",
+        ] {
+            assert!(asks(command), "should ask first: {command}");
+        }
+    }
+
+    #[test]
+    fn host_execution_needs_no_extra_approval_when_the_sandbox_is_off() {
+        let input = r#"{"command":"sudo emerge --pretend vim","dangerouslyDisableSandbox":true}"#;
+        let rules =
+            RuntimePermissionRuleConfig::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .with_risky_bash_asking_in_every_mode(false);
+        let sandboxed = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_permission_rules(&rules);
+        assert!(matches!(
+            sandboxed.authorize("bash", input, None),
+            PermissionOutcome::Deny { .. }
+        ));
+        let unsandboxed = sandboxed.with_sandbox_enabled(false);
+        assert_eq!(
+            unsandboxed.authorize("bash", input, None),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
     fn bash_risk_explains_why_approval_is_needed() {
         let reason = super::bash_command_risk("cd /tmp && sudo emerge -av vim").expect("risky");
         assert!(reason.contains("root"), "{reason}");
@@ -1234,5 +1637,18 @@ mod tests {
         );
         assert_eq!(super::bash_approval_key("rm -rf build/"), "rm -rf");
         assert_eq!(super::bash_approval_key("ls -la"), "ls -la");
+        // Targets are not part of the key, so "always" keeps matching.
+        assert_eq!(super::bash_approval_key("kill 1234"), "kill");
+        assert_eq!(super::bash_approval_key("kill -9 5678"), "kill");
+        assert_eq!(super::bash_approval_key("pkill llama-server"), "pkill");
+        assert_eq!(
+            super::bash_approval_key("pkill -f 'python app.py'"),
+            "pkill"
+        );
+        assert_eq!(super::bash_approval_key("killall firefox"), "killall");
+        assert_eq!(super::bash_approval_key("rm build/old.o"), "rm");
+        // A privilege wrapper still keeps the program it runs.
+        assert_eq!(super::bash_approval_key("sudo kill 1234"), "sudo kill");
+        assert_eq!(super::bash_approval_key("sudo rm -rf /tmp/x"), "sudo rm");
     }
 }

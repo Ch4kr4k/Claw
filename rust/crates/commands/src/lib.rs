@@ -59,6 +59,108 @@ pub enum SkillSlashDispatch {
 
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
+        name: "rate-limit-options", aliases: &[], summary: "Show usage-limit recovery choices or open account settings",
+        argument_hint: Some("[usage|upgrade]"), resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "install-github-app", aliases: &[], summary: "Open the official Claude GitHub App installation flow",
+        argument_hint: None, resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "privacy-settings", aliases: &[], summary: "Open Claude account privacy settings in the browser",
+        argument_hint: None, resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "usage-credits", aliases: &[], summary: "Open Claude usage-credit settings in the browser",
+        argument_hint: None, resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "upgrade", aliases: &[], summary: "Open Claude subscription upgrades in the browser",
+        argument_hint: None, resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "vim", aliases: &[], summary: "Toggle Vim-style insert and normal editing modes",
+        argument_hint: Some("[on|off]"), resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "ide",
+        aliases: &[],
+        summary: "Detect or open the workspace in a supported editor",
+        argument_hint: Some("[status|open [code|cursor|zed]]"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "heapdump",
+        aliases: &[],
+        summary: "Write Rust process and session memory diagnostics (not a JavaScript heap)",
+        argument_hint: None,
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "artifacts",
+        aliases: &[],
+        summary: "List, open or attach local artifacts",
+        argument_hint: Some("[list|open <path>|attach <path>]"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "slides",
+        aliases: &[],
+        summary: "Create a local presentation artifact",
+        argument_hint: Some("<brief>"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "design",
+        aliases: &[],
+        summary: "Create a local HTML/SVG design artifact",
+        argument_hint: Some("<brief>"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "plugin-authoring",
+        aliases: &[],
+        summary: "Create a Claw plugin using the local manifest and runtime contracts",
+        argument_hint: Some("[task]"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "claude-api",
+        aliases: &[],
+        summary: "Work on Anthropic API integrations using official references",
+        argument_hint: Some("[task]"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "artifact-diagramming",
+        aliases: &[],
+        summary: "Load accessible SVG diagram guidance",
+        argument_hint: Some("[request]"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
+        name: "artifact-capabilities",
+        aliases: &[],
+        summary: "Explain local artifact capabilities",
+        argument_hint: Some("[request]"),
+        resume_supported: false,
+    },
+
+    SlashCommandSpec {
         name: "help",
         aliases: &[],
         summary: "Show available slash commands",
@@ -75,8 +177,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "sandbox",
         aliases: &[],
-        summary: "Show sandbox isolation status",
-        argument_hint: None,
+        summary: "Show sandbox status; on, off or toggle isolation",
+        argument_hint: Some("[status|on|off|toggle]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -96,8 +198,10 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "permissions",
         aliases: &["allowed-tools"],
-        summary: "Show or switch the active permission mode",
-        argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
+        summary: "Show or switch permission mode; add/remove/list allow, ask and deny rules",
+        argument_hint: Some(
+            "[read-only|workspace-write|danger-full-access|list|add|remove allow|ask|deny <rule>]",
+        ),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -124,22 +228,22 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         aliases: &["settings"],
-        summary: "Inspect Claude config files or merged sections",
-        argument_hint: Some("[env|hooks|model|plugins]"),
+        summary: "Inspect or edit settings and apply key=value changes",
+        argument_hint: Some("[key=value ...|edit|env|hooks|model|plugins]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "Inspect configured MCP servers",
-        argument_hint: Some("[list|show <server>|help]"),
+        summary: "Inspect MCP servers; enable, disable or reconnect server connections",
+        argument_hint: Some("[list|show <server>|enable|disable|reconnect [<server>|all]|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
-        argument_hint: None,
+        summary: "Inspect or edit instruction memory and toggle auto memory",
+        argument_hint: Some("[list|on|off|edit [project|user|auto]]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -455,6 +559,27 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "reflect",
+        aliases: &[],
+        summary: "Save what this session learned (decisions, facts, mistakes, preferences) to auto memory",
+        argument_hint: Some("[focus]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "scope-check",
+        aliases: &["scope"],
+        summary: "Adversarial second opinion before building: delusion score, a kill case, and a shippable v0",
+        argument_hint: Some("<idea or task>"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "diverge",
+        aliases: &[],
+        summary: "Think divergently about a problem: varied techniques, diverse ideas, blind spots",
+        argument_hint: Some("<problem>"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "batch",
         aliases: &[],
         summary: "Plan a large change as independent units and run them as parallel subagents in worktrees",
@@ -514,6 +639,62 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "focus",
         aliases: &[],
         summary: "Toggle the focus view: last prompt, one line per tool call, final reply (full-screen only)",
+        argument_hint: Some("[on|off]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "fast",
+        aliases: &[],
+        summary: "Quicker replies: low reasoning effort, plus the fastModel setting's model when set",
+        argument_hint: Some("[on|off]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "login",
+        aliases: &[],
+        summary: "Set up a provider, API key and model (saved to ~/.claw/settings.json)",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        aliases: &[],
+        summary: "Remove the saved provider, API key and model from ~/.claw/settings.json",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "auto-mode-setup",
+        aliases: &[],
+        summary: "Choose how much runs without asking: careful, balanced or autonomous presets",
+        argument_hint: Some("[careful|balanced|autonomous]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "schedule",
+        aliases: &[],
+        summary: "Local routines: run a prompt with `claw -p` on a cron schedule on this machine",
+        argument_hint: Some("[list|add <cron> <prompt>|remove <id>|run <id>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "ultrareview",
+        aliases: &[],
+        summary: "Multi-agent review with local sub-agents; verified findings via ReportFindings",
+        argument_hint: Some("[PR#|branch|path]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "autofix-pr",
+        aliases: &[],
+        summary: "Fix a PR's failing checks with gh: read failed logs, fix, verify, commit (asks before pushing)",
+        argument_hint: Some("[PR#|prompt]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "diffpanel",
+        aliases: &["diff-panel"],
+        summary: "Show or hide the diff panel: uncommitted changes, right of the conversation (full-screen only)",
         argument_hint: Some("[on|off]"),
         resume_supported: false,
     },
@@ -660,7 +841,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "release-notes",
         aliases: &[],
-        summary: "Generate release notes from recent changes",
+        summary: "Read the bundled Claw Code release notes",
         argument_hint: None,
         resume_supported: false,
     },
@@ -803,6 +984,9 @@ pub enum SlashCommand {
     Focus {
         mode: Option<String>,
     },
+    DiffPanel {
+        mode: Option<String>,
+    },
     Background {
         prompt: Option<String>,
     },
@@ -840,6 +1024,10 @@ pub enum SlashCommand {
     /// A command that sends the model a fixed prompt (`/run`, `/verify`,
     /// `/subtask`, …); see the binary's `prompt_for_command`.
     Prompted {
+        name: &'static str,
+        args: Option<String>,
+    },
+    LocalAction {
         name: &'static str,
         args: Option<String>,
     },
@@ -982,6 +1170,7 @@ impl SlashCommand {
     #[must_use]
     pub fn slash_name(&self) -> &'static str {
         match self {
+            Self::LocalAction { name, .. } => name,
             Self::Help => "/help",
             Self::Clear { .. } => "/clear",
             Self::Compact { .. } => "/compact",
@@ -1017,6 +1206,7 @@ impl SlashCommand {
             Self::ReloadSkills => "/reload-skills",
             Self::Keybindings => "/keybindings",
             Self::Focus { .. } => "/focus",
+            Self::DiffPanel { .. } => "/diffpanel",
             Self::Background { .. } => "/background",
             Self::ListAgents => "/list-agents",
             Self::Stop { .. } => "/stop",
@@ -1040,6 +1230,9 @@ impl SlashCommand {
                 "fewer-permission-prompts" => "/fewer-permission-prompts",
                 "statusline" => "/statusline",
                 "batch" => "/batch",
+                "reflect" => "/reflect",
+                "scope-check" => "/scope-check",
+                "diverge" => "/diverge",
                 "debug" => "/debug",
                 "dataviz" => "/dataviz",
                 "import" => "/import",
@@ -1108,6 +1301,138 @@ pub fn validate_slash_command_input(
     let remainder = remainder_after_command(trimmed, command);
 
     Ok(Some(match command {
+        "rate-limit-options" => SlashCommand::LocalAction {
+            name: "/rate-limit-options",
+            args: remainder,
+        },
+
+        "install-github-app" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::LocalAction {
+                name: "/install-github-app",
+                args: remainder,
+            }
+        }
+
+        "privacy-settings" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::LocalAction {
+                name: "/privacy-settings",
+                args: remainder,
+            }
+        }
+
+        "usage-credits" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::LocalAction {
+                name: "/usage-credits",
+                args: remainder,
+            }
+        }
+
+        "upgrade" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::LocalAction {
+                name: "/upgrade",
+                args: remainder,
+            }
+        }
+
+        "vim" => SlashCommand::LocalAction {
+            name: "/vim",
+            args: remainder,
+        },
+        "fast" => SlashCommand::LocalAction {
+            name: "/fast",
+            args: remainder,
+        },
+        "auto-mode-setup" => SlashCommand::LocalAction {
+            name: "/auto-mode-setup",
+            args: remainder,
+        },
+        "schedule" => SlashCommand::LocalAction {
+            name: "/schedule",
+            args: remainder,
+        },
+        "ultrareview" => SlashCommand::LocalAction {
+            name: "/ultrareview",
+            args: remainder,
+        },
+        "autofix-pr" => SlashCommand::LocalAction {
+            name: "/autofix-pr",
+            args: remainder,
+        },
+
+        "artifact-capabilities" => SlashCommand::LocalAction {
+            name: "/artifact-capabilities",
+            args: remainder,
+        },
+        "artifact-diagramming" => SlashCommand::LocalAction {
+            name: "/artifact-diagramming",
+            args: remainder,
+        },
+        "claude-api" => SlashCommand::LocalAction {
+            name: "/claude-api",
+            args: remainder,
+        },
+        "plugin-authoring" => SlashCommand::LocalAction {
+            name: "/plugin-authoring",
+            args: remainder,
+        },
+        "design" => SlashCommand::LocalAction {
+            name: "/design",
+            args: remainder,
+        },
+        "slides" => SlashCommand::LocalAction {
+            name: "/slides",
+            args: remainder,
+        },
+        "artifacts" => SlashCommand::LocalAction {
+            name: "/artifacts",
+            args: remainder,
+        },
+        "heapdump" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::LocalAction {
+                name: "/heapdump",
+                args: None,
+            }
+        }
+        "ide" => SlashCommand::LocalAction {
+            name: "/ide",
+            args: remainder,
+        },
+        "config" | "settings"
+            if args.iter().any(|a| a.contains('='))
+                || matches!(args.first(), Some(&"edit" | &"--help")) =>
+        {
+            SlashCommand::LocalAction {
+                name: "/config",
+                args: remainder,
+            }
+        }
+        "permissions" | "allowed-tools"
+            if matches!(args.first(), Some(&"add" | &"remove" | &"list")) =>
+        {
+            SlashCommand::LocalAction {
+                name: "/permissions",
+                args: remainder,
+            }
+        }
+        "memory" if !args.is_empty() => SlashCommand::LocalAction {
+            name: "/memory",
+            args: remainder,
+        },
+        "sandbox" if !args.is_empty() => SlashCommand::LocalAction {
+            name: "/sandbox",
+            args: remainder,
+        },
+        "mcp" if matches!(args.first(), Some(&"enable" | &"disable" | &"reconnect")) => {
+            SlashCommand::LocalAction {
+                name: "/mcp",
+                args: remainder,
+            }
+        }
         "help" => {
             validate_no_args(command, &args)?;
             SlashCommand::Help
@@ -1162,6 +1487,7 @@ pub fn validate_slash_command_input(
             SlashCommand::Keybindings
         }
         "focus" => SlashCommand::Focus { mode: remainder },
+        "diffpanel" | "diff-panel" => SlashCommand::DiffPanel { mode: remainder },
         "background" | "bg" => SlashCommand::Background { prompt: remainder },
         "list-agents" | "peers" => {
             validate_no_args(command, &args)?;
@@ -1191,6 +1517,18 @@ pub fn validate_slash_command_input(
         "batch" => SlashCommand::Prompted {
             name: "batch",
             args: Some(require_remainder(command, remainder, "<instruction>")?),
+        },
+        "reflect" => SlashCommand::Prompted {
+            name: "reflect",
+            args: remainder,
+        },
+        "scope-check" | "scope" => SlashCommand::Prompted {
+            name: "scope-check",
+            args: Some(require_remainder(command, remainder, "<idea or task>")?),
+        },
+        "diverge" => SlashCommand::Prompted {
+            name: "diverge",
+            args: Some(require_remainder(command, remainder, "<problem>")?),
         },
         "debug" => SlashCommand::Prompted {
             name: "debug",
@@ -1324,11 +1662,15 @@ pub fn validate_slash_command_input(
             SlashCommand::Setup
         }
         "login" | "logout" => {
-            return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
-                command,
-                "",
-            ));
+            validate_no_args(command, &args)?;
+            SlashCommand::LocalAction {
+                name: if command == "login" {
+                    "/login"
+                } else {
+                    "/logout"
+                },
+                args: None,
+            }
         }
         "stats" | "tokens" | "cache" => {
             validate_no_args(command, &args)?;
@@ -1582,9 +1924,11 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             target: None,
         }),
         [action, ..] => Err(command_error(
-            &format!("Unknown /mcp action '{action}'. Use list, show <server>, or help."),
+            &format!(
+                "Unknown /mcp action '{action}'. Use list, show <server>, enable, disable, reconnect, or help."
+            ),
             "mcp",
-            "/mcp [list|show <server>|help]",
+            "/mcp [list|show <server>|enable|disable|reconnect [<server>|all]|help]",
         )),
     }
 }
@@ -1796,7 +2140,9 @@ fn slash_command_category(name: &str) -> &'static str {
         | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
         | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
         | "bookmarks" | "btw" | "todos" | "recap" | "goal" | "loop" | "cd" | "branch"
-        | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => "Session",
+        | "context" | "files" | "focus" | "unfocus" | "diffpanel" | "retry" | "stop" | "undo" => {
+            "Session"
+        }
         "model"
         | "permissions"
         | "config"
@@ -5271,6 +5617,7 @@ pub fn handle_slash_command(
         | SlashCommand::ReloadPlugins
         | SlashCommand::Keybindings
         | SlashCommand::Focus { .. }
+        | SlashCommand::DiffPanel { .. }
         | SlashCommand::Background { .. }
         | SlashCommand::ListAgents
         | SlashCommand::Stop { .. }
@@ -5332,6 +5679,7 @@ pub fn handle_slash_command(
         | SlashCommand::AddDir { .. }
         | SlashCommand::History { .. }
         | SlashCommand::Setup
+        | SlashCommand::LocalAction { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -5966,17 +6314,31 @@ mod tests {
         assert!(show_error.contains("  Usage            /mcp show <server>"));
 
         let action_error = parse_error_message("/mcp inspect alpha");
-        assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
-        assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
+        assert!(action_error.contains(
+            "Unknown /mcp action 'inspect'. Use list, show <server>, enable, disable, reconnect, or help."
+        ));
+        assert!(action_error.contains(
+            "  Usage            /mcp [list|show <server>|enable|disable|reconnect [<server>|all]|help]"
+        ));
     }
 
     #[test]
-    fn removed_login_and_logout_commands_report_env_auth_guidance() {
-        let login_error = parse_error_message("/login");
-        assert!(login_error.contains("ANTHROPIC_API_KEY"));
-        let logout_error = parse_error_message("/logout");
-        assert!(logout_error.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_are_local_provider_actions() {
+        assert_eq!(
+            SlashCommand::parse("/login").unwrap(),
+            Some(SlashCommand::LocalAction {
+                name: "/login",
+                args: None
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/logout").unwrap(),
+            Some(SlashCommand::LocalAction {
+                name: "/logout",
+                args: None
+            })
+        );
+        assert!(parse_error_message("/login extra").contains("login"));
     }
 
     #[test]
@@ -6000,12 +6362,16 @@ mod tests {
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains(
+            "/permissions [read-only|workspace-write|danger-full-access|list|add|remove allow|ask|deny <rule>]"
+        ));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/config [key=value ...|edit|env|hooks|model|plugins]"));
+        assert!(
+            help.contains("/mcp [list|show <server>|enable|disable|reconnect [<server>|all]|help]")
+        );
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -6022,10 +6388,15 @@ mod tests {
             "/skills [list|show <name>|install <path>|uninstall <name>|help|<skill> [args]]"
         ));
         assert!(help.contains("aliases: /skill"));
-        assert!(!help.contains("/login"));
-        assert!(!help.contains("/logout"));
+        assert!(help.contains("/login"));
+        assert!(help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 99);
+        assert!(help.contains("/diffpanel [on|off]"));
+        assert!(help.contains("/schedule [list|add <cron> <prompt>|remove <id>|run <id>]"));
+        assert!(help.contains("/scope-check <idea or task>"));
+        assert!(help.contains("/diverge <problem>"));
+        assert!(help.contains("/reflect [focus]"));
+        assert_eq!(slash_command_specs().len(), 125);
         assert!(resume_supported_slash_commands().len() >= 32);
     }
 
@@ -6095,7 +6466,9 @@ mod tests {
     fn renders_per_command_help_detail_for_mcp() {
         let help = render_slash_command_help_detail("mcp").expect("detail help should exist");
         assert!(help.contains("/mcp"));
-        assert!(help.contains("Summary          Inspect configured MCP servers"));
+        assert!(help.contains(
+            "Summary          Inspect MCP servers; enable, disable or reconnect server connections"
+        ));
         assert!(help.contains("Category         Tools"));
         assert!(help.contains("Resume           Supported with --resume SESSION.jsonl"));
     }
@@ -7192,5 +7565,66 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+}
+
+#[cfg(test)]
+mod command_action_tests {
+    use super::*;
+    #[test]
+    fn action_commands_are_registered_and_dispatched_with_arguments() {
+        for (input, expected, args) in [
+            (
+                "/config theme=light autoMemoryEnabled=false",
+                "/config",
+                "theme=light autoMemoryEnabled=false",
+            ),
+            ("/settings edit", "/config", "edit"),
+            (
+                "/permissions add deny Bash(rm *)",
+                "/permissions",
+                "add deny Bash(rm *)",
+            ),
+            (
+                "/allowed-tools remove allow Bash(ls)",
+                "/permissions",
+                "remove allow Bash(ls)",
+            ),
+            ("/memory edit auto", "/memory", "edit auto"),
+            ("/sandbox off", "/sandbox", "off"),
+            ("/mcp disable example", "/mcp", "disable example"),
+            ("/design A settings screen", "/design", "A settings screen"),
+            ("/slides Quarterly review", "/slides", "Quarterly review"),
+            (
+                "/artifacts attach report.html",
+                "/artifacts",
+                "attach report.html",
+            ),
+            ("/vim on", "/vim", "on"),
+        ] {
+            let command = SlashCommand::parse(input).unwrap().unwrap();
+            assert_eq!(command.slash_name(), expected);
+            assert_eq!(
+                command,
+                SlashCommand::LocalAction {
+                    name: expected,
+                    args: Some(args.into())
+                }
+            );
+            assert!(find_slash_command_spec(expected.trim_start_matches('/')).is_some());
+        }
+    }
+    #[test]
+    fn no_argument_commands_reject_unexpected_arguments() {
+        for name in [
+            "heapdump",
+            "upgrade",
+            "usage-credits",
+            "privacy-settings",
+            "install-github-app",
+        ] {
+            assert!(SlashCommand::parse(&format!("/{name}")).unwrap().is_some());
+            assert!(SlashCommand::parse(&format!("/{name} unexpected")).is_err());
+        }
     }
 }

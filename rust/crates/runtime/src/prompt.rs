@@ -801,9 +801,7 @@ pub fn load_system_prompt_with_context(
         .with_model_family(model_family)
         .with_project_context(project_context.clone());
     if crate::memory::memory_enabled(&config) {
-        builder = builder.append_section(crate::memory::render_memory_section(
-            &crate::memory::memory_dir(&cwd),
-        ));
+        builder = builder.append_section(crate::memory::render_memory_section_for(&cwd));
     }
     let sections = builder.with_runtime_config(config).build();
     Ok((sections, project_context))
@@ -877,6 +875,8 @@ fn get_actions_section() -> String {
     [
         "# Executing actions with care".to_string(),
         "Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.".to_string(),
+        "Before any `git commit` or `git push`, check what is about to leave the machine. Run `git status` and stage files by path; do not use `git add -A`/`git add .` until you have looked at every untracked file it would pick up. Never commit secrets or sensitive files: `.env*`, credentials and tokens, private keys (`id_rsa`, `id_ed25519`, `*.pem`, `*.key`, `*.p12`), cloud/kube configs, shell histories, agent session logs (`.claw/sessions/`, `*.jsonl` transcripts), databases, model weights and other large binaries, build output. When you find one, leave it unstaged, add it to `.gitignore`, and tell the user. Before pushing, list the outgoing changes (`git log --stat @{upstream}..HEAD`, or every commit when the branch has no upstream) and search their added lines for secret-looking content (`BEGIN .*PRIVATE KEY`, `api[_-]?key`, `secret`, `token`, `password`); if anything sensitive is already in a commit, stop and ask the user instead of pushing, since pushed history is hard to retract.".to_string(),
+        "Never put a password or passphrase the user gives you into a command line, file or script, and do not start `ssh-agent` or feed `ssh-add` yourself. When `ssh` or `git` needs a key passphrase, claw asks the user on the terminal.".to_string(),
     ]
     .join("\n")
 }

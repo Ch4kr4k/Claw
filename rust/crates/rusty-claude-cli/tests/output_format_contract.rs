@@ -2635,7 +2635,7 @@ fn assert_non_empty_action(parsed: &Value, args: &[&str]) {
 }
 
 fn run_claw(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    let mut command = hermetic(env!("CARGO_BIN_EXE_claw"));
     command.current_dir(current_dir).args(args);
     for key in ["CLAW_OUTPUT_FORMAT", "CLAW_LOG", "RUST_LOG"] {
         if !envs.iter().any(|(env_key, _)| *env_key == key) {
@@ -2708,6 +2708,25 @@ fn write_legacy_command(root: &Path, name: &str, description: &str) {
         format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
     )
     .expect("legacy command fixture should write");
+}
+
+/// A `claw` command that cannot see the developer's own setup: a fresh,
+/// empty home and config home (so `~/.claw/settings.json`, its default model
+/// and `modelServers` do not apply), no local-server variables, and no model
+/// server started or stopped. A test that sets `HOME` or `CLAW_CONFIG_HOME`
+/// itself overrides these, since a later `.env` wins.
+fn hermetic(bin: &str) -> Command {
+    let home = unique_temp_dir("home");
+    fs::create_dir_all(home.join(".claw")).expect("temp home should exist");
+    let mut command = Command::new(bin);
+    command
+        .env("HOME", &home)
+        .env("CLAW_CONFIG_HOME", home.join(".claw"))
+        .env("CLAW_MANAGE_SERVER", "0")
+        .env_remove("CLAW_LOCAL_BASE_URL")
+        .env_remove("CLAW_LOCAL_API_KEY")
+        .env_remove("CLAW_SEARXNG_URL");
+    command
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {
@@ -2784,7 +2803,6 @@ fn diff_json_has_status_and_result_field_702() {
 fn diff_json_changed_file_count_deduplication_733() {
     // #733/#742: changed_file_count must be numeric in a git repo, be 0 for clean,
     // and deduplicate staged+unstaged edits to the same file (1 file changed = count 1).
-    use std::process::Command;
     let root = unique_temp_dir("diff-changed-dedup");
     fs::create_dir_all(&root).expect("temp dir");
 
@@ -2818,7 +2836,7 @@ fn diff_json_changed_file_count_deduplication_733() {
 
     // Clean state: changed_file_count must be 0
     let bin = env!("CARGO_BIN_EXE_claw");
-    let clean = Command::new(bin)
+    let clean = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "diff"])
         .output()
@@ -2842,7 +2860,7 @@ fn diff_json_changed_file_count_deduplication_733() {
     fs::write(root.join("tracked.txt"), b"v3").expect("unstaged write");
 
     // Dirty state: same file appears in staged+unstaged — must deduplicate to count 1
-    let dirty = Command::new(bin)
+    let dirty = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "diff"])
         .output()
@@ -2865,12 +2883,11 @@ fn prompt_no_arg_json_error_kind_750() {
     // #751/#750/#823: `claw prompt --output-format json` with no prompt argument must emit
     // error_kind:"missing_prompt" with stdout JSON, empty stderr, and a non-empty hint.
     // Before #823 the structured envelope could be routed to stderr, leaving stdout empty.
-    use std::process::Command;
     let root = unique_temp_dir("prompt-no-arg");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
-    let output = Command::new(bin)
+    let output = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "prompt"])
         .output()
@@ -2914,12 +2931,11 @@ fn prompt_no_arg_json_error_kind_750() {
 fn prompt_empty_arg_json_stdout_missing_prompt_823() {
     // #823: `claw --output-format json prompt ""` must match the missing prompt
     // channel contract: rc=1, stdout JSON, error_kind:"missing_prompt", empty stderr.
-    use std::process::Command;
     let root = unique_temp_dir("prompt-empty-arg-823");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
-    let output = Command::new(bin)
+    let output = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "prompt", ""])
         .output()
@@ -2958,13 +2974,12 @@ fn prompt_empty_arg_json_stdout_missing_prompt_823() {
 fn flag_value_errors_have_error_kind_and_hint_756() {
     // #756: missing/invalid flag-value errors must emit typed error_kind + non-null hint.
     // Before #756: all returned error_kind:"unknown" + hint:null.
-    use std::process::Command;
     let root = unique_temp_dir("flag-value-errors");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
     // Case 1: --reasoning-effort with invalid value
-    let out = Command::new(bin)
+    let out = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "--reasoning-effort", "HIGH"])
         .output()
@@ -2994,7 +3009,7 @@ fn flag_value_errors_have_error_kind_and_hint_756() {
     );
 
     // Case 2: --model flag with missing value (trailing flag)
-    let out2 = Command::new(bin)
+    let out2 = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "--model"])
         .output()
@@ -3208,14 +3223,13 @@ fn short_p_flag_swallows_no_flags_755() {
     // After #755, -p consumes exactly one token and remaining flags are parsed.
     // We verify by checking that the envelope IS JSON (meaning --output-format json
     // was interpreted as a flag, not literal prompt text).
-    use std::process::Command;
     let root = unique_temp_dir("short-p-flags");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
     // -p hello --output-format json: with no credentials, should fail with
     // missing_credentials (not missing_prompt), proving --output-format json was parsed.
-    let output = Command::new(bin)
+    let output = hermetic(bin)
         .current_dir(&root)
         .args(["-p", "hello", "--output-format", "json"])
         .env_remove("ANTHROPIC_API_KEY")
@@ -3242,7 +3256,7 @@ fn short_p_flag_swallows_no_flags_755() {
     );
 
     // Also verify -p --model bogus is rejected as missing_prompt (flag-as-prompt guard)
-    let output2 = Command::new(bin)
+    let output2 = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "-p", "--model", "sonnet"])
         .output()
@@ -3269,12 +3283,11 @@ fn short_p_flag_no_arg_json_error_kind_753() {
     // #753: `claw --output-format json -p` (no prompt) must emit error_kind:"missing_prompt"
     // and non-empty hint. Before #753 it returned error_kind:"unknown" + hint:null.
     // Parity with #750 which fixed the explicit `prompt` verb.
-    use std::process::Command;
     let root = unique_temp_dir("short-p-no-arg");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
-    let output = Command::new(bin)
+    let output = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "-p"])
         .output()
@@ -3315,7 +3328,6 @@ fn short_p_flag_no_arg_json_error_kind_753() {
 fn bare_slash_command_hint_745() {
     // #747/#745: claw <slash-cmd> --output-format json must return non-null hint.
     // bare_slash_command_guidance() previously had no \n so split_error_hint returned hint:null.
-    use std::process::Command;
     let root = unique_temp_dir("bare-slash-hint");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
@@ -3323,7 +3335,7 @@ fn bare_slash_command_hint_745() {
     // issue and pr are non-resume-supported; commit is resume-supported.
     // All must emit non-null hint in their interactive_only error envelope.
     for cmd in &["issue", "pr", "commit"] {
-        let output = Command::new(bin)
+        let output = hermetic(bin)
             .current_dir(&root)
             .args(["--output-format", "json", cmd])
             .env("ANTHROPIC_API_KEY", "test")
@@ -3364,13 +3376,12 @@ fn config_unsupported_section_json_hint_741() {
     // #744/#741: claw config <unknown-section> --output-format json must return
     // error_kind:unsupported_config_section with a non-null hint and supported_sections[].
     // This is the regression guard for #741 (hint was null before fix).
-    use std::process::Command;
     let root = unique_temp_dir("config-unsupported-section");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
 
     for section in &["list", "show", "bogus"] {
-        let output = Command::new(bin)
+        let output = hermetic(bin)
             .current_dir(&root)
             .args(["--output-format", "json", "config", section])
             .output()
@@ -3410,11 +3421,10 @@ fn config_unsupported_section_json_hint_741() {
 #[test]
 fn config_help_returns_structured_section_list_344() {
     // #344: /config help should return a structured section list, not an error
-    use std::process::Command;
     let root = unique_temp_dir("config-help");
     fs::create_dir_all(&root).expect("temp dir");
     let bin = env!("CARGO_BIN_EXE_claw");
-    let output = Command::new(bin)
+    let output = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "config", "help"])
         .output()
@@ -3446,9 +3456,8 @@ fn export_json_has_kind_702() {
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     // Run without asserting exit code — may fail with no sessions or legacy sessions.
-    use std::process::Command;
     let bin = env!("CARGO_BIN_EXE_claw");
-    let output = Command::new(bin)
+    let output = hermetic(bin)
         .current_dir(&root)
         .args(["--output-format", "json", "export"])
         .env("ANTHROPIC_API_KEY", "test")
@@ -3572,10 +3581,11 @@ fn config_parse_error_has_typed_error_kind_and_hint_764() {
 }
 
 #[test]
-fn login_logout_removed_subcommands_have_error_kind_and_hint_765() {
-    // #765: `claw login` and `claw logout` are removed; JSON envelope must carry
-    // error_kind:removed_subcommand + non-null hint pointing to the env var migration.
-    // Before fix: single-line error string → error_kind:"unknown" + hint:null.
+fn login_logout_subcommands_point_to_repl_commands_765() {
+    // #765: the JSON envelope for `claw login` / `claw logout` must carry a typed
+    // error_kind and a non-null hint (before: error_kind:"unknown" + hint:null).
+    // This fork has `/login` and `/logout` in the REPL, so the subcommands are
+    // interactive-only and the hint names the slash command.
     let root = unique_temp_dir("login-logout-removed-765");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
@@ -3596,17 +3606,13 @@ fn login_logout_removed_subcommands_have_error_kind_and_hint_765() {
             serde_json::from_str(json_line).expect("error envelope should be valid JSON");
 
         assert_eq!(
-            parsed["error_kind"], "removed_subcommand",
-            "claw {subcmd} must return error_kind:removed_subcommand (#765)"
+            parsed["error_kind"], "interactive_only",
+            "claw {subcmd} must return error_kind:interactive_only (#765)"
         );
         let hint = parsed["hint"].as_str().unwrap_or("");
         assert!(
-            !hint.is_empty(),
-            "claw {subcmd} must return non-null hint (#765), got: {hint:?}"
-        );
-        assert!(
-            hint.contains("ANTHROPIC_API_KEY") || hint.contains("ANTHROPIC_AUTH_TOKEN"),
-            "claw {subcmd} hint must mention the env var migration path, got: {hint:?}"
+            hint.contains(&format!("/{subcmd}")),
+            "claw {subcmd} hint must name the /{subcmd} REPL command, got: {hint:?}"
         );
     }
 }

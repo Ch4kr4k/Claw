@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# claw launcher: runs the real binary (~/.local/lib/claw/claw) against the
+# local llama.cpp server (llama-gpu), from any directory, with a core set of tools (shell,
+# files, search, web, downloads, desktop control (X11), todo list, questions, skills). Sending all ~60 tool descriptions made the
+# local model ~5x slower; run with CLAW_ALL_TOOLS=1 to send them all anyway.
+# Agent lets the model spawn sub-agents (foreground, or background with a
+# notice when they finish).
+# Kept in the repo as scripts/wrappers/claw; reinstall binary and wrappers
+# with scripts/install-claw.sh (wrappers only: scripts/install-wrappers.sh).
+set -euo pipefail
+
+# `local/` models go to the local llama-server; OPENAI_BASE_URL/OPENAI_API_KEY
+# stay free for the real OpenAI API (gpt-* models). Other providers pick
+# their own keys by model name: claude-* ANTHROPIC_API_KEY, xai/* XAI_API_KEY,
+# qwen/* kimi/* DASHSCOPE_API_KEY.
+export CLAW_LOCAL_BASE_URL="${CLAW_LOCAL_BASE_URL:-http://127.0.0.1:8080/v1}"
+unset OLLAMA_HOST
+# An OPENAI_BASE_URL pointing at the local server (as ~/.bashrc sets for other
+# tools) would send gpt-* models there too; claw does not need it for local/.
+if [[ "${OPENAI_BASE_URL:-}" == "$CLAW_LOCAL_BASE_URL" ]]; then
+    unset OPENAI_BASE_URL
+fi
+# Context size of the local server. claw asks llama-server's /props for the
+# real size (-c) and only falls back to this when the server cannot say.
+export CLAW_CONTEXT_WINDOW="${CLAW_CONTEXT_WINDOW:-32768}"
+# A tool result larger than this (about 3k tokens) is cut down before it is
+# sent to the model, so it cannot overflow the local context.
+export CLAW_TOOL_RESULT_MAX_CHARS="${CLAW_TOOL_RESULT_MAX_CHARS:-12000}"
+# Model server: claw runs `modelServers.<provider>.start` from
+# ~/.claw/settings.json when it starts (for `local/...` models: llama-gpu) and
+# `stop` when the last claw using it exits. These override settings.json for
+# the provider of the model in use:
+#   export CLAW_SERVER_START="systemctl --user start llama-gpu"
+#   export CLAW_SERVER_STOP="systemctl --user stop llama-gpu"
+#   export CLAW_SERVER_HEALTH="http://127.0.0.1:8080/health"
+#   export CLAW_SERVER_STOP_ON_EXIT=0   # start it, but leave it running
+#   export CLAW_MANAGE_SERVER=0         # never start or stop servers
+CLAW_BIN="${CLAW_BIN:-$HOME/.local/lib/claw/claw}"
+CORE_TOOLS="bash,bash_output,kill_shell,Agent,read_file,write_file,edit_file,glob_search,grep_search,web_fetch,web_search,download,x11,browser,todo_write,AskUserQuestion,Skill,code_search,pty,checkpoint,diagnostics,google_dork,vision_analyze,repo_signals,trail"
+
+# File tools can reach any path, so starting in $HOME (or anywhere) is fine.
+args=(--allow-broad-cwd "$@")
+if [[ "${CLAW_ALL_TOOLS:-0}" != 1 && " $* " != *" --allowedTools "* ]]; then
+    args=(--allowedTools "$CORE_TOOLS" "${args[@]}")
+fi
+exec "$CLAW_BIN" "${args[@]}"

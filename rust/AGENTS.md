@@ -20,6 +20,7 @@ Virtual Cargo workspace (resolver 2, edition 2021) housing 12 crates that compos
 | `plugins` | lib | Plugin manifest and lifecycle. |
 | `telemetry` | lib | Request identity + analytics sinks. |
 | `compat-harness` | lib | Extracts upstream TS claude-code manifest/commands/tools for parity comparison. |
+| `claw-desktop` | bin (`claw-desktop`) | Iced desktop chat app; drives `claw desktop-agent` over JSON lines and reads sessions from disk. |
 
 Dependency direction: `rusty-claude-cli` → tools/commands/runtime/api/plugins. `tools` → `commands`, `documents`. `api` → `runtime`. See `../ARCHITECTURE.md` for the request lifecycle.
 

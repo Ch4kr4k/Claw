@@ -18,7 +18,6 @@ use reqwest::blocking::Client;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, edit_file_in_workspace, execute_bash,
     glob_search_in_workspace, grep_search_in_workspace, load_system_prompt,
-    lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
     read_file_in_workspace,
@@ -35,13 +34,6 @@ use runtime::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-
-/// Global task registry shared across tool invocations within a session.
-fn global_lsp_registry() -> &'static LspRegistry {
-    use std::sync::OnceLock;
-    static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(LspRegistry::new)
-}
 
 fn global_mcp_registry() -> &'static McpToolRegistry {
     use std::sync::OnceLock;
@@ -486,7 +478,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace. `~` and $HOME are the user's real home directory. Output comes back as plain text ending with [exit code N]. Set run_in_background to true for long-running commands (servers, builds, watchers): it returns a job id at once, you are notified when the job exits, and BashOutput reads its output.",
+            description: "Execute a shell command in the current workspace. `~` and $HOME are the user's real home directory. Output comes back as plain text ending with [exit code N]. Commands run without a terminal (stdin is closed), so use non-interactive flags: no `emerge --ask`, add `-y`/`--noconfirm` where a tool would prompt; claw asks the user itself before risky commands. Set run_in_background to true for long-running commands (servers, builds, watchers): it returns a job id at once, you are notified when the job exits, and BashOutput reads its output.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -498,7 +490,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" },
+                    "dangerouslyDisableSandbox": { "type": "boolean", "description": "Request explicit approval to execute this exact command on the host outside the sandbox. Use for necessary host administration; never set for package searches. Ordinary Bash approval does not grant host access." },
                     "namespaceRestrictions": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
                     "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
@@ -543,8 +535,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Line to start after (0 = from the top); a line number, not a character position" },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to read" },
                     "sheet": { "type": "string", "description": "Spreadsheets: only this sheet" },
                     "range": { "type": "string", "description": "Spreadsheets: A1 range, e.g. A1:D50" },
                     "formulas": { "type": "boolean", "description": "Spreadsheets: append [=FORMULA] to formula cells" },
@@ -635,7 +627,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace old_string with new_string in a workspace file. new_string replaces only the matched text, not the whole file; use write_file to rewrite a whole file.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -672,7 +664,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
                     "glob": { "type": "string" },
-                    "output_mode": { "type": "string" },
+                    "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"], "description": "content: matching lines; files_with_matches (default): file names only; count: matches per file" },
                     "-B": { "type": "integer", "minimum": 0 },
                     "-A": { "type": "integer", "minimum": 0 },
                     "-C": { "type": "integer", "minimum": 0 },
@@ -703,6 +695,105 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "X11",
+            description: "Control the user's Linux desktop (X11) like a person: `windows` lists windows (id, title, class, geometry); `screen` gives screen size, mouse position and the active window; `screenshot` captures the screen, a `window` or a region (x, y, width, height) and shows it to you; `focus`, `close`, `move_resize` a window; `launch` a program (`command`, optionally `wait_for` its window title); `wait_window`; `type` text and `key` presses (xdotool names: \"ctrl+s\", \"Return\", \"alt+Tab\", several separated by spaces) into the focused window, or into `window` (refused when that window is hidden or can't get focus, so input never lands elsewhere); `click` (button 1 left, 3 right; count 2 = double), `move_mouse`, `drag` (x, y to to_x, to_y), `scroll` (direction, count) at screen coordinates, or relative to `window`'s top-left corner when `window` is given; `clipboard_get`, `clipboard_set`. `window` is an id or part of a title. Take a screenshot to check what happened before acting further. Cheaper than screenshots: `ocr` returns the text of a `window`/region (or `image` file) with screen boxes; the accessibility actions work on named controls of GTK/Qt/Electron apps: `ui_apps`, `ui_find` (app, name, role e.g. \"push button\"), `ui_tree` (app or element, depth), `ui_click`, `ui_read`, `ui_set_text` (element id from ui_find, text). Prefer the `Browser` tool for web pages.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["windows", "screen", "screenshot", "focus", "type", "key", "click", "move_mouse", "drag", "scroll", "close", "move_resize", "launch", "wait_window", "clipboard_get", "clipboard_set", "ocr", "ui_apps", "ui_find", "ui_tree", "ui_click", "ui_read", "ui_set_text"] },
+                    "element": { "type": "string", "description": "Element id from ui_find/ui_tree" },
+                    "app": { "type": "string" },
+                    "name": { "type": "string" },
+                    "role": { "type": "string" },
+                    "depth": { "type": "integer", "minimum": 0 },
+                    "image": { "type": "string" },
+                    "window": { "type": "string" },
+                    "text": { "type": "string" },
+                    "keys": { "type": "string" },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" },
+                    "to_x": { "type": "integer" },
+                    "to_y": { "type": "integer" },
+                    "width": { "type": "integer" },
+                    "height": { "type": "integer" },
+                    "button": { "type": "integer", "minimum": 1, "maximum": 9 },
+                    "count": { "type": "integer", "minimum": 1 },
+                    "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+                    "command": { "type": "string" },
+                    "wait_for": { "type": "string" },
+                    "timeout": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "Browser",
+            description: "Use a real Chrome window (claw's own profile, logins kept) by page elements, not pixels; prefer it over X11 for anything on the web. Actions: `open` (url) in the current tab; `elements` lists visible links, buttons and fields with numbers; `click` (id or selector); `type` (text into id or selector, submit to press Enter, clear default true); `key` (Enter, Tab, Escape, ArrowDown, ctrl+a); `read` page text (selector, max_chars); `scroll` (direction); `wait` (text or selector); `back`, `forward`, `reload`; `eval` (script, JavaScript, returns its value); `screenshot` (full_page) shows you the page; `tabs`, `new_tab` (url), `switch_tab`/`close_tab` (tab); `start` (headless). Numbers from `elements` change when the page changes: list again after navigating.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["start", "tabs", "open", "new_tab", "switch_tab", "close_tab", "read", "elements", "click", "type", "key", "scroll", "back", "forward", "reload", "wait", "eval", "screenshot"] },
+                    "url": { "type": "string" },
+                    "id": { "type": "integer", "description": "Element number from `elements`" },
+                    "selector": { "type": "string", "description": "CSS selector, instead of id" },
+                    "text": { "type": "string" },
+                    "keys": { "type": "string" },
+                    "submit": { "type": "boolean" },
+                    "clear": { "type": "boolean" },
+                    "script": { "type": "string" },
+                    "direction": { "type": "string", "enum": ["up", "down"] },
+                    "tab": { "type": "string" },
+                    "full_page": { "type": "boolean" },
+                    "max_chars": { "type": "integer", "minimum": 200 },
+                    "headless": { "type": "boolean" },
+                    "timeout": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "COM",
+            description: "Automate Windows applications through COM (Windows or WSL only): Word, Excel, PowerPoint, Outlook, Access, Visio, and anything with a ProgID (Shell.Application, WScript.Shell, WbemScripting.SWbemLocator, Schedule.Service, …). Objects live in one PowerShell session under names you choose. Actions: `create` (object, prog_id, visible default true) starts an app; `attach` (object, prog_id) connects to a running one; `get` (object, path) reads a property, e.g. path `ActiveWorkbook.Name` or `ActiveSheet.Range(\"A1:C3\").Value2` (2-D values come back as rows); `set` (object, path, value; rows like [[1,\"a\"],[2,\"b\"]] become a 2-D array for ranges); `call` (object, path of a method, args), e.g. `Documents.Open` with [\"C:\\\\x.docx\"]; `inspect` (object, path) lists members and signatures, use it to learn an API; `objects`; `release` (object, quit); `progids` (filter) lists registered ProgIDs; `run` (script) runs PowerShell in the session, objects are $global:<name>. Use collection.Item(1) for indexes. Windows paths only.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["create", "attach", "get", "set", "call", "inspect", "objects", "release", "progids", "run"] },
+                    "object": { "type": "string", "description": "Name of the object in the session, e.g. excel" },
+                    "prog_id": { "type": "string" },
+                    "path": { "type": "string" },
+                    "value": {},
+                    "args": { "type": "array" },
+                    "visible": { "type": "boolean" },
+                    "quit": { "type": "boolean" },
+                    "script": { "type": "string" },
+                    "filter": { "type": "string" },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Seconds (default 120)" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "Download",
+            description: "Save a file to the user's computer: an image or document from the web (https URL), or a copy of a local file (path or file://). By default it goes into ~/Downloads under the name the server or URL gives, never overwriting (a ` (1)` suffix is added). Use it when the user asks to download or save something you showed or found. Returns the saved path.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "https URL, file:// URL or local path of the file" },
+                    "save_to": { "type": "string", "description": "Directory (ending in /) or file path to save to; default ~/Downloads" },
+                    "name": { "type": "string", "description": "File name to use inside save_to" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "WebSearch",
@@ -1032,7 +1123,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "TaskList",
-            description: "List all background tasks and their current status.",
+            description: "List everything running in the background with its status: tasks (TaskCreate), background shells and monitors (bash run_in_background, Monitor) and sub-agents (Agent run_in_background). Stop any of them with TaskStop, read output with TaskOutput, message an agent with SendMessage.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1260,22 +1351,24 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "CronCreate",
-            description: "Create a scheduled recurring task.",
+            description: "Schedule a prompt to run in this session: recurring (default) or once, at times given by a 5-field cron expression in local time (`*/10 * * * *`, `0 9 * * 1-5`, `@hourly`). It runs as a new turn when the session is idle at that time; tasks last as long as the session.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "schedule": { "type": "string" },
+                    "schedule": { "type": "string", "description": "Cron expression (also accepted as `cron`)." },
+                    "cron": { "type": "string" },
                     "prompt": { "type": "string" },
+                    "recurring": { "type": "boolean" },
                     "description": { "type": "string" }
                 },
-                "required": ["schedule", "prompt"],
+                "required": ["prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "CronDelete",
-            description: "Delete a scheduled recurring task by ID.",
+            description: "Cancel a task scheduled with CronCreate, by its id.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1298,17 +1391,17 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "LSP",
-            description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
+            description: "Code intelligence from a language server (rust-analyzer, pyright/pylsp, typescript-language-server, gopls, clangd, … whichever is installed; `lspServers` in settings adds others): jump to definitions and implementations, find references, hover for types and docs, list a file's or the workspace's symbols, walk call hierarchies, and get a file's errors and warnings. line and character are 1-based, as an editor shows them. The first request for a language starts its server, which may need a while to index.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["symbols", "references", "diagnostics", "definition", "hover"] },
-                    "path": { "type": "string" },
-                    "line": { "type": "integer", "minimum": 0 },
-                    "character": { "type": "integer", "minimum": 0 },
-                    "query": { "type": "string" }
+                    "operation": { "type": "string", "enum": ["goToDefinition", "findReferences", "hover", "documentSymbol", "workspaceSymbol", "goToImplementation", "prepareCallHierarchy", "incomingCalls", "outgoingCalls", "diagnostics"] },
+                    "filePath": { "type": "string" },
+                    "line": { "type": "integer", "minimum": 1 },
+                    "character": { "type": "integer", "minimum": 1 },
+                    "query": { "type": "string", "description": "For workspaceSymbol." }
                 },
-                "required": ["action"],
+                "required": ["operation", "filePath"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -1472,6 +1565,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
     ]
+    .into_iter()
+    .chain(local_tools::specs())
+    .chain(pty_tool::specs())
+    .chain(code_search::specs())
+    .chain(dev_tools::specs())
+    .chain(media::specs())
+    .chain(signals::specs())
+    .collect()
 }
 
 /// Check permission before executing a tool. Returns Err with denial reason if blocked.
@@ -1513,13 +1614,29 @@ fn execute_tool_with_enforcer(
             let file_input: ReadFileInput = from_value(input)?;
             let required_mode = classify_read_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
+            // Images are shown to the model instead of refused as binary.
+            let path = Path::new(&file_input.path);
+            if is_image_path(path)
+                && path.extension().is_some_and(|ext| ext != "svg")
+                && path.is_file()
+            {
+                return media::image_result(path, None);
+            }
+            // Memories in use stay ranked as active.
+            runtime::touch_memory(&file_input.path);
             run_read_file(file_input)
         }
         "write_file" => {
             let file_input: WriteFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, true);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input)
+            let old = std::fs::read_to_string(&file_input.path).unwrap_or_default();
+            let note = leangate::before_write(name, &file_input.path, &old, &file_input.content)?;
+            let path = file_input.path.clone();
+            let output = run_write_file(file_input)?;
+            leangate::record_edit(&path);
+            runtime::touch_memory(&path);
+            Ok(leangate::annotate(output, note))
         }
         "write_docx" => {
             let docx_input: WriteDocxInput = from_value(input)?;
@@ -1553,7 +1670,17 @@ fn execute_tool_with_enforcer(
             let file_input: EditFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_edit_file(file_input)
+            let note = leangate::before_write(
+                name,
+                &file_input.path,
+                &file_input.old_string,
+                &file_input.new_string,
+            )?;
+            let path = file_input.path.clone();
+            let output = run_edit_file(file_input)?;
+            leangate::record_edit(&path);
+            runtime::touch_memory(&path);
+            Ok(leangate::annotate(output, note))
         }
         "glob_search" => {
             let glob_input: GlobSearchInputValue = from_value(input)?;
@@ -1576,6 +1703,46 @@ fn execute_tool_with_enforcer(
                 PermissionMode::DangerFullAccess,
             )?;
             run_web_fetch(web_input)
+        }
+        "X11" => {
+            let x11_input = from_value::<x11::X11Input>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            x11::run(x11_input).and_then(x11::render)
+        }
+        "Browser" => {
+            let browser_input = from_value::<browser::BrowserInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            browser::run(browser_input).and_then(browser::render)
+        }
+        "COM" => {
+            let com_input = from_value::<com::ComInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            com::run(com_input).and_then(to_pretty_json)
+        }
+        "Download" => {
+            let download_input = from_value::<download::DownloadInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            download::run(download_input).and_then(to_pretty_json)
         }
         "WebSearch" => {
             let web_input = from_value::<WebSearchInput>(input)?;
@@ -1639,7 +1806,9 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
-        "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
+        "LSP" => from_value::<lsp_tool::LspInput>(input)
+            .and_then(lsp_tool::run)
+            .and_then(to_pretty_json),
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
         }
@@ -1655,7 +1824,13 @@ fn execute_tool_with_enforcer(
         "GitLog" => from_value::<GitLogInput>(input).and_then(run_git_log),
         "GitShow" => from_value::<GitShowInput>(input).and_then(run_git_show),
         "GitBlame" => from_value::<GitBlameInput>(input).and_then(run_git_blame),
-        _ => Err(format!("unsupported tool: {name}")),
+        _ => local_tools::execute(name, input)
+            .or_else(|| pty_tool::execute(name, input))
+            .or_else(|| code_search::execute(name, input))
+            .or_else(|| dev_tools::execute(name, input))
+            .or_else(|| media::execute(name, input))
+            .or_else(|| signals::execute(name, input))
+            .unwrap_or_else(|| Err(format!("unsupported tool: {name}"))),
     }
 }
 
@@ -1825,14 +2000,41 @@ fn run_task_list(_input: Value) -> Result<String, String> {
             })
         })
         .collect();
+    // Background shells, monitors and sub-agents are tasks too: TaskStop,
+    // TaskOutput and SendMessage take their ids.
+    let background: Vec<_> = runtime::global_background_jobs()
+        .list()
+        .into_iter()
+        .map(|job| {
+            json!({
+                "task_id": job.id,
+                "status": job.state.to_string(),
+                "command": job.command,
+                "elapsed_secs": job.elapsed_secs,
+            })
+        })
+        .collect();
+    let agents = local_tools::agents::rows();
     to_pretty_json(json!({
+        "count": tasks.len() + background.len(),
         "tasks": tasks,
-        "count": tasks.len()
+        "background": background,
+        "agents": agents,
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_stop(input: TaskIdInput) -> Result<String, String> {
+    // Background shells and monitors are tasks too (Claude Code's TaskStop
+    // stops whatever background work has the id).
+    if let Ok(read) = runtime::global_background_jobs().kill(&input.task_id) {
+        return to_pretty_json(json!({
+            "task_id": read.id,
+            "status": read.state.to_string(),
+            "message": "Background task stopped",
+            "output": read.output,
+        }));
+    }
     let registry = global_task_registry();
     match registry.stop(&input.task_id) {
         Ok(task) => to_pretty_json(json!({
@@ -1860,6 +2062,14 @@ fn run_task_update(input: TaskUpdateInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_task_output(input: TaskIdInput) -> Result<String, String> {
+    if let Ok(read) = runtime::global_background_jobs().read_new(&input.task_id, Duration::ZERO) {
+        return to_pretty_json(json!({
+            "task_id": read.id,
+            "status": read.state.to_string(),
+            "output": read.output,
+            "has_output": !read.output.is_empty()
+        }));
+    }
     let registry = global_task_registry();
     match registry.output(&input.task_id) {
         Ok(output) => to_pretty_json(json!({
@@ -2022,45 +2232,46 @@ fn run_team_delete(input: TeamDeleteInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_cron_create(input: CronCreateInput) -> Result<String, String> {
-    let entry =
-        global_cron_registry().create(&input.schedule, &input.prompt, input.description.as_deref());
+    let task = runtime::scheduler::global_scheduler().add_cron(
+        &input.schedule,
+        &input.prompt,
+        input.recurring,
+    )?;
     to_pretty_json(json!({
-        "cron_id": entry.cron_id,
-        "schedule": entry.schedule,
-        "prompt": entry.prompt,
-        "description": entry.description,
-        "enabled": entry.enabled,
-        "created_at": entry.created_at
+        "cron_id": task.id,
+        "schedule": task.expression,
+        "prompt": task.prompt,
+        "description": input.description,
+        "recurring": task.recurring,
+        "next_run": task.next_run.to_rfc3339(),
+        "message": "Scheduled. It runs when the session is idle at that time (local time), for as long as this session runs.",
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_cron_delete(input: CronDeleteInput) -> Result<String, String> {
-    match global_cron_registry().delete(&input.cron_id) {
-        Ok(entry) => to_pretty_json(json!({
-            "cron_id": entry.cron_id,
-            "schedule": entry.schedule,
-            "status": "deleted",
-            "message": "Cron entry removed"
-        })),
-        Err(e) => Err(e),
-    }
+    let task = runtime::scheduler::global_scheduler().delete(&input.cron_id)?;
+    to_pretty_json(json!({
+        "cron_id": task.id,
+        "schedule": task.expression,
+        "status": "deleted",
+        "message": "Scheduled task removed"
+    }))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_cron_list(_input: Value) -> Result<String, String> {
-    let entries: Vec<_> = global_cron_registry()
-        .list(false)
+    let entries: Vec<_> = runtime::scheduler::global_scheduler()
+        .list()
         .into_iter()
-        .map(|e| {
+        .map(|task| {
             json!({
-                "cron_id": e.cron_id,
-                "schedule": e.schedule,
-                "prompt": e.prompt,
-                "description": e.description,
-                "enabled": e.enabled,
-                "run_count": e.run_count,
-                "last_run_at": e.last_run_at,
-                "created_at": e.created_at
+                "cron_id": task.id,
+                "schedule": task.expression,
+                "prompt": task.prompt,
+                "recurring": task.recurring,
+                "run_count": task.runs,
+                "next_run": task.next_run.to_rfc3339(),
             })
         })
         .collect();
@@ -2068,25 +2279,6 @@ fn run_cron_list(_input: Value) -> Result<String, String> {
         "crons": entries,
         "count": entries.len()
     }))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_lsp(input: LspInput) -> Result<String, String> {
-    let registry = global_lsp_registry();
-    let action = &input.action;
-    let path = input.path.as_deref();
-    let line = input.line;
-    let character = input.character;
-    let query = input.query.as_deref();
-
-    match registry.dispatch(action, path, line, character, query) {
-        Ok(result) => to_pretty_json(result),
-        Err(e) => to_pretty_json(json!({
-            "action": action,
-            "error": e,
-            "status": "error"
-        })),
-    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3627,28 +3819,24 @@ struct TeamDeleteInput {
 
 #[derive(Debug, Deserialize)]
 struct CronCreateInput {
+    /// Claude Code calls it `cron`; claw's older name was `schedule`.
+    #[serde(alias = "cron")]
     schedule: String,
     prompt: String,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default = "default_true")]
+    recurring: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
 struct CronDeleteInput {
+    #[serde(alias = "id")]
     cron_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct LspInput {
-    action: String,
-    #[serde(default)]
-    path: Option<String>,
-    #[serde(default)]
-    line: Option<u32>,
-    #[serde(default)]
-    character: Option<u32>,
-    #[serde(default)]
-    query: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3978,6 +4166,19 @@ struct SearchHit {
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
+    // Sites with a clean API (Wikipedia, arXiv, GitHub, Semantic Scholar)
+    // are read through it; if that fails, the page is fetched as usual.
+    if let Some(Ok(adapted)) = source_adapters::fetch(&input.url) {
+        let result = adapted.render();
+        return Ok(WebFetchOutput {
+            bytes: result.len(),
+            code: 200,
+            code_text: "OK".to_string(),
+            result,
+            duration_ms: started.elapsed().as_millis(),
+            url: adapted.url,
+        });
+    }
     let client = build_http_client()?;
     let request_url = normalize_fetch_url(&input.url)?;
     let response = client
@@ -3995,10 +4196,34 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    if content_type.starts_with("image/") {
+        // Binary: decoding it as text only feeds the model noise.
+        let bytes = response.bytes().map_err(|error| error.to_string())?.len();
+        return Ok(WebFetchOutput {
+            bytes,
+            code,
+            code_text,
+            result: format!(
+                "Fetched {final_url}\nThis is an image ({content_type}, {bytes} bytes). To show it to the user, put ![description]({final_url}) in the reply."
+            ),
+            duration_ms: started.elapsed().as_millis(),
+            url: final_url,
+        });
+    }
     let body = response.text().map_err(|error| error.to_string())?;
     let bytes = body.len();
     let normalized = normalize_fetched_content(&body, &content_type);
-    let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
+    let mut result =
+        summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
+    if content_type.contains("html") {
+        let images = extract_image_urls(&body, &final_url);
+        if !images.is_empty() {
+            result.push_str("\nImages on the page (show one with ![description](url)):\n");
+            for image in images {
+                result.push_str(&format!("- {image}\n"));
+            }
+        }
+    }
 
     Ok(WebFetchOutput {
         bytes,
@@ -4012,20 +4237,7 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
 
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
-
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
-
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
-    }
+    let (engine, mut hits) = search_hits(&input.query)?;
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
         hits.retain(|hit| host_matches_list(&hit.url, allowed));
@@ -4049,7 +4261,7 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
             .collect::<Vec<_>>()
             .join("\n");
         format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
+            "Search results for {:?} (via {engine}). Include a Sources section in the final answer.\n{}",
             input.query, rendered_hits
         )
     };
@@ -4065,6 +4277,56 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
         ],
         duration_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// Hits for `query` and where they came from. A configured backend
+/// (`CLAWD_WEB_SEARCH_BASE_URL`) is used alone. Otherwise: the local
+/// SearXNG when it answers, then DuckDuckGo (skipped for a while after it
+/// answers with its bot check), then Brave Search and Bing.
+fn search_hits(query: &str) -> Result<(String, Vec<SearchHit>), String> {
+    if std::env::var_os("CLAWD_WEB_SEARCH_BASE_URL").is_some() {
+        return duckduckgo_hits(query).map(|hits| ("DuckDuckGo".to_string(), hits));
+    }
+    if let Some(found) = search_fallback::searxng(query) {
+        return Ok(found);
+    }
+    if !search_fallback::duckduckgo_blocked() {
+        let hits = duckduckgo_hits(query).unwrap_or_default();
+        if !hits.is_empty() {
+            return Ok(("DuckDuckGo".to_string(), hits));
+        }
+        // A bot check (or no answer): leave DuckDuckGo alone for a while
+        // instead of asking again on every search.
+        search_fallback::block_duckduckgo();
+    }
+    Ok(search_fallback::search(query)
+        .map(|(engine, hits)| (engine.to_string(), hits))
+        .unwrap_or_else(|| ("DuckDuckGo".to_string(), Vec::new())))
+}
+
+/// DuckDuckGo's HTML results (or the configured backend's), without the
+/// links back to DuckDuckGo itself that its bot-check page consists of.
+fn duckduckgo_hits(query: &str) -> Result<Vec<SearchHit>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent(search_fallback::USER_AGENT)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .get(build_search_url(query)?)
+        .send()
+        .map_err(|error| error.to_string())?;
+    let final_url = response.url().clone();
+    let html = response.text().map_err(|error| error.to_string())?;
+    let mut hits = extract_search_hits(&html);
+    if hits.is_empty() && final_url.host_str().is_some() {
+        hits = extract_search_hits_from_generic_links(&html);
+    }
+    if std::env::var_os("CLAWD_WEB_SEARCH_BASE_URL").is_none() {
+        hits.retain(|hit| !hit.url.contains("duckduckgo.com"));
+    }
+    Ok(hits)
 }
 
 fn build_http_client() -> Result<Client, String> {
@@ -4145,6 +4407,85 @@ fn summarize_web_fetch(
         ));
     }
     out
+}
+
+/// Image URLs on an HTML page: `og:image` first, then `<img src>`, made
+/// absolute, without data URIs, tracking pixels or duplicates.
+fn extract_image_urls(html: &str, page_url: &str) -> Vec<String> {
+    const MAX_IMAGES: usize = 12;
+    let base = reqwest::Url::parse(page_url).ok();
+    let mut found: Vec<String> = Vec::new();
+    let mut push = |raw: &str| {
+        let raw = decode_html_entities(raw.trim());
+        if raw.is_empty() || raw.starts_with("data:") || found.len() >= MAX_IMAGES {
+            return;
+        }
+        let absolute = match &base {
+            Some(base) => match base.join(&raw) {
+                Ok(url) => url.to_string(),
+                Err(_) => return,
+            },
+            None => raw,
+        };
+        let lower = absolute.to_lowercase();
+        if lower.contains("pixel") || lower.contains("1x1") || lower.contains("spacer") {
+            return;
+        }
+        if !found.contains(&absolute) {
+            found.push(absolute);
+        }
+    };
+    let lower = html.to_lowercase();
+    for (start, _) in lower.match_indices("<meta") {
+        let tag = &html[start..start + lower[start..].find('>').unwrap_or(0)];
+        let tag_lower = tag.to_lowercase();
+        if tag_lower.contains("og:image") || tag_lower.contains("twitter:image") {
+            if let Some(content) = html_attribute(tag, "content") {
+                push(&content);
+            }
+        }
+    }
+    for (start, _) in lower.match_indices("<img") {
+        let tag = &html[start..start + lower[start..].find('>').unwrap_or(0)];
+        if let Some(src) = html_attribute(tag, "src").or_else(|| html_attribute(tag, "data-src")) {
+            push(&src);
+        }
+    }
+    found
+}
+
+/// The value of `name="..."` (or single-quoted) inside one HTML tag.
+fn html_attribute(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    let mut search = 0;
+    while let Some(found) = lower[search..].find(name) {
+        let at = search + found;
+        search = at + name.len();
+        let before_ok = at == 0
+            || lower[..at]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_whitespace());
+        let rest = lower[search..].trim_start();
+        if !before_ok || !rest.starts_with('=') {
+            continue;
+        }
+        let value_start = tag.len() - rest.len() + 1;
+        let value = tag[value_start..].trim_start();
+        let quote = value.chars().next()?;
+        return if quote == '"' || quote == '\'' {
+            value[1..].find(quote).map(|end| value[1..=end].to_string())
+        } else {
+            Some(
+                value
+                    .split(|c: char| c.is_whitespace() || c == '>')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+    }
+    None
 }
 
 /// Elements whose content is never part of the readable page.
@@ -5072,17 +5413,34 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 
 /// Runs the sub-agent's conversation and returns its final answer.
 fn run_agent_job(job: &AgentJob) -> Result<String, String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
-    let summary = runtime
-        .run_turn(job.prompt.clone(), None)
-        .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
+    local_tools::agents::started(job);
+    let outcome = run_agent_conversation(job, Session::new(), job.prompt.clone());
+    let final_text = local_tools::agents::finished(job, outcome)?;
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)?;
     Ok(final_text)
 }
 
+/// One turn of a sub-agent's conversation, on `session` (empty for a new
+/// agent, the earlier one when [`local_tools`]' `SendMessage` resumes it).
+fn run_agent_conversation(
+    job: &AgentJob,
+    session: Session,
+    prompt: String,
+) -> (Result<String, String>, Session) {
+    let mut runtime = match build_agent_runtime(job, session) {
+        Ok(runtime) => runtime.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS),
+        Err(error) => return (Err(error), Session::new()),
+    };
+    let result = runtime
+        .run_turn(prompt, None)
+        .map(|summary| final_assistant_text(&summary))
+        .map_err(|error| error.to_string());
+    (result, runtime.into_session())
+}
+
 fn build_agent_runtime(
     job: &AgentJob,
+    session: Session,
 ) -> Result<ConversationRuntime<ProviderRuntimeClient, SubagentToolExecutor>, String> {
     let model = job
         .manifest
@@ -5095,7 +5453,7 @@ fn build_agent_runtime(
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
     Ok(ConversationRuntime::new(
-        Session::new(),
+        session,
         api_client,
         tool_executor,
         permission_policy,
@@ -5199,6 +5557,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "grep_search",
             "WebFetch",
             "WebSearch",
+            "Download",
             "TodoWrite",
             "Skill",
             "ToolSearch",
@@ -6183,6 +6542,14 @@ async fn stream_with_provider(
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
+                if delta
+                    .delta
+                    .stop_reason
+                    .as_deref()
+                    .is_some_and(runtime::is_output_limit_stop_reason)
+                {
+                    events.push(AssistantEvent::OutputLimitReached);
+                }
                 events.push(AssistantEvent::Usage(delta.usage.token_usage()));
             }
             ApiStreamEvent::MessageStop(_) => {
@@ -6385,6 +6752,13 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
         }
     }
 
+    if response
+        .stop_reason
+        .as_deref()
+        .is_some_and(runtime::is_output_limit_stop_reason)
+    {
+        events.push(AssistantEvent::OutputLimitReached);
+    }
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     events
@@ -7722,8 +8096,63 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+mod browser;
+mod code_search;
+mod com;
+mod dev_tools;
+mod download;
 pub mod lane_completion;
+pub mod leangate;
+pub mod local_tools;
+mod lsp_tool;
+mod media;
 pub mod pdf_extract;
+mod pty_tool;
+mod search_fallback;
+mod signals;
+
+/// Fingerprints a memory anchor's code, for `runtime::set_anchor_hasher`.
+#[must_use]
+pub fn memory_anchor_hash(
+    root: &std::path::Path,
+    path: &str,
+    symbol: Option<&str>,
+) -> Option<String> {
+    code_search::anchor_hash(root, path, symbol)
+}
+
+/// One lock for every test in this crate that changes the environment
+/// (`CLAW_CONFIG_HOME`, `HOME`, …), so they cannot interleave.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+mod source_adapters;
+mod x11;
+
+#[cfg(test)]
+mod image_url_tests {
+    #[test]
+    fn lists_page_images_as_absolute_urls() {
+        let html = r#"<html><head><meta property="og:image" content="https://cdn.example.com/cover.jpg">
+            </head><body><img class="x" src="/pics/a.png" alt="a"><img data-src='b.webp'>
+            <img src="data:image/gif;base64,AAAA"><img src="/pics/a.png"></body></html>"#;
+        let images = super::extract_image_urls(html, "https://example.com/post/1");
+        assert_eq!(
+            images,
+            vec![
+                "https://cdn.example.com/cover.jpg",
+                "https://example.com/pics/a.png",
+                "https://example.com/post/b.webp",
+            ]
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -7734,7 +8163,7 @@ mod tests {
     use std::net::{SocketAddr, TcpListener};
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -7756,8 +8185,7 @@ mod tests {
     use serde_json::json;
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        &crate::TEST_ENV_LOCK
     }
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {

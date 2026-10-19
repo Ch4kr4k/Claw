@@ -1,0 +1,17 @@
+[Unit]
+Description=llama.cpp server (llama-gpu) for claw on 127.0.0.1:8080
+# The GPU may not be ready the instant the session starts (CUDA init can take
+# over 30 s after boot); keep retrying for up to 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/llama-gpu
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

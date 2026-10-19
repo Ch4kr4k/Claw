@@ -16,7 +16,10 @@ use runtime::turn_keys::screen::{self, ScreenGuard};
 use runtime::{ContentBlock, MessageRole};
 
 use crate::render::TerminalRenderer;
-use crate::{build_runtime, build_system_prompt, final_assistant_text, report_repl_turn_error};
+use crate::{
+    build_runtime, build_system_prompt, effective_auto_compaction_threshold, final_assistant_text,
+    report_repl_turn_error,
+};
 use crate::{CliPermissionPrompter, LiveCli};
 
 type CommandResult = Result<bool, Box<dyn std::error::Error>>;
@@ -42,6 +45,7 @@ pub(crate) struct Fullscreen(());
 impl Fullscreen {
     pub(crate) fn start() -> Self {
         *lock_fullscreen() = screen::enter();
+        crate::diff_panel::refresh();
         Self(())
     }
 }
@@ -50,6 +54,24 @@ impl Drop for Fullscreen {
     fn drop(&mut self) {
         drop(lock_fullscreen().take());
     }
+}
+
+/// Restore the same rendering mode after an external editor exits.
+pub(crate) struct ExternalTerminal(bool);
+impl Drop for ExternalTerminal {
+    fn drop(&mut self) {
+        if self.0 {
+            *lock_fullscreen() = screen::enter();
+            screen::set_copy_handler(crate::repl_commands::copy_selection);
+            // An editor may have changed files too.
+            crate::diff_panel::refresh();
+        }
+    }
+}
+pub(crate) fn external_terminal() -> ExternalTerminal {
+    let active = screen::active();
+    drop(lock_fullscreen().take());
+    ExternalTerminal(active)
 }
 
 fn lock_fullscreen() -> std::sync::MutexGuard<'static, Option<ScreenGuard>> {
@@ -82,7 +104,7 @@ pub(crate) fn apply_saved_settings() {
 }
 
 /// `500k`, `1.5m`, `120000` → tokens.
-fn parse_token_count(value: &str) -> Option<u32> {
+pub(crate) fn parse_token_count(value: &str) -> Option<u32> {
     let value = value.trim().to_ascii_lowercase().replace('_', "");
     let (number, scale) = match value.chars().last()? {
         'k' => (&value[..value.len() - 1], 1_000.0),
@@ -408,18 +430,38 @@ impl LiveCli {
     /// until a key is pressed.
     pub(crate) fn run_loop(&mut self, args: &str) -> CommandResult {
         let args = args.trim();
+        if args == "stop" {
+            let scheduler = runtime::scheduler::global_scheduler();
+            if scheduler.cancel_wakeup() {
+                println!("Self-paced loop stopped: its next run was cancelled.");
+            } else {
+                println!("No self-paced loop is waiting to run.");
+            }
+            return Ok(false);
+        }
         let (interval, prompt) = match args.split_once(char::is_whitespace) {
             Some((first, rest)) if parse_interval(first).is_some() => (
                 parse_interval(first).unwrap_or(DEFAULT_LOOP_INTERVAL),
                 rest.trim(),
             ),
-            _ => (DEFAULT_LOOP_INTERVAL, args),
+            _ => (Duration::ZERO, args),
         };
         if prompt.is_empty() {
             println!(
-                "usage: /loop [interval] <prompt>   e.g. /loop 5m check if the deploy finished"
+                "usage: /loop [interval] <prompt>   e.g. /loop 5m check if the deploy finished\n       /loop <prompt>   the agent picks when to run again (self-paced)"
             );
             return Ok(false);
+        }
+        if interval.is_zero() {
+            // Self-paced, like Claude Code: each iteration ends with
+            // ScheduleWakeup, and the wake-up runs the next one while the
+            // prompt is idle (you can type in between).
+            println!(
+                "Self-paced loop: {prompt}\n  {DIM}The agent schedules each next run; it ends when it calls ScheduleWakeup with stop, or /loop stop.{RESET}"
+            );
+            report_repl_turn_error(self.run_turn(&self_paced_loop_prompt(prompt)));
+            self.persist_session()?;
+            return Ok(true);
         }
         println!(
             "Looping every {}: {prompt}\n  {DIM}Press any key while it waits to stop.{RESET}",
@@ -450,14 +492,14 @@ impl LiveCli {
         match value.map(str::trim).filter(|v| !v.is_empty()) {
             None => println!(
                 "Auto-compact window: {} tokens (the context size at which the session is compacted).\n  /autocompact <tokens> to change it (e.g. 150k), /autocompact auto for the default.",
-                runtime::auto_compaction_threshold_from_env()
+                effective_auto_compaction_threshold(&self.model)
             ),
             Some("auto" | "default") => {
                 runtime::set_auto_compaction_threshold_override(None);
                 runtime::save_user_setting("autoCompactWindow", None)?;
                 println!(
                     "Auto-compact window: {} tokens (default).",
-                    runtime::auto_compaction_threshold_from_env()
+                    effective_auto_compaction_threshold(&self.model)
                 );
             }
             Some(value) => {
@@ -552,6 +594,7 @@ impl LiveCli {
                 if !active {
                     *lock_fullscreen() = screen::enter();
                     screen::set_copy_handler(crate::repl_commands::copy_selection);
+                    crate::diff_panel::refresh();
                 }
                 println!("View: fullscreen (saved)");
             }
@@ -761,6 +804,38 @@ impl LiveCli {
 
     /// `/focus [on|off]`: the compact view; saved like Claude Code's
     /// `viewMode` setting.
+    /// `/diffpanel [on|off]`: the uncommitted changes, right of the
+    /// conversation. Saved, like `/focus`.
+    pub(crate) fn run_diff_panel(mode: Option<&str>) -> CommandResult {
+        if !screen::active() {
+            println!("The diff panel needs the full-screen view: /tui fullscreen");
+            return Ok(false);
+        }
+        let shown = crate::diff_panel::enabled() && !screen::side_panel_closed();
+        let on = match mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") => !shown,
+            Some("on") => true,
+            Some("off") => false,
+            Some(other) => {
+                println!("usage: /diffpanel [on|off]  (got `{other}`)");
+                return Ok(false);
+            }
+        };
+        runtime::save_user_setting("diffPanel", (!on).then_some("off"))?;
+        screen::set_side_panel_closed(!on);
+        if on {
+            crate::diff_panel::refresh();
+            println!(
+                "Diff panel on (saved): uncommitted changes, shown when the window is at least {} columns wide and something changed.",
+                screen::SIDE_PANEL_MIN_COLS
+            );
+        } else {
+            screen::set_side_panel("diff", None);
+            println!("Diff panel off (saved).");
+        }
+        Ok(false)
+    }
+
     pub(crate) fn run_focus(mode: Option<&str>) -> CommandResult {
         if !screen::active() {
             println!("The focus view needs the full-screen view: /tui fullscreen");
@@ -874,6 +949,17 @@ impl LiveCli {
         report_repl_turn_error(self.run_turn(&prompt));
         Ok(true)
     }
+}
+
+/// One iteration of a self-paced `/loop`: the task and how to pace it.
+pub(crate) fn self_paced_loop_prompt(prompt: &str) -> String {
+    format!(
+        "{prompt}\n\n<system-reminder>\nThis is an iteration of a self-paced /loop. When this \
+         iteration's work is done, call ScheduleWakeup with delaySeconds (60-3600, matched to \
+         what you are waiting for), prompt set to exactly the loop's task above (without this \
+         reminder), and a one-sentence reason. When the task is complete or nothing is left to \
+         watch, call ScheduleWakeup with stop: true instead.\n</system-reminder>"
+    )
 }
 
 /// The section `/advisor` adds to the system prompt.

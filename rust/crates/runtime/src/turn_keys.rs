@@ -56,6 +56,23 @@ pub mod screen {
     pub fn clear_pane() {}
     pub fn clear_conversation() {}
     pub fn scroll(_: Scroll) {}
+    pub fn wheel(_: Scroll, _: usize, _: usize) {}
+    pub type PanelRender = std::sync::Arc<dyn Fn(usize) -> Vec<String> + Send + Sync>;
+    pub const SIDE_PANEL_MIN_COLS: usize = 110;
+    pub fn set_side_panel(_: &str, _: Option<PanelRender>) {}
+    pub fn set_side_panel_closed(_: bool) {}
+    #[must_use]
+    pub fn side_panel_closed() -> bool {
+        false
+    }
+    #[must_use]
+    pub fn conversation_cols() -> Option<usize> {
+        None
+    }
+    #[must_use]
+    pub fn side_panel_width() -> Option<usize> {
+        None
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Mouse {
@@ -712,8 +729,10 @@ struct Keys {
     text: Vec<u8>,
     /// Shift+Tab presses (`ESC [ Z`).
     back_tabs: u32,
-    /// Mouse wheel, PgUp/PgDn, Ctrl+Home/Ctrl+End.
+    /// PgUp/PgDn, Ctrl+Home/Ctrl+End.
     scrolls: Vec<Scroll>,
+    /// Mouse wheel turns, with the (row, col) of the pointer.
+    wheels: Vec<(Scroll, usize, usize)>,
     /// Left-button presses, drags and releases (text selection).
     mice: Vec<screen::Mouse>,
 }
@@ -750,7 +769,9 @@ fn split_keys(bytes: &[u8]) -> Keys {
                         ([b'<', rest @ ..], Some(&kind @ (b'M' | b'm'))) => {
                             if let Some(event) = parse_sgr_mouse(rest, kind == b'm') {
                                 match event {
-                                    SgrMouse::Wheel(scroll) => keys.scrolls.push(scroll),
+                                    SgrMouse::Wheel(scroll, row, col) => {
+                                        keys.wheels.push((scroll, row, col));
+                                    }
                                     SgrMouse::Left(mouse) => keys.mice.push(mouse),
                                 }
                             }
@@ -768,7 +789,8 @@ fn split_keys(bytes: &[u8]) -> Keys {
 }
 
 enum SgrMouse {
-    Wheel(Scroll),
+    /// A wheel turn and the pointer's (row, col).
+    Wheel(Scroll, usize, usize),
     Left(screen::Mouse),
 }
 
@@ -787,8 +809,8 @@ fn parse_sgr_mouse(params: &[u8], release: bool) -> Option<SgrMouse> {
     }
     let (row, col) = (row.saturating_sub(1), col.saturating_sub(1));
     Some(match (button, release) {
-        (64, false) => SgrMouse::Wheel(Scroll::Up(wheel_rows())),
-        (65, false) => SgrMouse::Wheel(Scroll::Down(wheel_rows())),
+        (64, false) => SgrMouse::Wheel(Scroll::Up(wheel_rows()), row, col),
+        (65, false) => SgrMouse::Wheel(Scroll::Down(wheel_rows()), row, col),
         (0, false) => SgrMouse::Left(screen::Mouse::Press { row, col }),
         (32, false) => SgrMouse::Left(screen::Mouse::Drag { row, col }),
         (0, true) => SgrMouse::Left(screen::Mouse::Release { row, col }),
@@ -869,6 +891,13 @@ impl Drop for TurnKeyWatcher {
             terminal.restore_original();
         }
     }
+}
+
+/// Whether a turn is running with the key watcher on the terminal (so
+/// [`pause`] hands the keyboard over), not the idle prompt's line editor.
+#[must_use]
+pub fn watching() -> bool {
+    ACTIVE.load(Ordering::SeqCst)
 }
 
 /// Suspends the watcher (and restores normal terminal input) while the guard
@@ -1037,6 +1066,9 @@ mod imp {
                     continue;
                 }
                 Ok(read) => read,
+                // A signal (Ctrl+C, a window resize) cut the read short.
+                // Returning here left the rest of the turn without Esc.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => return,
             };
             pending.extend_from_slice(&buffer[..read]);
@@ -1084,6 +1116,9 @@ mod imp {
         }
         for scroll in keys.scrolls {
             screen::scroll(scroll);
+        }
+        for (scroll, row, col) in keys.wheels {
+            screen::wheel(scroll, row, col);
         }
         for mouse in keys.mice {
             screen::mouse(mouse);
@@ -1184,10 +1219,16 @@ mod tests {
         use super::Scroll;
         let keys = super::split_keys(b"\x1b[<64;10;5M\x1b[<65;10;5M\x1b[<0;3;3M\x1b[<0;3;3m\x1b[5~\x1b[6~\x1b[1;5H\x1b[1;5Fx");
         assert_eq!(
+            keys.wheels,
+            vec![
+                (Scroll::Up(super::wheel_rows()), 4, 9),
+                (Scroll::Down(super::wheel_rows()), 4, 9),
+            ],
+            "wheel turns keep where the pointer is"
+        );
+        assert_eq!(
             keys.scrolls,
             vec![
-                Scroll::Up(super::wheel_rows()),
-                Scroll::Down(super::wheel_rows()),
                 Scroll::PageUp,
                 Scroll::PageDown,
                 Scroll::Top,

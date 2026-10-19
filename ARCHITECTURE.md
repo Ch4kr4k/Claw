@@ -113,6 +113,62 @@ Key points:
   (bracketed paste, kitty keyboard, OSC 52) are passed to the terminal. On
   exit the conversation is printed to the normal screen; a panic hook puts
   the terminal back.
+- **Images from tools.** Tool results are text; a tool names a picture with
+  an output line `claw-image: /path.png` (`runtime::tool_images`), and the
+  conversation loop attaches it to the tool result message as an image
+  block, keeping only the newest two. The OpenAI-compatible request moves
+  such image messages after the whole run of tool results, so parallel tool
+  calls stay paired. The `X11` tool (`tools/src/x11.rs`, over xdotool,
+  wmctrl, ffmpeg and xclip) uses this for screenshots.
+- **COM automation.** `tools/src/com.rs` keeps one PowerShell process per
+  claw session (started with `-EncodedCommand`, `-STA`), so COM objects
+  survive between calls. Each call sends a JSON line with base64 PowerShell
+  generated from the action; the host runs it in the global scope and
+  answers with a marked JSON line (2-D arrays as rows, COM objects
+  summarised). Timeouts kill and restart the process.
+- **Inline images.** `rusty-claude-cli/src/term_image.rs` draws `![alt](url)`
+  in kitty/Ghostty with Unicode placeholders: the PNG (decoded and scaled
+  with `image`, SVG rasterised with `resvg`) is sent once as a quiet virtual
+  placement (`ESC _ G a=T,U=1`), then each row is U+10EEEE coloured with the
+  image id plus a row diacritic. Being text, the placeholders survive the
+  full-screen emulator, which keeps one combining mark per cell and passes
+  `ESC _ G` through. The alternate screen holds its own images, so the
+  graphics commands are replayed before the conversation is printed on exit.
+- **Diffs and the diff panel.** Write and edit tools report unified-diff
+  hunks with 3 context lines (`runtime::line_diff`, Myers' algorithm after
+  trimming the common start and end; past 4,000 differing lines the middle is
+  reported replaced). `diff_view` (CLI) draws hunks Claude Code style:
+  numbered rows, `+`/`-` rows on full-width green/red, syntect colours, long
+  lines wrapped with the marker. The screen can show a side panel
+  (`screen::set_side_panel`, a `PanelRender` closure called with the panel's
+  width, outside the screen lock): at ≥110 columns it takes two fifths of the
+  window with its own scroll (the wheel goes to whatever is under the
+  pointer) and a ✕; narrower, a dismissible notice box sits above the pane.
+  `diff_panel` fills it with `git diff HEAD` plus untracked files, worked out
+  on a background thread (pre-drawn there for the current width) after edits,
+  turns and `/diffpanel`. Output is wrapped to `screen::conversation_cols`;
+  a line drawn wider before the panel opened is cut, not wrapped, where its
+  overflow is only padding or a rule.
+- **Scheduling and monitors.** `runtime::scheduler` holds the session's
+  cron tasks (CronCreate; 5-field expressions in local time, via `chrono`)
+  and the single pending wake-up of a self-paced `/loop` (ScheduleWakeup).
+  The line editor polls it while idle, next to background-job notices; due
+  prompts come back as `ReadOutcome::Wake` and run as turns, so a scheduled
+  prompt never interrupts a running one. A Monitor is a background job
+  (`BackgroundJobs::start_monitor`) whose new lines a watcher thread turns
+  into notices every 250 ms, with a timeout and a lines-per-minute cap.
+- **Local tools.** `tools::local_tools` implements Claude Code tools without a
+  hosted service: worktrees (`git worktree`, cwd switch), sub-agent messaging
+  (finished agents keep their `Session`; SendMessage resumes them on a thread,
+  replies arrive as notices), notifications, findings, feedback drafts, user
+  files, EndConversation (a flag the REPL checks before each prompt) and
+  WaitForMcpServers (status the CLI records after MCP discovery). The CLI
+  supplies background-session rows and MCP status through setter hooks.
+- **LSP.** `tools::lsp_tool` starts a language server per (command, project
+  root) on first use, speaks JSON-RPC over stdio, opens and re-syncs files
+  before each request, answers the server's `workspace/configuration`
+  requests, and keeps `publishDiagnostics` per file. Requests time out after
+  60 s; positions are 1-based at the tool boundary.
 - **Activity row.** While a turn runs, a block shows an animated activity
   row, the input box and the status line: the pane in full-screen view, or
   (`turn_keys::live`, inline view) a block drawn right under the output by a
@@ -136,7 +192,14 @@ Key points:
   at the next prompt. A status line at the bottom shows what is being typed.
 - **Tool output cap.** `CLAW_TOOL_RESULT_MAX_CHARS` truncates what a single
   tool call sends back to the model (unset: no cap), to protect small context
-  windows.
+  windows. `read_file` results go to the model as plain text with a
+  `[path: lines a-b of n]` header and are cut at a line boundary, ending with
+  the `offset` to continue from. When the cap is set, a `read_file` page is
+  sized to the model's context window instead (about a quarter of it, 4k-100k
+  characters; `read_file_budget`), so large-context models read whole files.
+- **Repeat guard.** When a tool call repeats the previous call exactly and
+  gets the same result, the CLI adds a note to that result telling the model
+  that repeating it will not return anything new (`CliToolExecutor::note_repeated_call`).
 
 ## Interrupts: Esc and Ctrl+C
 
@@ -179,6 +242,29 @@ Both backends stream SSE into a common `StreamEvent` type.
 any body-read failure (including timeouts and dropped connections) as
 "error decoding response body".
 
+## Local context budgets
+
+For `local/` models the window comes from the server itself:
+`api/src/providers/local_window.rs` asks llama.cpp's `/props?model=<id>` (next
+to the `CLAW_LOCAL_BASE_URL` API root; the model id lets a router-mode server
+answer for that model) for `n_ctx`, caches it per model for 30 s, and falls
+back to `CLAW_CONTEXT_WINDOW` for servers without `/props`. From it,
+`max_tokens_for_model` asks for a quarter of the window as the reply budget
+(instead of 64K, which let a reply run until the window was full), and
+`build_runtime_with_plugin_state` sets the auto-compaction threshold to what
+is left of the window after the reply budget and a 1/16 margin (about 69%)
+unless `/autocompact` or `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`
+set one. `maybe_auto_compact` counts the last reply's output tokens as well
+as its input. The post-tool stall timeout is 120 s for `local/` models
+(10 s otherwise), since a local server sends nothing until it has read the
+whole prompt.
+
+A reply that stops at the token limit (`max_tokens` / `length`) is marked
+with `AssistantEvent::OutputLimitReached`. The turn loop then does not run a
+last tool call whose input is unfinished JSON (it gets an error result telling
+the model to send less per call), and a text-only reply is continued with a
+reminder, up to 3 times per turn, instead of ending the turn silently.
+
 ## Context-window recovery
 
 When a request fails with a context-overflow signature (`context_window`,
@@ -188,7 +274,32 @@ non-SSE body with no parseable content, or a non-timeout decode error),
 recent messages, running the Trident pipeline plus summary compaction
 (`runtime/src/trident.rs`, `compact.rs`) before each retry. If the error
 reveals the server's real context window, the auto-compaction threshold is
-reset to 70% of it. Timeouts are excluded: compaction cannot fix them.
+reset from it the same way, and for `local/` models the window is remembered
+(`api::note_local_context_window`) so the fresh runtime of the next turn uses
+it too. Timeouts are excluded: compaction cannot fix them.
+Auto-compaction (`maybe_auto_compact`) sizes what it keeps: it estimates the
+prompt overhead (system prompt, tools) from the last request and keeps 4, 2
+or 1 recent messages, cutting large kept tool results last, until the request
+lands halfway between that overhead and the threshold. A fixed 4 messages
+stayed over the threshold on a 32k window and compacted on every step.
+Merged summaries carry earlier user requests and key files once each and drop
+per-chunk bookkeeping, so they stay bounded.
+Each compaction summary carries a "Work done so far" list (one line per tool
+call: tool, path or command, outcome) across later compactions, so a model on
+a small window still knows which edits and builds it already did.
+Each round also cuts tool results longer than about a quarter of the window
+(`truncate_large_tool_results`, limit from `overflow_tool_result_limit`),
+since one whole large file in a kept message can overflow the window alone.
+The window is the one the error reports, else the model's known window
+(`known_context_window`: `api::local_context_window` for `local/` models, else
+`api::model_token_limit`), else the size of the request that overflowed, an
+upper bound that shrinks each round; so large-context models are cut only for
+enormous results. `CLAW_OVERFLOW_TOOL_RESULT_CHARS` or the
+`overflowToolResultChars` setting overrides it (`off` never cuts). A round
+that changes nothing is skipped. The retry continues the failed turn
+(`ConversationRuntime::continue_turn`) with the work it already did, rather
+than sending the prompt again; the prompt is re-sent only when compaction
+removed it.
 
 Compaction never splits an assistant tool-use message from its tool result.
 
@@ -260,6 +371,36 @@ section and switches the permission mode to read-only until `/plan off`.
 | Checkpoints | Shadow git repo `~/.claw/checkpoints/<hash>.git` whose work tree is the project; the project's own `.git` is never touched. Disabled for `$HOME`, `/`, huge folders, missing git, or `CLAW_SNAPSHOTS=0` |
 | Background jobs | In memory (`runtime/src/background_jobs.rs`); output buffered up to 1 MB per job; killed when the REPL exits |
 | Project config | `.claw.json`, `.claw/settings.json`, `.claw/settings.local.json` (see [`USAGE.md`](./USAGE.md#config-file-resolution-order)) |
+| Known workspaces | `~/.claw/workspaces.txt`: every folder claw started a session in, for the desktop app |
+| Desktop app state | `~/.claw/desktop.json` (projects, chat titles, which sessions the app started, preferences, scheduled tasks); project instructions in `<folder>/.claw/instructions.md`; skills, MCP servers and turned-off tools go to claw's own `~/.claw/skills` and `~/.claw/settings.json` |
+
+## Desktop app
+
+`crates/claw-desktop` (Iced) is a front end only. Each open chat starts
+`claw desktop-agent [--resume <session.jsonl>]` (`rusty-claude-cli/src/desktop_agent.rs`)
+in the chat's folder, through the `~/.local/bin/claw` launcher, and talks JSON
+lines over its stdin/stdout. The agent reuses `LiveCli`'s per-turn runtime
+(`prepare_turn_runtime`) with `emit_output = false`; hooks in the stream loop
+(`emit_text`, `emit_thinking`, `emit_tool_call`) and in
+`CliToolExecutor::report_result` (`emit_tool_result`) report the turn as
+events, `DesktopPermissionPrompter` sends approvals to the app and waits for
+the answer, and `cancel` trips the turn's `HookAbortSignal` like Esc. The app
+reads session files directly for the sidebar and history
+(`claw-desktop/src/sessions.rs`), so terminal sessions appear there too.
+
+`--incognito` clears the session's persistence path and removes the file
+`LiveCli::new` wrote, and the turn skips `persist_session`, so nothing reaches
+disk. The agent adds a system-prompt section telling the model it can show
+images with Markdown and that commands have no terminal.
+
+In the app, `markdown_view.rs` is a custom `markdown::Viewer`: code blocks are
+highlighted with `iced::highlighter` (Solarized dark, InspiredGitHub in light
+mode; results cached by content hash), wrap instead of scrolling, and images
+load asynchronously (reqwest or the file system) into a URL-keyed cache.
+`settings.rs` edits claw's `settings.json` (`mcpServers`,
+`permissions.deniedTools`, keeping a `.bak`) and installs skills. Scheduled
+tasks are checked every 30 s with `runtime::scheduler::CronSchedule` and run
+as new chats, so they only run while the app is open.
 
 ## Checkpoints and undo
 
@@ -294,3 +435,49 @@ slide specs, and `write_xlsx` edits workbooks in place.
 - `rust/mock_parity_scenarios.json` drives the parity harness
   ([`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md)).
 - Env-mutating tests take the crate's env lock.
+
+## Stateful command actions
+
+`commands::SlashCommand::LocalAction` routes the additional REPL operations to
+`rusty-claude-cli/src/command_actions.rs`. Legacy report variants remain available
+for `--resume`; mutation dispatch is limited to the live REPL. The settings layer
+validates assignment batches before writing, preserves unrelated JSON keys, and
+atomically replaces `.claw/settings.local.json`. Theme, model, and permission-mode
+edits update live state; rebuilding the runtime reloads permission rules, memory,
+plugins, and MCP discovery. MCP enablement uses the boolean map `mcpServerStates`:
+project-local `true` can override inherited `false`, unlike additive array settings.
+Disabled servers are filtered before transport construction and tool discovery.
+
+Artifacts stay under `.claw/artifacts`; attachment resolves canonical paths to
+reject traversal and symlink escape, enforces a 1 MiB UTF-8 limit, and persists the
+attached text in the session. Generation/reference commands send explicit prompts
+through the normal tool and permission pipeline. Account commands launch fixed
+HTTPS destinations as process arguments and never send conversation state.
+External editors temporarily release the full-screen renderer and restore it on
+return. The line editor's optional Vim mode implements insert/normal state and a
+small documented motion set without changing Ctrl-key handling.
+
+## Shell sandbox execution
+
+`runtime::sandbox` builds a Bubblewrap mount/user/PID sandbox and probes the
+requested setup using the same launcher as execution. Filesystem status is active
+only after that probe succeeds. The default is a read-only host root with a
+writable workspace and private temporary storage; configured allow-list roots
+are canonicalized and must exist. Network isolation is probed with `--unshare-net`
+when requested. Missing backends, invalid mounts and denied namespaces fail
+closed. There is no unshare/plain-shell fallback or fake-root Portage environment.
+
+`PermissionPolicy` treats Bash `dangerouslyDisableSandbox: true` as a separate
+host permission request, after deny rules and before allow rules/mode shortcuts.
+The CLI distinguishes this prompt and binds remembered host approvals to the full
+input and cwd. `ConversationRuntime` keeps Bash calls serial and installs a
+private, thread-local, single-use execution scope only around an authorized call.
+`execute_bash` consumes that scope after matching the typed input and cwd; direct
+tool dispatch cannot manufacture approval through JSON. Scope teardown clears an
+unused grant. Ordinary commands cannot weaken the configured sandbox through
+per-call override fields. Background jobs use the same checked launcher.
+
+The parent Claw process is the host executor; it is not itself launched inside the
+per-command sandbox. An outer sandbox on Claw still applies to host requests.
+This boundary covers Bash writes and requested network namespaces, not every tool
+or confidentiality of host files. Other tools retain their own permission checks.

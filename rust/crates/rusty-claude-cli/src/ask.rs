@@ -98,7 +98,12 @@ struct Picker {
     checked: Vec<bool>,
     /// `Some` while the user types a custom answer.
     typing: Option<String>,
+    /// Whether the last row offers "Type something else".
+    allow_other: bool,
 }
+
+/// Most option rows shown at once; longer lists scroll with the cursor.
+const MAX_VISIBLE_ROWS: usize = 10;
 
 impl Picker {
     fn new(input: AskInput) -> Self {
@@ -118,16 +123,17 @@ impl Picker {
             checked,
             choices,
             typing,
+            allow_other: true,
         }
     }
 
     /// Rows the cursor can be on: the choices plus "Type something else".
     fn rows(&self) -> usize {
-        self.choices.len() + 1
+        self.choices.len() + usize::from(self.allow_other)
     }
 
     fn is_other(&self, row: usize) -> bool {
-        row == self.choices.len()
+        self.allow_other && row == self.choices.len()
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> KeyOutcome {
@@ -258,7 +264,20 @@ impl Picker {
                 paint("\x1b[1m", &rest)
             ));
         }
-        for row in 0..self.rows() {
+        // A long list shows a window around the cursor.
+        let rows = self.rows();
+        let start = if rows > MAX_VISIBLE_ROWS {
+            self.cursor
+                .saturating_sub(MAX_VISIBLE_ROWS / 2)
+                .min(rows - MAX_VISIBLE_ROWS)
+        } else {
+            0
+        };
+        let end = (start + MAX_VISIBLE_ROWS).min(rows);
+        if start > 0 {
+            lines.push(paint("\x1b[2m", &format!("  ↑ {start} more")));
+        }
+        for row in start..end {
             let selected = row == self.cursor;
             let pointer = if selected { "❯ " } else { "  " };
             let checkbox = if self.multi && !self.is_other(row) {
@@ -299,6 +318,9 @@ impl Picker {
                     lines.push(format!("{indent}{}", paint("\x1b[2m", &line)));
                 }
             }
+        }
+        if end < rows {
+            lines.push(paint("\x1b[2m", &format!("  ↓ {} more", rows - end)));
         }
         let hint = if self.typing.is_some() {
             "type your answer · Enter send · Esc back"
@@ -446,6 +468,200 @@ fn no_user_result(question: &str) -> String {
     .unwrap_or_default()
 }
 
+/// What [`pick`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick {
+    /// The index of the chosen option.
+    Index(usize),
+    /// Text typed on the "Type something else" row.
+    Typed(String),
+    /// Esc or Ctrl+C.
+    Cancelled,
+}
+
+/// A list to choose from with the arrow keys (Enter selects, 1-9 jump, Esc
+/// cancels), starting on `default`. `allow_other` adds a row for typing an
+/// answer that is not listed. Long lists scroll.
+pub fn pick(
+    question: &str,
+    options: &[(String, Option<String>)],
+    default: usize,
+    allow_other: bool,
+) -> io::Result<Pick> {
+    let mut picker = Picker::new(AskInput {
+        question: question.to_string(),
+        header: None,
+        options: options
+            .iter()
+            .map(|(label, description)| AskOptionInput::Detailed {
+                label: label.clone(),
+                description: description.clone(),
+                recommended: false,
+            })
+            .collect(),
+        multi_select: false,
+    });
+    picker.allow_other = allow_other;
+    picker.cursor = default.min(picker.rows().saturating_sub(1));
+    if !allow_other && options.is_empty() {
+        return Ok(Pick::Cancelled);
+    }
+    terminal_keys_paused(|| {
+        Ok(match run_picker(picker)? {
+            Answer::Chosen(labels) => labels
+                .first()
+                .and_then(|label| options.iter().position(|(option, _)| option == label))
+                .map_or(Pick::Cancelled, Pick::Index),
+            Answer::Typed(text) => Pick::Typed(text),
+            Answer::Cancelled => Pick::Cancelled,
+        })
+    })
+}
+
+/// A line of text typed in raw mode, so it works in the full-screen view
+/// too: Enter accepts (an empty line means "keep the default"), Esc cancels
+/// (`None`). `hidden` shows `•` for each character, for keys and passwords.
+pub fn ask_text(prompt: &str, hidden: bool) -> io::Result<Option<String>> {
+    terminal_keys_paused(|| read_input(prompt, !hidden))
+}
+
+/// Runs `f` with the turn key watcher paused (if a turn is running), so the
+/// keyboard reaches `f`.
+fn terminal_keys_paused<T>(f: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let _keys_paused = runtime::turn_keys::pause();
+    crate::render::stop_thinking();
+    f()
+}
+
+/// Asks for what `ssh` needs while a command runs, usually a key
+/// passphrase: `SSH_ASKPASS` reaches here through [`runtime::askpass`].
+/// Typed characters show as `•` unless the prompt expects a visible answer
+/// (yes/no, a user name). `None` when cancelled, or outside a turn, where
+/// the line editor owns the keyboard.
+pub fn ask_secret(prompt: &str) -> Option<String> {
+    if !runtime::turn_keys::watching()
+        || !io::stdin().is_terminal()
+        || !runtime::turn_keys::stdout_is_terminal()
+    {
+        return None;
+    }
+    let _keys_paused = runtime::turn_keys::pause();
+    crate::render::stop_thinking();
+    read_input(prompt, shows_answer(prompt)).ok().flatten()
+}
+
+/// Whether the answer may be shown as typed.
+fn shows_answer(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    lower.contains("yes/no") || lower.contains("username")
+}
+
+/// The answer being typed for [`ask_secret`].
+#[derive(Default)]
+struct SecretInput {
+    text: String,
+}
+
+impl SecretInput {
+    /// `Some(answer)` once Enter or a cancel key is pressed.
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Option<String>> {
+        if key.kind != KeyEventKind::Press {
+            return None;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => return Some(Some(std::mem::take(&mut self.text))),
+            KeyCode::Esc => return Some(None),
+            KeyCode::Char('c' | 'd') if ctrl => return Some(None),
+            KeyCode::Char('u') if ctrl => self.text.clear(),
+            KeyCode::Backspace => {
+                self.text.pop();
+            }
+            KeyCode::Char(ch) if !ctrl => self.text.push(ch),
+            _ => {}
+        }
+        None
+    }
+}
+
+fn read_input(prompt: &str, visible: bool) -> io::Result<Option<String>> {
+    let margin = " ".repeat(OUTPUT_MARGIN);
+    let mut stdout = io::stdout();
+    writeln!(stdout)?;
+    terminal::enable_raw_mode()?;
+    let result: io::Result<(Option<String>, usize)> = (|| {
+        let mut input = SecretInput::default();
+        let mut drawn = 0_usize;
+        loop {
+            let width = terminal::size().map_or(80, |(cols, _)| usize::from(cols));
+            let width = width.saturating_sub(2 * OUTPUT_MARGIN + 3).max(20);
+            let shown = if visible {
+                input.text.clone()
+            } else {
+                "•".repeat(input.text.chars().count())
+            };
+            let mut lines: Vec<String> = prompt
+                .lines()
+                .map(|line| line.chars().take(width).collect())
+                .collect();
+            if let Some(last) = lines.last_mut() {
+                last.push(' ');
+                last.push_str(&shown);
+            }
+            lines.push("\x1b[2mEnter to accept · Esc to cancel\x1b[0m".to_string());
+            let mut frame = String::new();
+            if drawn > 0 {
+                frame.push_str(&format!("\x1b[{drawn}A"));
+            }
+            frame.push('\r');
+            for (index, line) in lines.iter().enumerate() {
+                let mark = match (index, visible) {
+                    (0, false) => "\x1b[33m🔑\x1b[0m ",
+                    (0, true) => "\x1b[33m›\x1b[0m ",
+                    _ => "   ",
+                };
+                frame.push_str(&format!("\x1b[2K{margin}{mark}{line}\r\n"));
+            }
+            if drawn == 0 && screen::active() {
+                frame.insert_str(0, "\x1b[?25l");
+            }
+            screen::write_pane(frame.as_bytes())?;
+            drawn = lines.len();
+            if let Event::Key(key) = event::read()? {
+                if let Some(answer) = input.handle_key(key) {
+                    return Ok((answer, drawn));
+                }
+            }
+        }
+    })();
+    terminal::disable_raw_mode()?;
+    let (answer, drawn) = result?;
+    // Never echo a secret: the summary only says whether one was given.
+    let summary = match &answer {
+        None => "cancelled".to_string(),
+        Some(text) if text.is_empty() => "kept".to_string(),
+        Some(text) if visible => text.clone(),
+        Some(_) => "entered".to_string(),
+    };
+    let first = prompt.lines().next().unwrap_or("").trim();
+    let icon = if visible { "›" } else { "🔑" };
+    let summary = format!("{margin}\x1b[36m{icon} {first} └ {summary}\x1b[0m\n");
+    let mut frame = String::new();
+    if screen::active() {
+        screen::clear_pane();
+    } else {
+        frame.push_str(&format!("\x1b[{drawn}A\r"));
+        for _ in 0..drawn {
+            frame.push_str("\x1b[2K\n");
+        }
+        frame.push_str(&format!("\x1b[{drawn}A\r"));
+    }
+    frame.push_str(&summary);
+    stdout.write_all(frame.as_bytes())?;
+    stdout.flush()?;
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -568,5 +784,27 @@ mod tests {
         assert_eq!(lines[3], "  [ ] 2. Integration");
         assert_eq!(lines[4], "      3. Type something else…");
         assert!(lines.iter().all(|line| line.chars().count() <= 40));
+    }
+
+    #[test]
+    fn secret_input_edits_and_ends() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut input = super::SecretInput::default();
+        for ch in "t00rx".chars() {
+            assert_eq!(input.handle_key(key(KeyCode::Char(ch))), None);
+        }
+        assert_eq!(input.handle_key(key(KeyCode::Backspace)), None);
+        assert_eq!(
+            input.handle_key(key(KeyCode::Enter)),
+            Some(Some("t00r".to_string()))
+        );
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(input.handle_key(ctrl_c), Some(None));
+        assert!(super::shows_answer(
+            "Are you sure you want to continue connecting (yes/no/[fingerprint])?"
+        ));
+        assert!(!super::shows_answer(
+            "Enter passphrase for key '/home/u/.ssh/id_ed25519':"
+        ));
     }
 }

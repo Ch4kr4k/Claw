@@ -12,6 +12,15 @@
 //! - Tab completes `/commands` and `@paths`; history persists across
 //!   sessions; text typed while a reply was running is pre-filled.
 
+use std::sync::atomic::{AtomicBool, Ordering as VimOrdering};
+static VIM_ENABLED: AtomicBool = AtomicBool::new(false);
+pub(crate) fn vim_enabled() -> bool {
+    VIM_ENABLED.load(VimOrdering::Relaxed)
+}
+pub(crate) fn set_vim_enabled(enabled: bool) {
+    VIM_ENABLED.store(enabled, VimOrdering::Relaxed);
+}
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -82,6 +91,7 @@ enum KeyAction {
 
 #[derive(Debug, Default)]
 struct EditState {
+    vim_normal: bool,
     buf: Vec<char>,
     pos: usize,
     pastes: Vec<(String, String)>,
@@ -121,6 +131,9 @@ struct HistorySearch {
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
+        if !cfg!(test) {
+            set_vim_enabled(runtime::read_user_setting("editorMode").as_deref() == Some("vim"));
+        }
         let history_path =
             (!cfg!(test)).then(|| runtime::default_config_home().join("history.jsonl"));
         let mut editor = Self {
@@ -213,7 +226,8 @@ impl LineEditor {
             if !event::poll(WAKE_POLL)? {
                 if self.state.buf.is_empty()
                     && self.state.search.is_none()
-                    && runtime::global_background_jobs().has_notices()
+                    && (runtime::global_background_jobs().has_notices()
+                        || runtime::scheduler::global_scheduler().has_due())
                 {
                     self.erase()?;
                     return Ok(ReadOutcome::Wake);
@@ -239,7 +253,13 @@ impl LineEditor {
     fn handle_event(&mut self, event: Event) -> io::Result<KeyAction> {
         if self.pane {
             if let Some(scroll) = scroll_for(&event) {
-                screen::scroll(scroll);
+                // The wheel scrolls whatever is under the pointer.
+                match &event {
+                    Event::Mouse(mouse) => {
+                        screen::wheel(scroll, usize::from(mouse.row), usize::from(mouse.column))
+                    }
+                    _ => screen::scroll(scroll),
+                }
                 return Ok(KeyAction::Continue);
             }
             if let Some(mouse) = selection_mouse(&event) {
@@ -334,6 +354,11 @@ impl LineEditor {
 
     /// A key: a user keybinding if one matches, else the built-in keys.
     fn handle_key(&mut self, key: KeyEvent) -> KeyAction {
+        if vim_enabled() && self.state.search.is_none() {
+            if let Some(action) = self.handle_vim_key(key) {
+                return action;
+            }
+        }
         if self.state.search.is_none() {
             let chord = Chord::of(&key);
             if let Some((_, binding)) = self.bindings.iter().find(|(c, _)| *c == chord) {
@@ -342,6 +367,78 @@ impl LineEditor {
             }
         }
         self.handle_builtin_key(key)
+    }
+
+    fn handle_vim_key(&mut self, key: KeyEvent) -> Option<KeyAction> {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        if key.code == KeyCode::Esc {
+            self.state.vim_normal = true;
+            self.state.menu.clear();
+            self.state.pos = self.state.pos.min(self.state.buf.len().saturating_sub(1));
+            self.state.listing = Some("Vim NORMAL (i to insert)".into());
+            return Some(KeyAction::Continue);
+        }
+        if !self.state.vim_normal {
+            return None;
+        }
+        let state = &mut self.state;
+        match key.code {
+            KeyCode::Char('i') => state.vim_normal = false,
+            KeyCode::Char('a') => {
+                state.pos = (state.pos + 1).min(state.buf.len());
+                state.vim_normal = false;
+            }
+            KeyCode::Char('I') => {
+                state.pos = state.line_start();
+                state.vim_normal = false;
+            }
+            KeyCode::Char('A') => {
+                state.pos = state.line_end();
+                state.vim_normal = false;
+            }
+            KeyCode::Char('h') | KeyCode::Left => state.pos = state.pos.saturating_sub(1),
+            KeyCode::Char('l') | KeyCode::Right => {
+                state.pos =
+                    (state.pos + 1).min(state.line_end().saturating_sub(1).max(state.line_start()))
+            }
+            KeyCode::Char('0') | KeyCode::Home => state.pos = state.line_start(),
+            KeyCode::Char('$') | KeyCode::End => {
+                state.pos = state.line_end().saturating_sub(1).max(state.line_start())
+            }
+            KeyCode::Char('b') => state.pos = state.word_left(),
+            KeyCode::Char('w') => {
+                while state.pos < state.buf.len() && !state.buf[state.pos].is_whitespace() {
+                    state.pos += 1;
+                }
+                while state.pos < state.buf.len() && state.buf[state.pos].is_whitespace() {
+                    state.pos += 1;
+                }
+                state.pos = state.pos.min(state.buf.len().saturating_sub(1));
+            }
+            KeyCode::Char('j') | KeyCode::Down if state.line_end() < state.buf.len() => {
+                state.move_vertical(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up if state.line_start() > 0 => state.move_vertical(-1),
+            KeyCode::Char('x') | KeyCode::Delete => state.delete(),
+            KeyCode::Enter => {
+                return Some(KeyAction::Done(ReadOutcome::Submit(state.expanded_text())))
+            }
+            _ => {}
+        }
+        self.state.listing = Some(
+            if self.state.vim_normal {
+                "Vim NORMAL (i to insert)"
+            } else {
+                "Vim INSERT (Esc for normal)"
+            }
+            .into(),
+        );
+        Some(KeyAction::Continue)
     }
 
     fn apply_binding(&mut self, binding: Binding) -> KeyAction {
@@ -1687,5 +1784,50 @@ mod tests {
     fn common_prefix_of_candidates() {
         let items = vec!["/model".to_string(), "/model opus".to_string()];
         assert_eq!(common_prefix(&items), "/model");
+    }
+}
+
+#[cfg(test)]
+mod vim_tests {
+    use super::*;
+    fn press(editor: &mut LineEditor, code: KeyCode) -> Option<KeyAction> {
+        editor.handle_vim_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+    #[test]
+    fn vim_escape_preserves_text_and_insert_append_and_delete_work() {
+        let mut editor = LineEditor::new("> ", vec![]);
+        editor.state.set_buffer("hello world");
+        press(&mut editor, KeyCode::Esc);
+        assert_eq!(editor.state.text(), "hello world");
+        assert!(editor.state.vim_normal);
+        press(&mut editor, KeyCode::Char('0'));
+        press(&mut editor, KeyCode::Char('w'));
+        assert_eq!(editor.state.pos, 6);
+        press(&mut editor, KeyCode::Char('x'));
+        assert_eq!(editor.state.text(), "hello orld");
+        press(&mut editor, KeyCode::Char('A'));
+        assert!(!editor.state.vim_normal);
+        assert_eq!(editor.state.pos, editor.state.buf.len());
+        assert_eq!(press(&mut editor, KeyCode::Char('!')), None);
+    }
+    #[test]
+    fn vim_motions_handle_empty_and_multiline_unicode() {
+        let mut editor = LineEditor::new("> ", vec![]);
+        press(&mut editor, KeyCode::Esc);
+        for key in ['h', 'j', 'k', 'l', '0', '$', 'b', 'w', 'x'] {
+            press(&mut editor, KeyCode::Char(key));
+        }
+        assert_eq!(editor.state.pos, 0);
+        editor.state.set_buffer("λx\n\n你好");
+        press(&mut editor, KeyCode::Char('0'));
+        press(&mut editor, KeyCode::Char('k'));
+        press(&mut editor, KeyCode::Char('l'));
+        assert!(editor.state.pos >= editor.state.line_start());
+        press(&mut editor, KeyCode::Char('k'));
+        assert_eq!(editor.state.line_start(), 0);
+        assert!(matches!(
+            press(&mut editor, KeyCode::Enter),
+            Some(KeyAction::Done(ReadOutcome::Submit(_)))
+        ));
     }
 }

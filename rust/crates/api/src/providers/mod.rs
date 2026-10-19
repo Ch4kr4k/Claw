@@ -9,6 +9,8 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod hosted;
+pub mod local_window;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -293,6 +295,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             auth_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        });
+    }
+    if let Some(hosted) = hosted::hosted_openai_provider_for_model(&canonical) {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: hosted.config.api_key_env,
+            base_url_env: hosted.config.base_url_env,
+            default_base_url: hosted.config.default_base_url,
         });
     }
     None
@@ -613,7 +623,20 @@ fn web_passthrough_diagnostic(
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
+    // A local server's window is small and shared by prompt and reply: asking
+    // for 64K lets the reply run until the window is full and cuts it off
+    // mid-sentence or mid-tool-call. Keep a quarter of the window for it.
+    if model.starts_with("local/") {
+        if let Some(budget) = local_window::local_max_output_tokens(model) {
+            return budget.min(64_000);
+        }
+    }
     let canonical = resolve_model_alias(model);
+    if model_token_limit(model).is_none() {
+        if let Some(hosted) = hosted::hosted_openai_provider_for_model(&canonical) {
+            return hosted.default_max_output_tokens;
+        }
+    }
     let heuristic = if canonical.contains("opus") {
         32_000
     } else {

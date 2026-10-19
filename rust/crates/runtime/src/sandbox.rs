@@ -158,223 +158,203 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
+/// Probe the actual requested mount/namespace setup. A failed probe never
+/// permits a plain-shell fallback. `active` means this exact setup was verified.
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
-    let network_supported = namespace_supported;
-    let filesystem_active =
-        request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
-    let mut fallback_reasons = Vec::new();
-
-    if request.enabled && request.namespace_restrictions && !namespace_supported {
-        fallback_reasons
-            .push("namespace isolation unavailable (requires Linux with `unshare`)".to_string());
-    }
-    if request.enabled && request.network_isolation && !network_supported {
-        fallback_reasons
-            .push("network isolation unavailable (requires Linux with `unshare`)".to_string());
-    }
-    if request.enabled
-        && request.filesystem_mode == FilesystemIsolationMode::AllowList
-        && request.allowed_mounts.is_empty()
-    {
-        fallback_reasons
-            .push("filesystem allow-list requested without configured mounts".to_string());
-    }
-
-    let active = request.enabled
-        && (!request.namespace_restrictions || namespace_supported)
-        && (!request.network_isolation || network_supported);
-
-    let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
-
+    let verification = verify_bubblewrap(request, cwd);
+    let supported = verification.is_ok();
+    let network_supported = if request.network_isolation {
+        supported
+    } else if supported {
+        let mut network_request = request.clone();
+        network_request.network_isolation = true;
+        verify_bubblewrap(&network_request, cwd).is_ok()
+    } else {
+        false
+    };
+    let active = request.enabled && supported;
+    let allowed_mounts = writable_mounts(request, cwd).unwrap_or_default();
     SandboxStatus {
         enabled: request.enabled,
         requested: request.clone(),
-        supported: namespace_supported,
+        supported,
         active,
-        namespace_supported,
-        namespace_active: request.enabled && request.namespace_restrictions && namespace_supported,
+        namespace_supported: supported,
+        namespace_active: active,
         network_supported,
-        network_active: request.enabled && request.network_isolation && network_supported,
+        network_active: active && request.network_isolation,
         filesystem_mode: request.filesystem_mode,
-        filesystem_active,
+        filesystem_active: active && request.filesystem_mode != FilesystemIsolationMode::Off,
         allowed_mounts,
         in_container: container.in_container,
         container_markers: container.markers,
-        fallback_reason: (!fallback_reasons.is_empty()).then(|| fallback_reasons.join("; ")),
+        fallback_reason: verification.err().map(|error| error.to_string()),
     }
 }
 
-#[must_use]
+fn verify_bubblewrap(request: &SandboxRequest, cwd: &Path) -> std::io::Result<()> {
+    bubblewrap_command("true", cwd, request).and_then(|launcher| {
+        let output = std::process::Command::new(&launcher.program)
+            .args(&launcher.args)
+            .envs(launcher.env)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "Bubblewrap could not enforce the requested sandbox: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    })
+}
+
+/// A disabled sandbox is the only case where the caller may use a host shell.
+/// Enabled but unsupported protection is an error, including filesystem-only
+/// requests. No command is ever retried outside the sandbox automatically.
 pub fn build_linux_sandbox_command(
     command: &str,
     cwd: &Path,
     status: &SandboxStatus,
-) -> Option<LinuxSandboxCommand> {
-    if !cfg!(target_os = "linux")
-        || !status.enabled
-        || (!status.namespace_active && !status.network_active)
-    {
-        return None;
+) -> std::io::Result<Option<LinuxSandboxCommand>> {
+    if !status.enabled {
+        return Ok(None);
     }
-
-    let mut args: Vec<String> = working_unshare_mapping()
-        .unwrap_or(UNSHARE_MAPPING_CANDIDATES[0])
-        .iter()
-        .map(|arg| arg.to_string())
-        .collect();
-    // The candidates already carry the namespace flags, so the probe and the
-    // launcher share a single argument shape; only the opt-in `--net` is
-    // added here.
-    if status.network_active {
-        args.push("--net".to_string());
+    if !status.active {
+        return Err(std::io::Error::other(format!(
+            "sandbox unavailable; command was not executed: {}. Install/enable Bubblewrap, or request explicit approval for host execution with dangerouslyDisableSandbox=true",
+            status.fallback_reason.as_deref().unwrap_or("requested protection could not be verified")
+        )));
     }
-    args.push("sh".to_string());
-    args.push("-lc".to_string());
-    args.push(command.to_string());
-
-    // HOME is left as the real home: the namespaces do not hide any paths, so
-    // pointing HOME at `<cwd>/.sandbox-home` only made `~/...` resolve to a
-    // directory that does not exist and the model gave up on real files.
-    let sandbox_tmp = cwd.join(".sandbox-tmp");
-    let mut env = vec![
-        ("TMPDIR".to_string(), sandbox_tmp.display().to_string()),
-        // `--map-root-user` makes portage think it runs as root, so it tries
-        // to chown its cache to the `portage` user, which is unmapped here
-        // (EINVAL) and every `emerge -s` / `equery` crashed. Keep it as root.
-        ("PORTAGE_USERNAME".to_string(), "root".to_string()),
-        ("PORTAGE_GRPNAME".to_string(), "root".to_string()),
-        (
-            "CLAWD_SANDBOX_FILESYSTEM_MODE".to_string(),
-            status.filesystem_mode.as_str().to_string(),
-        ),
-        (
-            "CLAWD_SANDBOX_ALLOWED_MOUNTS".to_string(),
-            status.allowed_mounts.join(":"),
-        ),
-    ];
-    if let Ok(path) = env::var("PATH") {
-        env.push(("PATH".to_string(), path));
-    }
-
-    Some(LinuxSandboxCommand {
-        program: "unshare".to_string(),
-        args,
-        env,
-    })
+    bubblewrap_command(command, cwd, &status.requested).map(Some)
 }
 
-fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
-    let cwd = cwd.to_path_buf();
-    mounts
-        .iter()
-        .map(|mount| {
+fn writable_mounts(request: &SandboxRequest, cwd: &Path) -> std::io::Result<Vec<String>> {
+    if request.filesystem_mode == FilesystemIsolationMode::Off {
+        // The private /tmp would otherwise hide a workspace located there.
+        let cwd = cwd.canonicalize()?;
+        return Ok(if cwd.starts_with("/tmp") {
+            vec![cwd.to_string_lossy().into_owned()]
+        } else {
+            Vec::new()
+        });
+    }
+    if request.filesystem_mode == FilesystemIsolationMode::AllowList
+        && request.allowed_mounts.is_empty()
+    {
+        return Err(std::io::Error::other(
+            "filesystem allow-list requires allowedMounts",
+        ));
+    }
+    let mut paths = vec![cwd.to_path_buf()];
+    if request.filesystem_mode == FilesystemIsolationMode::AllowList {
+        paths.extend(request.allowed_mounts.iter().map(|mount| {
             let path = PathBuf::from(mount);
             if path.is_absolute() {
                 path
             } else {
                 cwd.join(path)
             }
-        })
-        .map(|path| path.display().to_string())
-        .collect()
-}
-
-fn command_exists(command: &str) -> bool {
-    env::var_os("PATH")
-        .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
-}
-
-/// Candidate `unshare` user-namespace mapping options, in preference order.
-///
-/// Most systems accept `--map-root-user` alone. Some hardened containers and
-/// seccomp profiles block unprivileged writes to `/proc/self/uid_map`; there,
-/// util-linux delegates to the setuid `newuidmap`/`newgidmap` helpers when
-/// `--map-auto` is also present.
-///
-/// That fallback therefore depends on the setuid helpers (the `uidmap`
-/// package on Debian/Ubuntu) and on the current user having a range in
-/// `/etc/subuid` and `/etc/subgid`. When either is missing, `--map-auto`
-/// fails and the startup probe rejects the candidate, keeping the plain form.
-///
-/// Each candidate is the **complete** static argument shape the launcher
-/// uses (see `build_linux_sandbox_command`): mapping flags followed by the
-/// namespace flags `--mount --ipc --pid --uts --fork`. The startup probe
-/// runs each candidate verbatim (plus a trivial program), so probe success
-/// implies launch success: on systems where the mapping works but the
-/// namespace flags are denied (e.g. AppArmor-restricted CI runners that
-/// block mount propagation in user namespaces), the probe fails and the
-/// sandbox stays disabled instead of activating a launcher that always
-/// errors.
-///
-/// `--net` is intentionally absent: it is appended only when network
-/// isolation is active (the non-default path), and probing with it would
-/// disable the sandbox on hosts that block network-namespace creation (e.g.
-/// Docker's default seccomp profile) even when network isolation is never
-/// requested.
-const UNSHARE_MAPPING_CANDIDATES: &[&[&str]] = &[
-    &[
-        "--user",
-        "--map-root-user",
-        "--mount",
-        "--ipc",
-        "--pid",
-        "--uts",
-        "--fork",
-    ],
-    &[
-        "--user",
-        "--map-root-user",
-        "--map-auto",
-        "--mount",
-        "--ipc",
-        "--pid",
-        "--uts",
-        "--fork",
-    ],
-];
-
-/// Probe a candidate `unshare` mapping invocation with a trivial program.
-fn unshare_probe(args: &[&str]) -> bool {
-    std::process::Command::new("unshare")
-        .args(args)
-        .arg("true")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// The first mapping option set that works on this machine, if any.
-///
-/// Probes are cached for the process lifetime; a missing `unshare` binary or a
-/// kernel that refuses every mapping yields `None`.
-fn working_unshare_mapping() -> Option<&'static [&'static str]> {
-    use std::sync::OnceLock;
-    static MAPPING: OnceLock<Option<&'static [&'static str]>> = OnceLock::new();
-    *MAPPING.get_or_init(|| {
-        UNSHARE_MAPPING_CANDIDATES
-            .iter()
-            .copied()
-            .find(|args| unshare_probe(args))
-    })
-}
-
-/// Check whether `unshare --user` actually works on this system.
-/// On some CI environments (e.g. GitHub Actions), the binary exists but
-/// user namespaces are restricted, causing silent failures.
-fn unshare_user_namespace_works() -> bool {
-    use std::sync::OnceLock;
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    *RESULT.get_or_init(|| {
-        if !command_exists("unshare") {
-            return false;
+        }));
+    }
+    let mut mounts = Vec::new();
+    for path in paths {
+        // Resolve symlinks and traversal before passing any host path to bwrap.
+        // Requiring existing roots prevents a misspelled allow-list failing open.
+        let path = path.canonicalize()?;
+        if path == Path::new("/")
+            || path.starts_with("/proc")
+            || path.starts_with("/sys")
+            || path.starts_with("/dev")
+        {
+            return Err(std::io::Error::other(format!(
+                "invalid writable sandbox root: {}",
+                path.display()
+            )));
         }
-        working_unshare_mapping().is_some()
-    })
+        mounts.push(path.to_string_lossy().into_owned());
+    }
+    mounts.sort();
+    mounts.dedup();
+    Ok(mounts)
+}
+
+fn bubblewrap_command(
+    command: &str,
+    cwd: &Path,
+    request: &SandboxRequest,
+) -> std::io::Result<LinuxSandboxCommand> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command, cwd, request);
+        Err(std::io::Error::other(
+            "sandbox requires Linux and Bubblewrap",
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let uid = rustix::process::geteuid().as_raw();
+        let gid = rustix::process::getegid().as_raw();
+        if uid == 0 {
+            return Err(std::io::Error::other(
+                "run Claw as an unprivileged user to use the sandbox",
+            ));
+        }
+        let cwd = cwd.canonicalize()?;
+        let mut args: Vec<String> = [
+            "--unshare-user",
+            "--disable-userns",
+            "--unshare-pid",
+            "--new-session",
+            "--die-with-parent",
+            "--cap-drop",
+            "ALL",
+            "--uid",
+            &uid.to_string(),
+            "--gid",
+            &gid.to_string(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        if request.namespace_restrictions {
+            args.extend(["--unshare-ipc", "--unshare-uts"].map(str::to_string));
+        }
+        if request.network_isolation {
+            args.push("--unshare-net".to_string());
+        }
+        let root_bind = if request.filesystem_mode == FilesystemIsolationMode::Off {
+            "--bind"
+        } else {
+            "--ro-bind"
+        };
+        args.extend(
+            [
+                root_bind, "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+            ]
+            .map(str::to_string),
+        );
+        for mount in writable_mounts(request, &cwd)? {
+            args.extend(["--bind".to_string(), mount.clone(), mount]);
+        }
+        args.extend([
+            "--chdir".to_string(),
+            cwd.to_string_lossy().into_owned(),
+            "--".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            command.to_string(),
+        ]);
+        Ok(LinuxSandboxCommand {
+            program: "bwrap".to_string(),
+            args,
+            // Private temporary storage, with no fake root/Portage overrides.
+            env: vec![("TMPDIR".to_string(), "/tmp".to_string())],
+        })
+    }
 }
 
 #[cfg(test)]
@@ -435,71 +415,130 @@ mod tests {
     }
 
     #[test]
-    fn mapping_candidates_prefer_plain_root_mapping() {
-        assert!(!super::UNSHARE_MAPPING_CANDIDATES.is_empty());
-        for candidate in super::UNSHARE_MAPPING_CANDIDATES {
-            // Mapping flags.
-            assert!(candidate.contains(&"--user"));
-            assert!(candidate.contains(&"--map-root-user"));
-            // Namespace flags the real launcher appends — the probe must
-            // exercise the full invocation shape, not just mapping flags.
-            assert!(candidate.contains(&"--mount"));
-            assert!(candidate.contains(&"--ipc"));
-            assert!(candidate.contains(&"--pid"));
-            assert!(candidate.contains(&"--uts"));
-            assert!(candidate.contains(&"--fork"));
-        }
-        // The plain form must be tried first; `--map-auto` is only a fallback
-        // for kernels/containers that block unprivileged uid_map writes.
-        assert_eq!(
-            super::UNSHARE_MAPPING_CANDIDATES[0],
-            &[
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--ipc",
-                "--pid",
-                "--uts",
-                "--fork",
-            ]
-        );
-        // The second candidate inserts `--map-auto` in the position util-linux
-        // expects (after `--map-root-user`, before the namespace flags).
-        assert_eq!(
-            super::UNSHARE_MAPPING_CANDIDATES[1],
-            &[
-                "--user",
-                "--map-root-user",
-                "--map-auto",
-                "--mount",
-                "--ipc",
-                "--pid",
-                "--uts",
-                "--fork",
-            ]
+    fn unavailable_sandbox_never_falls_back_to_host() {
+        let status = super::SandboxStatus {
+            enabled: true,
+            fallback_reason: Some("test backend unavailable".to_string()),
+            ..Default::default()
+        };
+        assert!(build_linux_sandbox_command(
+            "touch /tmp/should-not-run",
+            Path::new("/tmp"),
+            &status
+        )
+        .is_err());
+        let disabled = super::SandboxStatus::default();
+        assert!(
+            build_linux_sandbox_command("true", Path::new("/tmp"), &disabled)
+                .unwrap()
+                .is_none()
         );
     }
 
     #[test]
-    fn builds_linux_launcher_with_network_flag_when_requested() {
-        let config = SandboxConfig::default();
-        let status = super::resolve_sandbox_status_for_request(
-            &config.resolve_request(
-                Some(true),
-                Some(true),
-                Some(true),
-                Some(FilesystemIsolationMode::WorkspaceOnly),
-                None,
-            ),
-            Path::new("/workspace"),
+    fn invalid_allow_list_is_inactive() {
+        let cwd = tempfile::tempdir().unwrap();
+        let request = SandboxConfig::default().resolve_request(
+            Some(true),
+            None,
+            None,
+            Some(FilesystemIsolationMode::AllowList),
+            None,
         );
+        let status = super::resolve_sandbox_status_for_request(&request, cwd.path());
+        assert!(!status.active);
+        assert!(!status.filesystem_active);
+        assert!(status.fallback_reason.unwrap().contains("allowedMounts"));
+    }
 
-        if let Some(launcher) =
-            build_linux_sandbox_command("printf hi", Path::new("/workspace"), &status)
-        {
-            assert_eq!(launcher.program, "unshare");
-            assert!(launcher.args.iter().any(|arg| arg == "--mount"));
-            assert!(launcher.args.iter().any(|arg| arg == "--net") == status.network_active);
+    #[test]
+    fn bubblewrap_enforces_writes_identity_and_network() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("protected"), "original").unwrap();
+        let request =
+            SandboxConfig::default().resolve_request(Some(true), None, Some(true), None, None);
+        let status = super::resolve_sandbox_status_for_request(&request, &workspace);
+        if !status.active {
+            // CI may prohibit namespaces. Still require a closed execution path.
+            assert!(build_linux_sandbox_command("true", &workspace, &status).is_err());
+            eprintln!(
+                "Bubblewrap integration unavailable: {:?}",
+                status.fallback_reason
+            );
+            return;
         }
+        let run = |command: &str, status: &super::SandboxStatus| {
+            let launcher = build_linux_sandbox_command(command, &workspace, status)
+                .unwrap()
+                .unwrap();
+            std::process::Command::new(launcher.program)
+                .args(launcher.args)
+                .envs(launcher.env)
+                .output()
+                .unwrap()
+        };
+        let output = run(
+            "id -u; printf ok > allowed; printf tmp > /tmp/private; readlink /proc/self/ns/net",
+            &status,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        #[cfg(target_os = "linux")]
+        assert!(String::from_utf8_lossy(&output.stdout)
+            .starts_with(&format!("{}\n", rustix::process::geteuid().as_raw())));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("allowed")).unwrap(),
+            "ok"
+        );
+        let host_net = std::fs::read_link("/proc/self/ns/net").unwrap();
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(host_net.to_str().unwrap()));
+        // The sibling under /tmp is hidden by the private tmpfs.
+        let output = run(
+            &format!("printf changed > '{}'", outside.join("protected").display()),
+            &status,
+        );
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("protected")).unwrap(),
+            "original"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("protected"), workspace.join("escape"))
+                .unwrap();
+            assert!(!run("printf escaped > escape", &status).status.success());
+            assert_eq!(
+                std::fs::read_to_string(outside.join("protected")).unwrap(),
+                "original"
+            );
+        }
+
+        let mut allow = request.clone();
+        allow.filesystem_mode = FilesystemIsolationMode::AllowList;
+        allow.allowed_mounts = vec![outside.to_string_lossy().into_owned()];
+        let status = super::resolve_sandbox_status_for_request(&allow, &workspace);
+        let output = run(
+            &format!(
+                "printf approved > '{}'",
+                outside.join("protected").display()
+            ),
+            &status,
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("protected")).unwrap(),
+            "approved"
+        );
     }
 }

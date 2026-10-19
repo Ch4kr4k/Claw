@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 mod approval_tokens;
+pub mod askpass;
 pub mod background_jobs;
 mod bash;
 pub mod bash_validation;
@@ -21,6 +22,7 @@ pub mod green_contract;
 mod hooks;
 mod json;
 mod lane_events;
+pub mod line_diff;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
@@ -29,6 +31,7 @@ pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
 mod memory;
+pub mod model_server;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -39,6 +42,7 @@ pub mod recovery_recipes;
 mod remote;
 mod report_schema;
 pub mod sandbox;
+pub mod scheduler;
 mod session;
 pub mod session_control;
 pub mod snapshots;
@@ -52,6 +56,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+pub mod tool_images;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
@@ -83,7 +88,8 @@ pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
     compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    get_compact_continuation_message, should_compact, truncate_large_tool_results,
+    CompactionConfig, CompactionResult,
 };
 pub use config::{
     claude_config_home, clear_user_provider_settings, default_config_home, read_user_setting,
@@ -102,9 +108,10 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use conversation::{
-    auto_compaction_threshold_from_env, set_auto_compaction_threshold_override, ApiClient,
-    ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-    RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
+    auto_compaction_threshold_from_env, configured_auto_compaction_threshold,
+    is_output_limit_stop_reason, set_auto_compaction_threshold_override, ApiClient, ApiRequest,
+    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+    StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
@@ -146,8 +153,9 @@ pub use mcp_stdio::{
     UnsupportedMcpServer,
 };
 pub use memory::{
-    is_memory_path, list_memories, memory_dir, memory_enabled, render_memory_section, MemoryEntry,
-    MEMORY_INDEX,
+    is_memory_path, list_memories, memory_dir, memory_enabled, record_session,
+    render_memory_section, render_memory_section_for, set_anchor_hasher, touch_memory,
+    AnchorHasher, MemoryEntry, MEMORY_INDEX,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
@@ -157,9 +165,9 @@ pub use oauth::{
     PkceChallengeMethod, PkceCodePair,
 };
 pub use permissions::{
-    bash_approval_key, bash_command_risk, PermissionContext, PermissionMode, PermissionOutcome,
-    PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest,
+    bash_approval_key, bash_command_destructive_risk, bash_command_risk, is_host_execution_request,
+    PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,

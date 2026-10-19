@@ -285,6 +285,9 @@ pub fn edit_file(
             "old_string not found in file",
         ));
     }
+    if !replace_all {
+        reject_duplicated_context(&original_file, old_string, new_string)?;
+    }
 
     let updated = if replace_all {
         original_file.replace(old_string, new_string)
@@ -303,6 +306,59 @@ pub fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+/// Refuses an edit whose `new_string` repeats all of the file's text before
+/// or after `old_string`. Weaker models sometimes pass a one-line `old_string`
+/// with the whole rewritten file as `new_string`, which nests a second copy of
+/// the file inside itself on every call.
+fn reject_duplicated_context(original: &str, old_string: &str, new_string: &str) -> io::Result<()> {
+    // Trimmed, non-blank lines, so re-indentation doesn't hide the duplicate.
+    fn significant_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+    fn contains_run(haystack: &[&str], needle: &[&str]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    let Some(start) = original.find(old_string) else {
+        return Ok(());
+    };
+    let new_lines = significant_lines(new_string);
+    let old_lines = significant_lines(old_string);
+    let sides = [
+        ("before", &original[..start]),
+        ("after", &original[start + old_string.len()..]),
+    ];
+    for (side, context) in sides {
+        let context_lines = significant_lines(context);
+        // Lone braces and the like repeat legitimately; require real code.
+        let substantive = context_lines
+            .iter()
+            .filter(|line| line.chars().any(char::is_alphanumeric))
+            .count();
+        if substantive < 2 || contains_run(&old_lines, &context_lines) {
+            continue;
+        }
+        if contains_run(&new_lines, &context_lines) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "edit not applied: new_string repeats all {} lines of the file {side} \
+                     old_string, so they would appear twice. new_string replaces only the \
+                     old_string text. Pass just the replacement for old_string, or use \
+                     write_file to rewrite the whole file.",
+                    context_lines.len()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Expands a glob pattern and returns matching filenames.
@@ -424,6 +480,18 @@ fn grep_search_impl(
         .output_mode
         .clone()
         .unwrap_or_else(|| String::from("files_with_matches"));
+    if !matches!(
+        output_mode.as_str(),
+        "content" | "files_with_matches" | "count"
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unknown output_mode `{output_mode}`: use \"content\" (matching lines), \
+                 \"files_with_matches\" (file names, the default) or \"count\""
+            ),
+        ));
+    }
     let context = input.context.or(input.context_short).unwrap_or(0);
 
     let mut filenames = Vec::new();
@@ -624,21 +692,7 @@ fn apply_limit<T>(
 }
 
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
-    let mut lines = Vec::new();
-    for line in original.lines() {
-        lines.push(format!("-{line}"));
-    }
-    for line in updated.lines() {
-        lines.push(format!("+{line}"));
-    }
-
-    vec![StructuredPatchHunk {
-        old_start: 1,
-        old_lines: original.lines().count(),
-        new_start: 1,
-        new_lines: updated.lines().count(),
-        lines,
-    }]
+    crate::line_diff::unified_hunks(original, updated, crate::line_diff::DEFAULT_CONTEXT)
 }
 
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
@@ -812,6 +866,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_new_string_that_repeats_the_whole_file() {
+        let path = temp_path("edit-whole-file.rs");
+        let original = "use std::fs;\n\nfn main() {\n    let path = \"/a\";\n    fs::write(path, \"1\").unwrap();\n}\n";
+        write_file(path.to_string_lossy().as_ref(), original).expect("write should succeed");
+        let whole_file = original.replace("\"/a\"", "\"/b\"");
+        let error = edit_file(
+            path.to_string_lossy().as_ref(),
+            "let path = \"/a\";",
+            &whole_file,
+            false,
+        )
+        .expect_err("whole-file new_string should be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("write_file"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn allows_edits_that_keep_neighbouring_lines() {
+        let path = temp_path("edit-neighbours.rs");
+        let original = "fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n";
+        write_file(path.to_string_lossy().as_ref(), original).expect("write should succeed");
+        // Adds a line and repeats one neighbouring line, but not all the context.
+        edit_file(
+            path.to_string_lossy().as_ref(),
+            "    two();",
+            "    two();\n    one();",
+            false,
+        )
+        .expect("ordinary edit should succeed");
+    }
+
+    #[test]
     fn rejects_binary_files() {
         let path = temp_path("binary-test.bin");
         std::fs::write(&path, b"\x00\x01\x02\x03binary content").expect("write should succeed");
@@ -938,6 +1025,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn grep_rejects_an_unknown_output_mode() {
+        let error = grep_search(&GrepSearchInput {
+            pattern: String::from("x"),
+            path: None,
+            glob: None,
+            output_mode: Some(String::from("text")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        })
+        .expect_err("unknown mode should fail");
+        assert!(error.to_string().contains("unknown output_mode `text`"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 glob = "0.3"
 plugins = { path = "../plugins" }
 regex = "1"
@@ -19,7 +20,7 @@ unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 # Safe dup/dup2 for passing the turn's output through the live block.
-rustix = { version = "1", features = ["stdio"] }
+rustix = { version = "1", features = ["stdio", "process"] }
 
 [dev-dependencies]
 tempfile = "3"

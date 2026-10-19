@@ -133,12 +133,16 @@ fn extended_color(params: &[u16]) -> (Option<u32>, usize) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Cell {
     ch: char,
+    /// A combining character drawn on `ch` (an accent, or the row of an
+    /// inline image placeholder); `'\0'` for none.
+    mark: char,
     width: u8,
     style: Style,
 }
 
 const BLANK: Cell = Cell {
     ch: ' ',
+    mark: '\0',
     width: 1,
     style: Style {
         fg: 0,
@@ -165,6 +169,10 @@ pub(super) struct Buffer {
     /// Sequences meant for the terminal itself (modes, queries, clipboard,
     /// title), to be written to it as they are.
     pub(super) passthrough: Vec<u8>,
+    /// Every kitty graphics command (inline images) seen: the alternate
+    /// screen keeps its images apart, so they are sent again when the
+    /// conversation is printed to the normal screen.
+    pub(super) graphics: Vec<u8>,
 }
 
 impl Buffer {
@@ -179,6 +187,7 @@ impl Buffer {
             cursor_visible: true,
             pending: Vec::new(),
             passthrough: Vec::new(),
+            graphics: Vec::new(),
         }
     }
 
@@ -234,7 +243,22 @@ impl Buffer {
             if width > 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 self.put(ch, width as u8);
+            } else {
+                self.mark(ch);
             }
+        }
+    }
+
+    /// Puts a combining character on the cell before the cursor; a second
+    /// one on the same cell is dropped.
+    fn mark(&mut self, mark: char) {
+        let col = self.col;
+        let Some(line) = self.lines.get_mut(self.row) else {
+            return;
+        };
+        let cell = line.iter_mut().take(col).rev().find(|cell| cell.width > 0);
+        if let Some(cell) = cell.filter(|cell| cell.mark == '\0' && !mark.is_control()) {
+            cell.mark = mark;
         }
     }
 
@@ -252,13 +276,23 @@ impl Buffer {
         if line.len() < col {
             line.resize(col, BLANK);
         }
-        set_cell(line, col, Cell { ch, width, style });
+        set_cell(
+            line,
+            col,
+            Cell {
+                ch,
+                mark: '\0',
+                width,
+                style,
+            },
+        );
         if width == 2 {
             set_cell(
                 line,
                 col + 1,
                 Cell {
                     ch: ' ',
+                    mark: '\0',
                     width: 0,
                     style,
                 },
@@ -318,9 +352,14 @@ impl Buffer {
                     }
                     j += 1;
                 };
-                // Window titles and the clipboard (OSC 52) go to the
-                // terminal; hyperlinks and other strings are dropped.
-                if kind == b']' && !s[2..body_end].starts_with(b"8;") {
+                // Window titles, the clipboard (OSC 52) and kitty graphics
+                // (inline images, `ESC _ G`) go to the terminal; hyperlinks
+                // and other strings are dropped.
+                let body = &s[2..body_end];
+                if kind == b'_' && body.starts_with(b"G") {
+                    self.graphics.extend_from_slice(&s[..end]);
+                    self.passthrough.extend_from_slice(&s[..end]);
+                } else if kind == b']' && !body.starts_with(b"8;") {
                     self.passthrough.extend_from_slice(&s[..end]);
                 }
                 Some(end)
@@ -550,6 +589,13 @@ fn set_cell(line: &mut Line, index: usize, cell: Cell) {
 /// each row (an empty line is one empty row).
 pub(super) fn wrap_ranges(line: &[Cell], width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
+    // A line drawn for a wider window (before the side panel opened) whose
+    // overflow is only padding or a rule is cut, not wrapped: a coloured
+    // diff row or a rule would otherwise spill onto an empty-looking row.
+    let fits = clip(line, width).len();
+    if fits < line.len() && line[fits..].iter().all(|cell| is_filler(cell.ch)) {
+        return vec![(0, fits)];
+    }
     let mut ranges = Vec::new();
     let (mut start, mut used) = (0, 0);
     for (index, cell) in line.iter().enumerate() {
@@ -563,6 +609,11 @@ pub(super) fn wrap_ranges(line: &[Cell], width: usize) -> Vec<(usize, usize)> {
     }
     ranges.push((start, line.len()));
     ranges
+}
+
+/// Padding or rule characters, which may be cut off at the window's edge.
+fn is_filler(ch: char) -> bool {
+    matches!(ch, ' ' | '\u{a0}' | '─')
 }
 
 pub(super) fn row_count(line: &[Cell], width: usize) -> usize {
@@ -582,6 +633,9 @@ pub(super) fn render_cells(cells: &[Cell]) -> String {
             current = cell.style;
         }
         out.push(cell.ch);
+        if cell.mark != '\0' {
+            out.push(cell.mark);
+        }
     }
     if current != Style::default() {
         out.push_str("\x1b[0m");
@@ -614,10 +668,14 @@ pub(super) fn highlight(cells: &[Cell], from: usize, to: usize) -> Vec<Cell> {
 
 /// The text of `line`, without styles.
 pub(super) fn plain(line: &[Cell]) -> String {
-    line.iter()
-        .filter(|cell| cell.width > 0)
-        .map(|cell| cell.ch)
-        .collect()
+    let mut text = String::new();
+    for cell in line.iter().filter(|cell| cell.width > 0) {
+        text.push(cell.ch);
+        if cell.mark != '\0' {
+            text.push(cell.mark);
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -679,12 +737,39 @@ mod tests {
     }
 
     #[test]
+    fn kitty_images_pass_through_and_keep_their_placeholders() {
+        let mut buffer = Buffer::new(None);
+        buffer.feed(b"\x1b_Ga=T,U=1,i=7;AAAA\x1b\\\x1b_Xother\x1b\\");
+        buffer.feed("\u{10EEEE}\u{305}\u{10EEEE}e\u{301}".as_bytes());
+        assert_eq!(
+            String::from_utf8(buffer.passthrough.clone()).unwrap(),
+            "\x1b_Ga=T,U=1,i=7;AAAA\x1b\\"
+        );
+        assert_eq!(lines(&buffer), vec!["\u{10EEEE}\u{305}\u{10EEEE}e\u{301}"]);
+        assert_eq!(
+            render_cells(&buffer.lines[0]),
+            "\u{10EEEE}\u{305}\u{10EEEE}e\u{301}"
+        );
+    }
+
+    #[test]
     fn wide_characters_wrap_whole() {
         let mut buffer = Buffer::new(None);
         buffer.feed("ab日本".as_bytes());
         assert_eq!(row_count(&buffer.lines[0], 4), 2);
         assert_eq!(row_count(&buffer.lines[0], 6), 1);
         assert_eq!(row_count(&[], 6), 1);
+    }
+
+    #[test]
+    fn overflow_of_only_padding_or_rule_is_cut_not_wrapped() {
+        let mut buffer = Buffer::new(None);
+        buffer.feed("\x1b[42mcode\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}\u{a0}\x1b[0m\n".as_bytes());
+        buffer.feed("──────────\n".as_bytes());
+        buffer.feed("words that wrap\n".as_bytes());
+        assert_eq!(super::wrap_ranges(&buffer.lines[0], 6), vec![(0, 6)]);
+        assert_eq!(super::wrap_ranges(&buffer.lines[1], 4), vec![(0, 4)]);
+        assert_eq!(super::row_count(&buffer.lines[2], 6), 3);
     }
 
     #[test]

@@ -101,7 +101,9 @@ impl OpenAiCompatConfig {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
-            _ => &[],
+            name => super::hosted::all_hosted_providers()
+                .find(|hosted| hosted.config.provider_name == name)
+                .map_or(&[], |hosted| hosted.credential_env_vars),
         }
     }
 }
@@ -1104,6 +1106,9 @@ fn wire_model_for_base_url<'a>(
     if lowered_prefix == "local" {
         return Cow::Borrowed(&model[pos + 1..]);
     }
+    if let Some(rest) = super::hosted::strip_hosted_prefix(model) {
+        return Cow::Borrowed(rest);
+    }
 
     Cow::Borrowed(model)
 }
@@ -1183,6 +1188,7 @@ fn build_chat_completion_request_for_base_url(
     for message in &request.messages {
         messages.extend(translate_message(message, wire_model));
     }
+    messages = images_after_tool_results(messages);
     // Sanitize: drop any `role:"tool"` message that does not have a valid
     // paired `role:"assistant"` with a `tool_calls` entry carrying the same
     // `id` immediately before it (directly or as part of a run of tool
@@ -1382,6 +1388,31 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
             })
             .collect(),
     }
+}
+
+/// Moves user messages that sit inside a run of `role:"tool"` messages (the
+/// images a tool returned, e.g. a screenshot) to just after the run: tool
+/// results must follow their assistant message without a break, or the
+/// later ones count as orphaned.
+fn images_after_tool_results(messages: Vec<Value>) -> Vec<Value> {
+    let is_tool = |message: &Value| message.get("role").and_then(Value::as_str) == Some("tool");
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut held = Vec::new();
+    for message in messages {
+        if is_tool(&message) {
+            out.push(message);
+        } else if out.last().is_some_and(is_tool)
+            && message.get("role").and_then(Value::as_str) == Some("user")
+            && message.get("content").is_some_and(Value::is_array)
+        {
+            held.push(message);
+        } else {
+            out.append(&mut held);
+            out.push(message);
+        }
+    }
+    out.append(&mut held);
+    out
 }
 
 /// Remove `role:"tool"` messages from `messages` that have no valid paired
@@ -1747,7 +1778,9 @@ fn parse_sse_frame(
 fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Ok(Some(value)),
-        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(super::dotenv_value(key)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => {
+            Ok(super::dotenv_value(key).or_else(|| super::hosted::custom_api_key(key)))
+        }
         Err(error) => Err(ApiError::from(error)),
     }
 }
@@ -1886,10 +1919,10 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        model_requires_reasoning_content_in_history, normalize_finish_reason, normalize_response,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
-        StreamState,
+        build_chat_completion_request, chat_completions_endpoint, images_after_tool_results,
+        is_reasoning_model, model_requires_reasoning_content_in_history, normalize_finish_reason,
+        normalize_response, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
+        OpenAiCompatConfig, StreamState,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -2795,6 +2828,23 @@ mod tests {
             translated[0]["tool_calls"][0]["function"]["name"],
             "read_file"
         );
+    }
+
+    #[test]
+    fn tool_images_follow_the_whole_run_of_tool_results() {
+        let image = json!({"role": "user", "content": [{"type": "image_url"}]});
+        let messages = vec![
+            json!({"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": "shot"}),
+            image.clone(),
+            json!({"role": "tool", "tool_call_id": "b", "content": "ok"}),
+            json!({"role": "user", "content": "next"}),
+        ];
+        let roles: Vec<_> = images_after_tool_results(messages)
+            .iter()
+            .map(|m| m["role"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(roles, ["assistant", "tool", "tool", "user", "user"]);
     }
 
     #[test]

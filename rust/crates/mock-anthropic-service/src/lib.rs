@@ -1074,7 +1074,16 @@ fn extract_read_content(tool_output: &str) -> String {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })
-        .unwrap_or_else(|| tool_output.trim().to_string())
+        .unwrap_or_else(|| {
+            // The CLI sends text reads as `[path: lines a-b of n]` + content.
+            let text = tool_output.trim();
+            match text.split_once('\n') {
+                Some((header, body)) if header.starts_with('[') && header.contains(": lines ") => {
+                    body.trim().to_string()
+                }
+                _ => text.to_string(),
+            }
+        })
 }
 
 #[allow(clippy::cast_possible_truncation)]

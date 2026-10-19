@@ -18,12 +18,17 @@ mod approval;
 mod ask;
 mod background;
 mod claude_commands;
+mod command_actions;
+mod desktop_agent;
+mod diff_panel;
+mod diff_view;
 mod init;
 mod input;
 mod keybindings;
 mod render;
 mod repl_commands;
 mod setup_wizard;
+mod term_image;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -267,6 +272,33 @@ fn env_model_for_runtime() -> Option<EnvModel> {
 fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
+
+/// The auto-compaction threshold for a `local/` model whose window is
+/// known, unless the user set one (`/autocompact`, the environment). The
+/// default (100k) is far past a local server's window, so sessions ran
+/// until the server refused a request. Compacting at 60% leaves room for
+/// the reply (a quarter of the window) and the next tool result.
+fn window_auto_compaction_threshold(model: &str) -> Option<u32> {
+    if !model.starts_with("local/") || runtime::configured_auto_compaction_threshold().is_some() {
+        return None;
+    }
+    known_context_window(model).map(auto_compaction_threshold_for_window)
+}
+
+/// What is left of the window once the reply budget (a quarter) and a
+/// small margin are set aside. A flat 3/5 left a 32k window with ~6k tokens
+/// of history after a ~13k system prompt, so it compacted nearly every step.
+fn auto_compaction_threshold_for_window(window: u32) -> u32 {
+    window
+        .saturating_sub(api::local_max_output_tokens_for_window(window))
+        .saturating_sub(window / 16)
+}
+
+/// The threshold turns use from now on, as `/autocompact` reports it.
+fn effective_auto_compaction_threshold(model: &str) -> u32 {
+    window_auto_compaction_threshold(model)
+        .unwrap_or_else(runtime::auto_compaction_threshold_from_env)
+}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
@@ -285,6 +317,10 @@ const GIT_COMMIT_TIMESTAMP: Option<&str> = option_env!("GIT_COMMIT_TIMESTAMP");
 const RUSTC_VERSION: Option<&str> = option_env!("RUSTC_VERSION");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// A local server sends nothing until it has read the whole prompt, which on
+/// a small GPU takes well over 10 seconds once the context is a few thousand
+/// tokens long; the short timeout cancelled that work and started it again.
+const LOCAL_POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Error text for a reply stopped with Esc or Ctrl+C.
 const INTERRUPTED_BY_USER: &str = "reply stopped by user";
 /// How often an in-flight model request checks whether Esc was pressed.
@@ -338,7 +374,24 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
-    if let Err(error) = run() {
+    // `ssh` runs `claw __askpass PROMPT` (via SSH_ASKPASS) when a command
+    // claw started needs a key passphrase; see `runtime::askpass`.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some(runtime::askpass::ASKPASS_ARG) {
+        std::process::exit(runtime::askpass::run_helper(&argv[2..]));
+    }
+    // Stops a model server claw started once no claw uses it.
+    if argv.get(1).map(String::as_str) == Some(runtime::model_server::WATCH_ARG) {
+        let provider = argv.get(2).map_or("local", String::as_str);
+        std::process::exit(runtime::model_server::run_watcher(provider));
+    }
+    // Memory anchors are fingerprinted with the tools crate's symbol parser.
+    runtime::set_anchor_hasher(tools::memory_anchor_hash);
+    let result = run();
+    // Drop this process's model-server leases (stopping servers nobody else
+    // uses) on every way out.
+    runtime::model_server::release_all();
+    if let Err(error) = result {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
         // tools can parse failures the same way they parse successes (ROADMAP #42).
@@ -1110,6 +1163,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_acp_status(output_format)?;
             std::process::exit(2);
         }
+        CliAction::DesktopAgent {
+            model,
+            allowed_tools,
+            permission_mode,
+            resume,
+            incognito,
+            allow_broad_cwd,
+        } => {
+            enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Json)?;
+            desktop_agent::run(model, allowed_tools, permission_mode, resume, incognito)?;
+        }
+        CliAction::Desktop => launch_desktop_app()?,
         CliAction::SessionList { output_format } => run_session_list(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
@@ -1159,6 +1224,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            resume,
         } => run_repl(
             model,
             allowed_tools,
@@ -1166,6 +1232,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            resume,
         )?,
         CliAction::HelpTopic {
             topic,
@@ -1178,6 +1245,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
+    /// `claw desktop-agent`: one session for the desktop app over JSON lines.
+    DesktopAgent {
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        resume: Option<String>,
+        /// Keep nothing on disk: the session file is removed and never saved.
+        incognito: bool,
+        allow_broad_cwd: bool,
+    },
+    /// `claw desktop`: start the desktop app.
+    Desktop,
     DumpManifests {
         output_format: CliOutputFormat,
         manifests_dir: Option<PathBuf>,
@@ -1285,6 +1364,8 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+        /// `claw --resume [session]`: continue this session.
+        resume: Option<String>,
     },
     HelpTopic {
         topic: LocalHelpTopic,
@@ -1900,16 +1981,40 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
+            resume: None,
         });
     }
     if let Some(action) = parse_local_help_action(&rest, output_format) {
         return action;
     }
-    if rest.first().map(String::as_str) == Some("--resume") {
-        return parse_resume_args(&rest[1..], output_format, allow_broad_cwd);
-    }
-    if rest.first().map(String::as_str) == Some("resume") {
-        return parse_resume_args(&rest[1..], output_format, allow_broad_cwd);
+    if matches!(
+        rest.first().map(String::as_str),
+        Some("--resume" | "resume")
+    ) {
+        let action = parse_resume_args(&rest[1..], output_format, allow_broad_cwd)?;
+        // `claw --resume [session]` with nothing to run on it continues the
+        // session in the REPL, like `claude --resume`.
+        if let CliAction::ResumeSession {
+            session_path,
+            commands,
+            output_format: CliOutputFormat::Text,
+            allow_broad_cwd,
+        } = &action
+        {
+            if commands.is_empty() && resume_opens_repl() {
+                return Ok(CliAction::Repl {
+                    model,
+                    allowed_tools,
+                    permission_mode: permission_mode_override
+                        .unwrap_or_else(default_permission_mode),
+                    base_commit,
+                    reasoning_effort,
+                    allow_broad_cwd: *allow_broad_cwd,
+                    resume: Some(session_path.display().to_string()),
+                });
+            }
+        }
+        return Ok(action);
     }
     // #696: `claw compact` is the bare name of the interactive `/compact`
     // slash command, not a prompt. When extra args such as `--help` appear
@@ -2157,6 +2262,35 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], model, output_format),
         "acp" => parse_acp_args(&rest[1..], output_format),
+        "desktop" => Ok(CliAction::Desktop),
+        "desktop-agent" => {
+            let mut resume = None;
+            let mut incognito = false;
+            let mut args = rest[1..].iter();
+            while let Some(arg) = args.next() {
+                match (arg.as_str(), args.as_slice().first()) {
+                    ("--resume", Some(path)) => {
+                        resume = Some(path.clone());
+                        args.next();
+                    }
+                    ("--incognito", _) => incognito = true,
+                    _ => {
+                        return Err(format!(
+                            "unexpected arguments after `claw desktop-agent`: {}\nUsage: claw desktop-agent [--resume <session.jsonl>] [--incognito]",
+                            rest[1..].join(" ")
+                        ))
+                    }
+                }
+            }
+            Ok(CliAction::DesktopAgent {
+                model,
+                allowed_tools,
+                permission_mode: permission_mode(),
+                resume,
+                incognito,
+                allow_broad_cwd,
+            })
+        }
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => {
             // #771: extra positional args to `init` were silently ignored — now rejected
@@ -2490,11 +2624,12 @@ fn parse_single_word_command_alias(
         })),
         "setup" => Some(Ok(CliAction::Setup { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
-        // #146: let `config` and `diff` fall through to parse_subcommand
-        // where they are wired as pure-local introspection, instead of
-        // producing the "is a slash command" guidance. Zero-arg cases
-        // reach parse_subcommand too via this None.
-        "config" | "diff" => None,
+        // #146/#808: let `config`, `settings` and `diff` fall through to
+        // parse_subcommand where they are wired as pure-local introspection,
+        // instead of producing the "is a slash command" guidance (`/settings`
+        // is also a REPL alias of `/config`). Zero-arg cases reach
+        // parse_subcommand too via this None.
+        "config" | "settings" | "diff" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -2996,8 +3131,16 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
 }
 
 fn is_bare_provider_model(model: &str) -> bool {
-    model.starts_with("claude-") || model.starts_with("gpt-")
+    model.starts_with("claude-")
+        || model.starts_with("gpt-")
+        // `zai/glm-4.6`, `openrouter/vendor/model`, or a bare `glm-4.6`
+        // while ZAI_API_KEY is set.
+        || api::hosted_openai_provider_for_model(model).is_some()
 }
+
+/// Where `/login`'s local server choice points by default: llama.cpp's
+/// `llama-server`.
+pub(crate) const DEFAULT_LOCAL_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 
 fn is_local_openai_model_syntax(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("local/") {
@@ -3203,7 +3346,28 @@ fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
+    let mut definitions = tool_registry.definitions(allowed_tools);
+    // Tools turned off with `permissions.deniedTools` are refused anyway;
+    // hiding them keeps the model from trying.
+    let denied = config_denied_tools_for_current_dir();
+    if !denied.is_empty() {
+        definitions.retain(|tool| {
+            !denied
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&tool.name))
+        });
+    }
+    definitions
+}
+
+fn config_denied_tools_for_current_dir() -> Vec<String> {
+    let Ok(cwd) = env::current_dir() else {
+        return Vec::new();
+    };
+    ConfigLoader::default_for(&cwd)
+        .load()
+        .map(|config| config.permission_rules().denied_tools().to_vec())
+        .unwrap_or_default()
 }
 
 fn parse_system_prompt_args(
@@ -3362,6 +3526,12 @@ fn parse_dump_manifests_args(
         output_format,
         manifests_dir,
     })
+}
+
+/// Whether a bare `claw --resume` opens the REPL: only with a terminal to
+/// type in. Parse tests (often run from a terminal) keep the one-shot form.
+fn resume_opens_repl() -> bool {
+    !cfg!(test) && io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
 fn parse_resume_args(
@@ -3809,6 +3979,19 @@ fn saved_provider_env(
     api_key: &str,
     base_url: Option<&str>,
 ) -> Vec<(&'static str, String)> {
+    if kind == "local" {
+        // `local/` models read only these, so the URL is always set.
+        let mut vars = Vec::new();
+        if !api_key.trim().is_empty() {
+            vars.push(("CLAW_LOCAL_API_KEY", api_key.trim().to_string()));
+        }
+        let url = base_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or(DEFAULT_LOCAL_BASE_URL);
+        vars.push(("CLAW_LOCAL_BASE_URL", url.to_string()));
+        return vars;
+    }
     let (key_var, url_var, default_url) = match kind {
         "anthropic" => (
             "ANTHROPIC_API_KEY",
@@ -3826,7 +4009,14 @@ fn saved_provider_env(
             "DASHSCOPE_BASE_URL",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
         ),
-        _ => return Vec::new(),
+        other => match api::hosted_openai_provider(other) {
+            Some(hosted) => (
+                hosted.config.api_key_env,
+                hosted.config.base_url_env,
+                hosted.config.default_base_url,
+            ),
+            None => return Vec::new(),
+        },
     };
     let mut vars = Vec::new();
     if !api_key.trim().is_empty() {
@@ -4054,7 +4244,14 @@ fn check_base_url_health() -> DiagnosticCheck {
         ("OPENAI_BASE_URL", "https://api.openai.com"),
         ("XAI_BASE_URL", "https://api.x.ai"),
         ("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com"),
-    ];
+        ("CLAW_LOCAL_BASE_URL", DEFAULT_LOCAL_BASE_URL),
+    ]
+    .into_iter()
+    .chain(
+        api::all_hosted_providers()
+            .map(|hosted| (hosted.config.base_url_env, hosted.config.default_base_url)),
+    )
+    .collect::<Vec<_>>();
     let mut issues: Vec<String> = Vec::new();
     let mut details: Vec<String> = Vec::new();
     for (var_name, default_url) in &base_url_vars {
@@ -4665,7 +4862,7 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
         format!("Filesystem live  {}", status.filesystem_active),
     ];
     if let Some(reason) = &status.fallback_reason {
-        details.push(format!("Fallback reason  {reason}"));
+        details.push(format!("Unavailable      {reason}"));
     }
     DiagnosticCheck::new(
         "Sandbox",
@@ -4684,11 +4881,8 @@ fn check_sandbox_health(status: &runtime::SandboxStatus) -> DiagnosticCheck {
     )
     .with_details(details)
     .with_hint(
-        // #778: stable remediation hint — sandbox degraded on non-Linux hosts is expected, not an error
-        if degraded && !status.supported {
-            "Sandbox namespace isolation requires Linux with `unshare`. On macOS/non-Linux hosts this warning is expected and can be ignored. Filesystem isolation is still active."
-        } else if degraded {
-            "Check that the `unshare` binary is available and the process has the required capabilities."
+        if degraded {
+            "Shell commands are blocked. Enable Bubblewrap and unprivileged user namespaces on Linux, check the configured mount roots, or explicitly approve a host command."
         } else {
             ""
         },
@@ -6978,7 +7172,8 @@ fn run_resume_command(
                 })),
             })
         }
-        SlashCommand::Bughunter { .. }
+        SlashCommand::LocalAction { .. }
+        | SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
         | SlashCommand::Pr { .. }
         | SlashCommand::Issue { .. }
@@ -6994,6 +7189,7 @@ fn run_resume_command(
         | SlashCommand::ReloadPlugins
         | SlashCommand::Keybindings
         | SlashCommand::Focus { .. }
+        | SlashCommand::DiffPanel { .. }
         | SlashCommand::Background { .. }
         | SlashCommand::ListAgents
         | SlashCommand::Stop { .. }
@@ -7034,7 +7230,10 @@ fn run_resume_command(
         | SlashCommand::Effort { .. }
         | SlashCommand::Rewind { .. }
         | SlashCommand::AddDir { .. }
-        | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+        | SlashCommand::Setup => Err(
+            "interactive_only: this slash command works only in a live session.\nOpen the session with `claw --resume <session>` (no command after it) and run it there."
+                .into(),
+        ),
     }
 }
 
@@ -7153,6 +7352,12 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 
 /// The prompt for a turn started because a background job finished; the
 /// notices themselves are prepended by `with_job_notices`.
+/// How many times LeanGate sends type errors back before letting a turn end.
+const LEAN_GATE_ROUNDS: usize = 2;
+
+/// Sessions shorter than this many turns are not reflected on at exit.
+const REFLECT_MIN_TURNS: u32 = 5;
+
 const BACKGROUND_WAKE_PROMPT: &str = "A background task you started has finished (see the \
 reminder above). Continue the work it was part of; if nothing is left to do, briefly report \
 the result.";
@@ -7165,6 +7370,7 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    resume: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
@@ -7184,17 +7390,32 @@ fn run_repl(
     // claw and the input box stays at the bottom. CLAW_FULLSCREEN=0 keeps
     // the inline view. The guard gives the window back on the way out.
     claude_commands::apply_saved_settings();
-    let _fullscreen = claude_commands::Fullscreen::start();
+    let fullscreen = claude_commands::Fullscreen::start();
     if runtime::read_user_setting("viewMode").as_deref() == Some("focus") {
         runtime::turn_keys::screen::set_focus(true);
     }
     runtime::turn_keys::screen::set_copy_handler(repl_commands::copy_selection);
+    tools::local_tools::set_mcp_waiter(mcp_wait_report);
+    tools::local_tools::set_background_sessions_provider(background_session_rows);
     let mut editor =
         input::LineEditor::new("❯ ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    if let Some(session) = resume {
+        cli.resume_session(Some(session))?;
+    }
+    // Commands run without a terminal; ssh asks for key passphrases here.
+    runtime::askpass::set_prompter(ask::ask_secret);
 
     loop {
+        // The agent ended the session (EndConversation).
+        if let Some(reason) = tools::local_tools::take_end_conversation() {
+            println!(
+                "  {TOOL_DIM_STYLE}⎿ the assistant ended the conversation: {reason}{STYLE_RESET}"
+            );
+            cli.persist_session()?;
+            break;
+        }
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         claude_commands::announce_finished_background();
         cli.refresh_footer_status();
@@ -7213,11 +7434,13 @@ fn run_repl(
                     continue;
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                    cli.reflect_before_exit();
                     cli.persist_session()?;
                     break;
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(SlashCommand::Exit)) => {
+                        cli.reflect_before_exit();
                         cli.persist_session()?;
                         break;
                     }
@@ -7275,10 +7498,32 @@ fn run_repl(
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Wake => {
-                // A background shell or agent finished while the prompt was
-                // idle: resume the agent with the notice, like Claude Code.
-                println!("  {TOOL_DIM_STYLE}⎿ background task finished, resuming{STYLE_RESET}");
-                report_repl_turn_error(cli.run_turn(BACKGROUND_WAKE_PROMPT));
+                // A scheduled prompt came due (CronCreate, a self-paced
+                // /loop's ScheduleWakeup): run it as a turn.
+                let due = runtime::scheduler::global_scheduler().take_due();
+                for prompt in &due {
+                    let label = if prompt.source == "wakeup" {
+                        "loop wake-up".to_string()
+                    } else {
+                        format!("scheduled task {}", prompt.source)
+                    };
+                    println!(
+                        "  {TOOL_DIM_STYLE}⎿ {label}: {}{STYLE_RESET}",
+                        prompt.prompt.lines().next().unwrap_or("")
+                    );
+                    let text = if prompt.source == "wakeup" {
+                        claude_commands::self_paced_loop_prompt(&prompt.prompt)
+                    } else {
+                        prompt.prompt.clone()
+                    };
+                    report_repl_turn_error(cli.run_turn(&text));
+                }
+                // A background shell, agent or monitor reported while the
+                // prompt was idle: resume the agent with it, like Claude Code.
+                if due.is_empty() || runtime::global_background_jobs().has_notices() {
+                    println!("  {TOOL_DIM_STYLE}⎿ background task reported, resuming{STYLE_RESET}");
+                    report_repl_turn_error(cli.run_turn(BACKGROUND_WAKE_PROMPT));
+                }
             }
             input::ReadOutcome::CycleMode(draft) => {
                 if let Err(error) = cli.cycle_permission_mode() {
@@ -7287,6 +7532,7 @@ fn run_repl(
                 editor.restore_draft(draft);
             }
             input::ReadOutcome::Exit => {
+                cli.reflect_before_exit();
                 cli.persist_session()?;
                 break;
             }
@@ -7294,6 +7540,13 @@ fn run_repl(
     }
 
     runtime::global_background_jobs().kill_all();
+    runtime::askpass::cleanup();
+    // Back on the normal screen first, or the line vanishes with claw's.
+    drop(fullscreen);
+    println!(
+        "{TOOL_DIM_STYLE}Resume this session with: claw --resume {}{STYLE_RESET}",
+        cli.session.id
+    );
     Ok(())
 }
 
@@ -7502,6 +7755,87 @@ struct RuntimePluginState {
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
 }
 
+/// Each MCP server's status after the last connection attempt, for
+/// `WaitForMcpServers`: (name, "connected" or "failed", error).
+static MCP_STATUS: std::sync::Mutex<Vec<(String, String, Option<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn record_mcp_status(servers: &[String], discovery: &runtime::McpToolDiscoveryReport) {
+    let failure = |name: &str| {
+        discovery
+            .failed_servers
+            .iter()
+            .find(|failure| failure.server_name == name)
+            .map(|failure| failure.error.clone())
+            .or_else(|| {
+                discovery
+                    .unsupported_servers
+                    .iter()
+                    .find(|server| server.server_name == name)
+                    .map(|server| server.reason.clone())
+            })
+    };
+    let mut rows: Vec<(String, String, Option<String>)> = servers
+        .iter()
+        .map(|name| match failure(name) {
+            Some(error) => (name.clone(), "failed".to_string(), Some(error)),
+            None => (name.clone(), "connected".to_string(), None),
+        })
+        .collect();
+    for server in &discovery.unsupported_servers {
+        if !rows.iter().any(|(name, _, _)| *name == server.server_name) {
+            rows.push((
+                server.server_name.clone(),
+                "failed".to_string(),
+                Some(server.reason.clone()),
+            ));
+        }
+    }
+    *MCP_STATUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
+}
+
+/// `WaitForMcpServers`: claw connects MCP servers when the session (or
+/// `/mcp reconnect`) builds its runtime, so there is nothing left to wait
+/// for; this reports how each named (or every) server came out.
+fn mcp_wait_report(names: &[String], _timeout: std::time::Duration) -> serde_json::Value {
+    let rows = MCP_STATUS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let servers: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|(name, _, _)| names.is_empty() || names.contains(name))
+        .map(|(name, status, error)| json!({ "server": name, "status": status, "error": error }))
+        .collect();
+    let unknown: Vec<&String> = names
+        .iter()
+        .filter(|name| !rows.iter().any(|(row, _, _)| row == *name))
+        .collect();
+    json!({
+        "servers": servers,
+        "unknown": unknown,
+        "message": "MCP servers finish connecting when the session starts; a failed one can be retried with /mcp reconnect <server>.",
+    })
+}
+
+/// `ListAgents`' rows for background claw sessions.
+fn background_session_rows() -> Vec<serde_json::Value> {
+    background::entries()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "session": entry.session_id,
+                "status": entry.status,
+                "prompt": entry.prompt.chars().take(80).collect::<String>(),
+                "messageable": false,
+            })
+        })
+        .collect()
+}
+
 struct RuntimeMcpState {
     runtime: tokio::runtime::Runtime,
     manager: McpServerManager,
@@ -7617,7 +7951,15 @@ impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        let disabled = command_actions::disabled_servers(runtime_config);
+        let enabled = runtime_config
+            .mcp()
+            .servers()
+            .iter()
+            .filter(|(name, _)| !disabled.contains(*name))
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect();
+        let mut manager = McpServerManager::from_servers(&enabled);
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
@@ -7686,6 +8028,7 @@ impl RuntimeMcpState {
                     }
                 }))
                 .collect::<Vec<_>>();
+        record_mcp_status(&manager.server_names(), &discovery);
         let degraded_report = (!failed_servers.is_empty()).then(|| {
             runtime::McpDegradedReport::new(
                 working_servers,
@@ -8005,6 +8348,11 @@ impl LiveCli {
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Start the model's local server first: the prompt asks it for its
+        // context size.
+        runtime::model_server::ensure_for_model(&model);
+        // A session in this project, for memory activity ranking.
+        runtime::record_session(&env::current_dir().unwrap_or_default());
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -8040,6 +8388,7 @@ impl LiveCli {
             advisor: None,
         };
         cli.persist_session()?;
+        remember_workspace();
         Ok(cli)
     }
 
@@ -8153,8 +8502,14 @@ impl LiveCli {
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let prompt = Self::with_job_notices(input);
         self.begin_checkpoint(input);
-        let result = self.run_turn_inner(&prompt);
+        let _ = tools::leangate::take_edited_files();
+        let mut result = self.run_turn_inner(&prompt);
+        if result.is_ok() {
+            result = self.lean_gate_rounds();
+        }
         self.finish_checkpoint();
+        // Shell commands and sub-agents change files too.
+        diff_panel::refresh();
         // Shift+Tab pressed while the turn ran: switch modes now it is over.
         if let Err(error) = self.cycle_permission_mode_by(runtime::turn_keys::take_mode_presses()) {
             eprintln!("error: {error}");
@@ -8163,23 +8518,140 @@ impl LiveCli {
         result
     }
 
+    /// Runs one attempt at a turn with the key watcher up, so the activity
+    /// block and status line show and Esc, the mouse wheel and selection
+    /// work while it runs. Without `attachments` the session already holds
+    /// `input` and the turn is continued rather than sent again.
+    fn run_watched_attempt(
+        &self,
+        runtime: &mut BuiltRuntime,
+        hook_abort_monitor: HookAbortMonitor,
+        input: &str,
+        attachments: Option<Vec<ContentBlock>>,
+    ) -> Result<runtime::TurnSummary, RuntimeError> {
+        // Esc (like Ctrl+C) stops the reply; keys typed meanwhile become type-ahead.
+        let key_watcher = runtime::turn_keys::TurnKeyWatcher::start(hook_abort_monitor.signal());
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = match attachments {
+            Some(attachments) => runtime.run_turn_with_attachments(
+                input,
+                attachments,
+                Some(&mut permission_prompter),
+            ),
+            None => runtime.continue_turn(input, Some(&mut permission_prompter)),
+        };
+        drop(key_watcher);
+        hook_abort_monitor.stop();
+        result
+    }
+
+    /// Ends a turn the user stopped (Esc, Ctrl+C), keeping what it did.
+    fn finish_stopped_turn(
+        &mut self,
+        mut runtime: BuiltRuntime,
+        spinner: &mut Spinner,
+        stdout: &mut io::Stdout,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Stopping a reply hands control back: queued prompts are put
+        // in the input box instead of running.
+        runtime::turn_keys::unqueue_into_type_ahead();
+        // Keep what the turn did (the prompt, finished tool calls and
+        // their results) instead of dropping it, so the next prompt can
+        // refer to it. The stop only lands during a model request, after
+        // every tool_use already has its tool_result, so the history
+        // stays well-formed; the note tells the model it was cut off.
+        if let Some(rt) = runtime.runtime.as_mut() {
+            let _ = rt
+                .session_mut()
+                .push_user_text("[Request interrupted by user]");
+        }
+        self.pending_attachments.clear();
+        self.replace_runtime(runtime)?;
+        self.persist_session()?;
+        spinner.fail("stopped", TerminalRenderer::new().color_theme(), stdout)?;
+        println!();
+        Ok(())
+    }
+
+    /// LeanGate after a turn: while the files the turn edited have type
+    /// errors, the agent gets them back and continues, a few rounds at most.
+    /// Skipped when the user stopped the turn.
+    fn lean_gate_rounds(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..LEAN_GATE_ROUNDS {
+            let edited = tools::leangate::take_edited_files();
+            if edited.is_empty() || self.last_turn_was_stopped() {
+                break;
+            }
+            let Some(report) = tools::leangate::completion_check(&edited) else {
+                break;
+            };
+            println!(
+                "  {TOOL_DIM_STYLE}⎿ LeanGate: the edited files have type errors; claw fixes them before finishing{STYLE_RESET}"
+            );
+            self.run_turn_inner(&report)?;
+        }
+        let _ = tools::leangate::take_edited_files();
+        Ok(())
+    }
+
+    /// On the way out of a substantial session, one turn that saves what it
+    /// learned (decisions, facts, mistakes, preferences) to auto memory.
+    /// Esc skips it; `"memoryReflectOnExit": false` or `CLAW_MEMORY_REFLECT=0`
+    /// turns it off.
+    fn reflect_before_exit(&mut self) {
+        if self.runtime.usage().turns() < REFLECT_MIN_TURNS
+            || std::env::var("CLAW_MEMORY_REFLECT")
+                .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"))
+        {
+            return;
+        }
+        let cwd = env::current_dir().unwrap_or_default();
+        let config = runtime::ConfigLoader::default_for(&cwd).load().ok();
+        let memory_on = config.as_ref().is_none_or(runtime::memory_enabled);
+        let reflect_on = config
+            .as_ref()
+            .and_then(|config| config.get("memoryReflectOnExit"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        if !memory_on || !reflect_on {
+            return;
+        }
+        let Some(prompt) = repl_commands::prompt_for_command("reflect", None) else {
+            return;
+        };
+        println!(
+            "  {TOOL_DIM_STYLE}⎿ Saving what this session learned to memory (Esc skips)…{STYLE_RESET}"
+        );
+        if let Err(error) = self.run_turn(&prompt) {
+            eprintln!("reflection skipped: {error}");
+        }
+    }
+
+    fn last_turn_was_stopped(&self) -> bool {
+        self.runtime
+            .session()
+            .messages
+            .last()
+            .is_some_and(|message| {
+                message.blocks.iter().any(|block| {
+                    matches!(block, runtime::ContentBlock::Text { text } if text == "[Request interrupted by user]")
+                })
+            })
+    }
+
     fn run_turn_inner(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
-        // Esc (like Ctrl+C) stops the reply; keys typed meanwhile become type-ahead.
         runtime::turn_keys::set_activity_color(&render::activity_color(render::current_theme()));
-        let key_watcher = runtime::turn_keys::TurnKeyWatcher::start(hook_abort_monitor.signal());
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let turn_started = std::time::Instant::now();
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let attachments = self.pending_attachments.clone();
-        let result = runtime.run_turn_with_attachments(
+        let result = self.run_watched_attempt(
+            &mut runtime,
+            hook_abort_monitor,
             input,
-            attachments.clone(),
-            Some(&mut permission_prompter),
+            Some(attachments.clone()),
         );
-        drop(key_watcher);
-        hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 // Providers that stream text have already shown the reply;
@@ -8216,29 +8688,7 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) if error.to_string().contains(INTERRUPTED_BY_USER) => {
-                // Stopping a reply hands control back: queued prompts are put
-                // in the input box instead of running.
-                runtime::turn_keys::unqueue_into_type_ahead();
-                // Keep what the turn did (the prompt, finished tool calls and
-                // their results) instead of dropping it, so the next prompt can
-                // refer to it. The stop only lands during a model request, after
-                // every tool_use already has its tool_result, so the history
-                // stays well-formed; the note tells the model it was cut off.
-                if let Some(rt) = runtime.runtime.as_mut() {
-                    let _ = rt
-                        .session_mut()
-                        .push_user_text("[Request interrupted by user]");
-                }
-                self.pending_attachments.clear();
-                self.replace_runtime(runtime)?;
-                self.persist_session()?;
-                spinner.fail(
-                    "stopped",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
-                Ok(())
+                self.finish_stopped_turn(runtime, &mut spinner, &mut stdout)
             }
             Err(error) => {
                 runtime.shutdown_plugins()?;
@@ -8297,13 +8747,18 @@ impl LiveCli {
                     // If the error tells us the server's actual context window, adapt our
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
-                        // Set threshold at 70% of the reported window to leave headroom.
-                        let threshold: u32 = (window as f64 * 0.7).round() as u32;
+                        // Same share of the window as a known window gets up front.
+                        let threshold = auto_compaction_threshold_for_window(window);
                         println!(
                             "  Server context window: {} tokens — setting auto-compaction threshold to {}",
                             window, threshold
                         );
                         runtime.set_auto_compaction_input_tokens_threshold(threshold);
+                        // Each turn builds a fresh runtime: remember the window
+                        // so later turns compact (and budget replies) in time.
+                        if self.model.starts_with("local/") {
+                            api::note_local_context_window(&self.model, window);
+                        }
                     }
 
                     // A single compaction pass may not free enough context space.
@@ -8312,8 +8767,19 @@ impl LiveCli {
                     // Max 4 rounds before giving up and surfacing the error to the user.
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
+                    // The latest overflow error: it may name the window.
+                    let mut overflow_error = error_str.clone();
 
                     for round in 0..max_compact_rounds {
+                        // Kept messages go word for word, so one huge tool
+                        // result (a whole large file) can overflow the
+                        // window by itself. Worked out each round, from
+                        // the request that just overflowed.
+                        let max_tool_result_chars = overflow_tool_result_limit(
+                            &overflow_error,
+                            &self.model,
+                            runtime.session(),
+                        );
                         let preserve = preserve_schedule[round];
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
@@ -8332,11 +8798,24 @@ impl LiveCli {
                             &runtime::trident::TridentConfig::default(),
                         );
                         let removed = result.removed_message_count;
+                        let mut compacted_session = result.compacted_session;
+                        let cut = max_tool_result_chars.map_or(0, |limit| {
+                            runtime::truncate_large_tool_results(&mut compacted_session, limit)
+                        });
 
-                        if removed == 0 && round > 0 {
-                            // No more messages to compact — further rounds won't help
+                        if removed == 0 && cut == 0 {
+                            // Nothing changed: the same request would fail
+                            // the same way, so go straight to a harder round.
+                            if round + 1 < max_compact_rounds {
+                                continue;
+                            }
                             println!("  No further compaction possible.");
                             break;
+                        }
+                        if cut > 0 {
+                            println!(
+                                "  Cut {cut} oversized tool result(s) to fit the context window."
+                            );
                         }
 
                         if removed > 0 {
@@ -8344,27 +8823,38 @@ impl LiveCli {
                                 "{}",
                                 format_compact_report(
                                     removed,
-                                    result.compacted_session.messages.len(),
+                                    compacted_session.messages.len(),
                                     false
                                 )
                             );
                         }
 
+                        // The compacted session holds this turn's prompt and
+                        // the work done so far: continue from there. Sending
+                        // the prompt again started the work over each round,
+                        // so it overflowed the same way every time. Only when
+                        // compaction removed the prompt is it sent again.
+                        let continues = compacted_session.messages.last().is_some_and(|message| {
+                            matches!(message.role, MessageRole::User | MessageRole::Tool)
+                        });
+
                         // Without this, prepare_turn_runtime() reads from self.runtime.session()
                         // which still holds the ORIGINAL un-compacted session, so every retry round
                         // would send the same bloated request — compaction was wasted.
-                        *self.runtime.session_mut() = result.compacted_session.clone();
+                        *self.runtime.session_mut() = compacted_session;
 
                         // Build a new runtime with the compacted session and retry
                         let (mut new_runtime, hook_abort_monitor) =
                             self.prepare_turn_runtime(true)?;
-                        drop(hook_abort_monitor);
 
-                        let mut rp = CliPermissionPrompter::new(self.permission_mode);
-                        match new_runtime.run_turn_with_attachments(
+                        // The retry is a whole turn of its own (often many
+                        // tool calls): it needs the key watcher too, or the
+                        // activity block, Esc and scrolling are gone for it.
+                        match self.run_watched_attempt(
+                            &mut new_runtime,
+                            hook_abort_monitor,
                             input,
-                            attachments.clone(),
-                            Some(&mut rp),
+                            (!continues).then(|| attachments.clone()),
                         ) {
                             Ok(summary) => {
                                 self.pending_attachments.clear();
@@ -8387,6 +8877,15 @@ impl LiveCli {
                                 }
                                 self.persist_session()?;
                                 return Ok(());
+                            }
+                            Err(retry_error)
+                                if retry_error.to_string().contains(INTERRUPTED_BY_USER) =>
+                            {
+                                return self.finish_stopped_turn(
+                                    new_runtime,
+                                    &mut spinner,
+                                    &mut stdout,
+                                );
                             }
                             Err(retry_error) => {
                                 let retry_str = retry_error.to_string();
@@ -8421,6 +8920,7 @@ impl LiveCli {
                                     // and loop — the next round will compact more aggressively.
                                     runtime.shutdown_plugins()?;
                                     runtime = new_runtime;
+                                    overflow_error = retry_str;
                                     continue;
                                 }
 
@@ -8533,6 +9033,9 @@ impl LiveCli {
         command: SlashCommand,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         Ok(match command {
+            SlashCommand::LocalAction { name, args } => {
+                self.run_local_action(name, args.as_deref())?
+            }
             SlashCommand::Help => {
                 println!("{}", render_repl_help());
                 false
@@ -8557,10 +9060,7 @@ impl LiveCli {
                 self.run_issue(context.as_deref())?;
                 false
             }
-            SlashCommand::Ultraplan { task } => {
-                self.run_ultraplan(task.as_deref())?;
-                false
-            }
+            SlashCommand::Ultraplan { task } => self.run_ultraplan(task.as_deref())?,
             SlashCommand::Teleport { target } => {
                 Self::run_teleport(target.as_deref())?;
                 false
@@ -8574,12 +9074,13 @@ impl LiveCli {
             SlashCommand::ReloadSkills => Self::run_reload_skills()?,
             SlashCommand::Keybindings => Self::run_keybindings()?,
             SlashCommand::Focus { mode } => Self::run_focus(mode.as_deref())?,
+            SlashCommand::DiffPanel { mode } => Self::run_diff_panel(mode.as_deref())?,
             SlashCommand::Background { prompt } => self.run_background(prompt.as_deref())?,
             SlashCommand::ListAgents => Self::run_list_agents()?,
             SlashCommand::Stop { id } => Self::run_stop(id.as_deref())?,
             SlashCommand::ReloadPlugins => self.run_reload_plugins()?,
             SlashCommand::SkillDoctor => Self::run_skill_doctor()?,
-            SlashCommand::TerminalSetup => Self::run_terminal_setup()?,
+            SlashCommand::TerminalSetup => self.run_local_action("/terminal-setup", None)?,
             SlashCommand::Powerup => Self::run_powerup()?,
             SlashCommand::Goal { condition } => self.run_goal(condition.as_deref())?,
             SlashCommand::Loop { args } => self.run_loop(&args)?,
@@ -8625,7 +9126,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Memory => {
-                Self::print_memory()?;
+                self.run_local_action("/memory", None)?;
                 false
             }
             SlashCommand::Init => {
@@ -8768,7 +9269,8 @@ impl LiveCli {
                 report_repl_turn_error(self.run_turn(&prompt));
                 false
             }
-            SlashCommand::ReleaseNotes | SlashCommand::Summary => {
+            SlashCommand::ReleaseNotes => self.run_local_action("/release-notes", None)?,
+            SlashCommand::Summary => {
                 let name = command.slash_name().trim_start_matches('/').to_string();
                 let prompt = repl_commands::prompt_for_command(&name, None).unwrap_or_default();
                 report_repl_turn_error(self.run_turn(&prompt));
@@ -8919,6 +9421,7 @@ impl LiveCli {
         };
 
         let model = resolve_model_alias_with_config(&model);
+        runtime::model_server::ensure_for_model(&model);
 
         if model == self.model {
             println!(
@@ -9062,16 +9565,8 @@ impl LiveCli {
         } else {
             self.runtime.estimated_tokens()
         };
-        // The window: for a `local/` model, CLAW_CONTEXT_WINDOW (set it to
-        // llama-server's `-c`); otherwise the model's known limit. Unknown
-        // hosted models show only the tokens used.
-        let window = if self.model.starts_with("local/") {
-            std::env::var("CLAW_CONTEXT_WINDOW")
-                .ok()
-                .and_then(|value| value.trim().parse::<usize>().ok())
-        } else {
-            api::model_token_limit(&self.model).map(|limit| limit.context_window_tokens as usize)
-        };
+        // Unknown hosted models show only the tokens used.
+        let window = known_context_window(&self.model).map(|window| window as usize);
         let short = |tokens: usize| {
             if tokens >= 1000 {
                 #[allow(clippy::cast_precision_loss)]
@@ -9776,9 +10271,17 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_ultraplan(&self, task: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", format_ultraplan_report(task));
-        Ok(())
+    /// `/ultraplan <task>`: Claude Code drafted plans in the cloud; here a
+    /// read-only planning turn researches with parallel explorers and
+    /// writes the plan to `.claw/plans/`, without changing code.
+    fn run_ultraplan(&mut self, task: Option<&str>) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(task) = task.map(str::trim).filter(|task| !task.is_empty()) else {
+            println!("usage: /ultraplan <task>   e.g. /ultraplan move the session store to SQLite");
+            return Ok(false);
+        };
+        println!("{}", format_ultraplan_report(Some(task)));
+        report_repl_turn_error(self.run_turn(&ultraplan_prompt(task)));
+        Ok(true)
     }
 
     fn run_teleport(target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -12104,6 +12607,29 @@ fn format_bughunter_report(scope: Option<&str>) -> String {
     )
 }
 
+/// The planning turn `/ultraplan` runs.
+fn ultraplan_prompt(task: &str) -> String {
+    let slug: String = task
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("-");
+    format!(
+        "Plan this task in depth before any code is written: {task}\n\n\
+         Do not modify source files in this turn; only read, research and write the plan file.\n\
+         1. Restate the goal and its constraints in a few lines.\n\
+         2. Explore in parallel: start 2-4 sub-agents with the Agent tool (run_in_background: true), each on one area the task touches (the code paths involved, their tests, related configuration and docs, prior art in the repository). Ask each for file paths, how the code works today, and risks.\n\
+         3. When they report, check the key claims yourself and resolve contradictions.\n\
+         4. Write the plan to .claw/plans/{slug}.md: goal; approach (and the alternatives rejected, with why); numbered, independently verifiable steps naming the files each touches; risks and how each is mitigated; how to verify (commands and expected results); rollback.\n\
+         5. Reply with a short summary of the plan and its path, and ask whether to carry it out."
+    )
+}
+
 fn format_ultraplan_report(task: Option<&str>) -> String {
     format!(
         "Ultraplan
@@ -12659,14 +13185,21 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    let mut prompt = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
         model_family_identity_for(model),
-    )?)
+    )?;
+    if term_image::enabled() {
+        prompt.push(TERMINAL_IMAGES_PROMPT.to_string());
+    }
+    Ok(prompt)
 }
+
+/// Told to the model when the terminal draws images in replies.
+const TERMINAL_IMAGES_PROMPT: &str = "# Images\nThis terminal shows images in your replies: to show a picture, put it in the reply as Markdown, `![description](https://...)` for a web image or `![description](/absolute/path.png)` for a local file (PNG, JPEG, GIF, WebP or SVG). When the user wants a file saved (an image you showed, a document you found), use the Download tool; it saves into ~/Downloads unless told otherwise.";
 
 struct PluginsCommandPayload {
     message: String,
@@ -13202,6 +13735,7 @@ fn build_runtime_with_plugin_state(
         mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
+    let model_for_threshold = model.clone();
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
@@ -13220,11 +13754,15 @@ fn build_runtime_with_plugin_state(
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-        ),
+        )
+        .with_model(&model_for_threshold),
         policy,
         system_prompt,
         &feature_config,
     );
+    if let Some(threshold) = window_auto_compaction_threshold(&model_for_threshold) {
+        runtime = runtime.with_auto_compaction_input_tokens_threshold(threshold);
+    }
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
@@ -13289,6 +13827,21 @@ fn session_approval_key(tool_name: &str, command: Option<&str>) -> String {
     }
 }
 
+fn permission_request_approval_key(
+    request: &runtime::PermissionRequest,
+    command: Option<&str>,
+) -> String {
+    if runtime::is_host_execution_request(&request.tool_name, &request.input) {
+        // Serialize the tuple to avoid ambiguous delimiter-based scope keys.
+        format!(
+            "host:{}",
+            serde_json::json!([std::env::current_dir().ok(), request.input])
+        )
+    } else {
+        session_approval_key(&request.tool_name, command)
+    }
+}
+
 /// What the permission box shows for a request: a title and a preview of
 /// what the tool will do (the command, the file and its change, the query).
 fn approval_request(
@@ -13325,7 +13878,12 @@ fn approval_request(
                 subject.push(String::new());
                 subject.push(description.to_string());
             }
-            ("Bash command".to_string(), subject)
+            let title = if runtime::is_host_execution_request(&request.tool_name, &request.input) {
+                "Host command (outside sandbox)"
+            } else {
+                "Bash command"
+            };
+            (title.to_string(), subject)
         }
         ("edit_file" | "Edit", _) => {
             let mut subject = vec![path.unwrap_or("?").to_string(), String::new()];
@@ -13345,6 +13903,21 @@ fn approval_request(
         ("web_fetch" | "WebFetch", _) => (
             "Fetch".to_string(),
             vec![field("url").unwrap_or("?").to_string()],
+        ),
+        ("com" | "COM", _) => (
+            "Automate a Windows application (COM)".to_string(),
+            vec![com_summary(&request.input)],
+        ),
+        ("x11" | "X11", _) => (
+            "Control the desktop".to_string(),
+            vec![x11_summary(&request.input)],
+        ),
+        ("download" | "Download", _) => (
+            "Download".to_string(),
+            vec![
+                field("url").unwrap_or("?").to_string(),
+                format!("to {}", field("save_to").unwrap_or("~/Downloads")),
+            ],
         ),
         (name, _) => (
             format!("Tool: {name}"),
@@ -13375,7 +13948,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             });
-        let approval_key = session_approval_key(&request.tool_name, command.as_deref());
+        // Host grants cover the complete input and cwd, never a command prefix.
+        // Ordinary `sudo emerge` session approvals cannot authorize host access.
+        let approval_key = permission_request_approval_key(request, command.as_deref());
         if SESSION_APPROVALS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -13387,7 +13962,10 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         // Pause the keyboard watcher before showing the question, so an
         // answer typed right away is read here instead of being queued.
         let _keys_paused = runtime::turn_keys::pause();
-        let always_label =
+        let always_label = if runtime::is_host_execution_request(&request.tool_name, &request.input)
+        {
+            "this exact host command and working directory"
+        } else {
             approval_key.split_once(':').map_or(
                 "",
                 |(tool, key)| {
@@ -13397,7 +13975,8 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
                         key
                     }
                 },
-            );
+            )
+        };
         if io::stdin().is_terminal() && runtime::turn_keys::stdout_is_terminal() {
             render::stop_thinking();
             let prompt = approval_request(request, command.as_deref(), always_label);
@@ -13720,7 +14299,12 @@ impl AnthropicRuntimeClient {
 
         loop {
             let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                let stall_timeout = if message_request.model.starts_with("local/") {
+                    LOCAL_POST_TOOL_STALL_TIMEOUT
+                } else {
+                    POST_TOOL_STALL_TIMEOUT
+                };
+                match tokio::time::timeout(stall_timeout, stream.next_event()).await {
                     Ok(inner) => inner.map_err(|error| {
                         RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
                     })?,
@@ -13791,6 +14375,7 @@ impl AnthropicRuntimeClient {
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
+                            desktop_agent::emit_text(&text);
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -13802,6 +14387,7 @@ impl AnthropicRuntimeClient {
                     }
                     ContentBlockDelta::ThinkingDelta { thinking } => {
                         runtime::turn_keys::note_reasoning(thinking.chars().count());
+                        desktop_agent::emit_thinking(&thinking);
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
@@ -13841,6 +14427,7 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
+                        desktop_agent::emit_tool_call(&id, &name, &input);
                         // Display tool call now that input is fully accumulated
                         writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                             .and_then(|()| out.flush())
@@ -13849,6 +14436,25 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
+                    if delta
+                        .delta
+                        .stop_reason
+                        .as_deref()
+                        .is_some_and(runtime::is_output_limit_stop_reason)
+                    {
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(out, "{rendered}")
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        writeln!(
+                            out,
+                            "\n\x1b[2m(reply cut off at the {}-token limit; asking the model to continue)\x1b[0m",
+                            message_request.max_tokens
+                        )
+                        .and_then(|()| out.flush())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        events.push(AssistantEvent::OutputLimitReached);
+                    }
                     events.push(AssistantEvent::Usage(delta.usage.token_usage()));
                 }
                 ApiStreamEvent::MessageStop(_) => {
@@ -13910,6 +14516,69 @@ fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
         .is_some_and(|message| message.role == MessageRole::Tool)
 }
 
+/// Env var (and `overflowToolResultChars` in settings) that sets how long a
+/// tool result may stay when a request overflows the context window: a size
+/// like `64k`, or `off` to never cut.
+const OVERFLOW_TOOL_RESULT_CHARS_ENV: &str = "CLAW_OVERFLOW_TOOL_RESULT_CHARS";
+
+/// Smallest cut: below this a result says too little to be useful.
+const MIN_OVERFLOW_TOOL_RESULT_CHARS: usize = 2_000;
+
+/// How long a tool result may stay after a request overflowed the context
+/// window, in characters; `None` leaves results whole. About a quarter of
+/// the window (a token is roughly 4 characters), so the limit grows with
+/// the model and a large-context model is cut only when a result alone is
+/// enormous. The window is the one the server reported, else the model's
+/// known window ([`known_context_window`]), else the size of the request that overflowed (the window
+/// is at most that, and it shrinks round by round). The user's setting
+/// overrides all of it.
+fn overflow_tool_result_limit(
+    overflow_error: &str,
+    model: &str,
+    session: &runtime::Session,
+) -> Option<usize> {
+    let configured = std::env::var(OVERFLOW_TOOL_RESULT_CHARS_ENV)
+        .ok()
+        .or_else(|| runtime::read_user_setting("overflowToolResultChars"));
+    overflow_tool_result_limit_from(
+        configured.as_deref(),
+        extract_context_window_tokens_from_error(overflow_error)
+            .or_else(|| known_context_window(model)),
+        runtime::estimate_session_tokens(session),
+    )
+}
+
+/// The model's context window in tokens: for a `local/` model, what the
+/// server reports at `/props` (llama.cpp's `-c`), else `CLAW_CONTEXT_WINDOW`;
+/// otherwise the model's known limit.
+fn known_context_window(model: &str) -> Option<u32> {
+    if model.starts_with("local/") {
+        api::local_context_window(model)
+    } else {
+        api::model_token_limit(model).map(|limit| limit.context_window_tokens)
+    }
+}
+
+fn overflow_tool_result_limit_from(
+    configured: Option<&str>,
+    window_tokens: Option<u32>,
+    overflowed_tokens: usize,
+) -> Option<usize> {
+    if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
+        if matches!(
+            value.to_ascii_lowercase().as_str(),
+            "off" | "none" | "0" | "false"
+        ) {
+            return None;
+        }
+        if let Some(chars) = claude_commands::parse_token_count(value) {
+            return Some(chars as usize);
+        }
+    }
+    let window = window_tokens.map_or(overflowed_tokens, |window| window as usize);
+    Some(window.max(MIN_OVERFLOW_TOOL_RESULT_CHARS))
+}
+
 /// Extract the server-reported context window size from an error message.
 /// Returns `None` if no window size can be parsed.  The server must
 /// mention something like "context size (81920 tokens)" or "available
@@ -13924,13 +14593,16 @@ fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
     // Pattern: "(NNNNNN tokens)" appearing after context-size markers
     for line in error_str.lines() {
         let lowered = line.to_ascii_lowercase();
-        if lowered.contains("context size")
-            || lowered.contains("context length")
-            || lowered.contains("context window")
-        {
-            // Try parenthesised form: (81920 tokens)
-            if let Some(start) = lowered.find('(') {
-                if let Some(end) = lowered.find(")") {
+        let marker = ["context size", "context length", "context window"]
+            .iter()
+            .filter_map(|marker| lowered.find(marker))
+            .min();
+        if let Some(marker) = marker {
+            // Try parenthesised form: (81920 tokens). Only after the marker:
+            // llama.cpp puts the request's size first, "request (40010
+            // tokens) exceeds the available context size (16384 tokens)".
+            if let Some(start) = lowered[marker..].find('(').map(|i| marker + i) {
+                if let Some(end) = lowered[start..].find(')').map(|i| start + i) {
                     if start < end {
                         let inner = &line[start + 1..end];
                         let digits: String =
@@ -13944,7 +14616,7 @@ fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
                 }
             }
             // Try "maximum context length is NNNNNN tokens"
-            if let Some(pos) = lowered.find("is ") {
+            if let Some(pos) = lowered[marker..].find("is ").map(|i| marker + i) {
                 let rest = &line[pos + 3..];
                 let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(n) = digits.parse::<u32>() {
@@ -13954,7 +14626,7 @@ fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
                 }
             }
             // Try "configured limit of NNNNNN tokens"
-            if let Some(pos) = lowered.find("of ") {
+            if let Some(pos) = lowered[marker..].find("of ").map(|i| marker + i) {
                 let rest = &line[pos + 3..];
                 let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(n) = digits.parse::<u32>() {
@@ -14276,6 +14948,45 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
     format!("{TOOL_BULLET_STYLE}●{STYLE_RESET} {TOOL_TITLE_STYLE}{title}{STYLE_RESET}({detail})")
 }
 
+/// One line for a COM call: action, object, ProgID and member path, or the
+/// script it runs.
+fn com_summary(input: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+    let field = |key: &str| parsed.get(key).and_then(serde_json::Value::as_str);
+    let mut parts = vec![field("action").unwrap_or("?").to_string()];
+    if let Some(object) = field("object") {
+        parts.push(match field("path") {
+            Some(path) => format!("{object}.{path}"),
+            None => object.to_string(),
+        });
+    }
+    for key in ["prog_id", "filter", "script"] {
+        if let Some(value) = field(key) {
+            parts.push(truncate_for_summary(value, 120));
+        }
+    }
+    parts.join(" ")
+}
+
+/// One line for an X11 call: its action and what it acts on.
+fn x11_summary(input: &str) -> String {
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or_default();
+    let field = |key: &str| parsed.get(key).filter(|value| !value.is_null());
+    let mut parts = vec![field("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?")
+        .to_string()];
+    for key in ["window", "command", "keys", "text", "x", "y", "direction"] {
+        if let Some(value) = field(key) {
+            let shown = value
+                .as_str()
+                .map_or_else(|| value.to_string(), |text| format!("{text:?}"));
+            parts.push(format!("{key}={}", truncate_for_summary(&shown, 80)));
+        }
+    }
+    parts.join(" ")
+}
+
 /// The capitalised name Claude Code shows for a tool (`bash` -> `Bash`).
 fn tool_display_title(label: &str) -> String {
     match label {
@@ -14346,6 +15057,16 @@ fn tool_call_parts<'a>(name: &'a str, input: &str) -> (&'a str, String) {
                 .unwrap_or("?")
                 .to_string(),
         ),
+        "X11" | "x11" => ("x11", x11_summary(input)),
+        "COM" | "com" => ("com", com_summary(input)),
+        "Download" | "download" => (
+            "download",
+            parsed
+                .get("url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?")
+                .to_string(),
+        ),
         _ => (name, summarize_tool_payload(input)),
     };
     (label, detail)
@@ -14384,6 +15105,8 @@ fn format_tool_result_body(name: &str, output: &str, is_error: bool) -> String {
         "glob_search" | "Glob" => format_glob_result(&parsed),
         "grep_search" | "Grep" => format_grep_result(&parsed),
         "TodoWrite" | "todo_write" => format_todo_result(&parsed),
+        "ReportFindings" => format_findings_result(&parsed),
+        "SendUserFile" => format_user_files_result(&parsed),
         _ => format_generic_tool_result(&parsed),
     }
 }
@@ -14571,87 +15294,198 @@ fn format_write_result(parsed: &serde_json::Value) -> String {
         .get("content")
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    let verb = if kind == "create" { "Wrote" } else { "Updated" };
-    let header = result_block(
-        &format!("{verb} {path} ({} lines)", content.lines().count()),
-        TOOL_ADDED_STYLE,
-    );
-    if content.trim().is_empty() {
-        return header;
+    if kind == "create" {
+        // Like Claude Code: the line count, then the start of the file.
+        let header = result_block(
+            &format!("Wrote {} lines to {path}", content.lines().count()),
+            TOOL_DIM_STYLE,
+        );
+        if content.trim().is_empty() {
+            return header;
+        }
+        let preview = diff_view::Hunk {
+            old_start: 0,
+            new_start: 1,
+            lines: content.lines().map(|line| format!(" {line}")).collect(),
+        };
+        return format!(
+            "{header}\n{}",
+            inline_diff_rows(&[preview], &path, WRITE_DISPLAY_MAX_LINES)
+        );
     }
-    let preview = truncate_output_for_display(content, WRITE_DISPLAY_MAX_LINES, 2_000);
-    format!("{header}\n{}", result_block(&preview, ""))
+    format_patch_result(parsed, &path, false)
 }
 
-/// A diff line with its background across the whole row: red for removed,
-/// green for added, dim for context.
-fn diff_line(line: &str) -> String {
-    match line.chars().next() {
-        Some('+') => format!("\x1b[48;5;22m\x1b[38;5;255m{line}\x1b[K{STYLE_RESET}"),
-        Some('-') => format!("\x1b[48;5;52m\x1b[38;5;255m{line}\x1b[K{STYLE_RESET}"),
-        _ => format!("{TOOL_DIM_STYLE}{line}{STYLE_RESET}"),
-    }
-}
-
-/// `Updated path (+3 -1)` and the diff, from the structured patch when the
-/// tool returned one, otherwise from the old and new strings.
+/// `Added 3 lines, removed 1 line` and the numbered, coloured diff, from
+/// the structured patch when the tool returned one, otherwise from the old
+/// and new strings.
 fn format_edit_result(parsed: &serde_json::Value) -> String {
     let path = extract_tool_path(parsed);
+    let replace_all = parsed
+        .get("replaceAll")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    format_patch_result(parsed, &path, replace_all)
+}
+
+fn format_patch_result(parsed: &serde_json::Value, path: &str, replace_all: bool) -> String {
     let text = |key: &str| {
         parsed
             .get(key)
             .and_then(|value| value.as_str())
             .unwrap_or_default()
     };
-    let mut lines = parsed
+    let mut hunks = parsed
         .get("structuredPatch")
-        .and_then(serde_json::Value::as_array)
-        .map(|hunks| {
-            hunks
-                .iter()
-                .filter_map(|hunk| hunk.get("lines").and_then(serde_json::Value::as_array))
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
+        .map(diff_view::Hunk::from_structured_patch)
         .unwrap_or_default();
-    if lines.is_empty() {
-        lines = text("oldString")
-            .lines()
-            .map(|line| format!("-{line}"))
-            .chain(text("newString").lines().map(|line| format!("+{line}")))
-            .collect();
+    if hunks.iter().all(|hunk| hunk.lines.is_empty()) && !text("oldString").is_empty() {
+        hunks = vec![diff_view::Hunk {
+            old_start: 1,
+            new_start: 1,
+            lines: text("oldString")
+                .lines()
+                .map(|line| format!("-{line}"))
+                .chain(text("newString").lines().map(|line| format!("+{line}")))
+                .collect(),
+        }];
     }
-    let added = lines.iter().filter(|line| line.starts_with('+')).count();
-    let removed = lines.iter().filter(|line| line.starts_with('-')).count();
-    let replace_all = parsed
-        .get("replaceAll")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let (added, removed) = diff_view::line_counts(&hunks);
     let header = result_block(
         &format!(
-            "Updated {path} (+{added} -{removed}){}",
+            "{}{}",
+            diff_view::change_summary(added, removed),
             if replace_all { ", all occurrences" } else { "" }
         ),
-        TOOL_ADDED_STYLE,
+        TOOL_DIM_STYLE,
     );
-    let mut shown = lines
-        .iter()
-        .take(DIFF_DISPLAY_MAX_LINES)
-        .map(|line| format!("{TOOL_DIM_STYLE}  | {STYLE_RESET}{}", diff_line(line)))
-        .collect::<Vec<_>>();
-    if lines.len() > DIFF_DISPLAY_MAX_LINES {
-        shown.push(result_block(
-            &format!("... +{} lines", lines.len() - DIFF_DISPLAY_MAX_LINES),
-            TOOL_DIM_STYLE,
+    if hunks.is_empty() {
+        return header;
+    }
+    format!(
+        "{header}\n{}",
+        inline_diff_rows(&hunks, path, DIFF_DISPLAY_MAX_LINES)
+    )
+}
+
+/// Diff rows under a tool line, as wide as the conversation. The padding
+/// is no-break spaces: the margin writer drops trailing plain spaces, and
+/// the coloured backgrounds must run to the end of the row.
+fn inline_diff_rows(hunks: &[diff_view::Hunk], path: &str, max_rows: usize) -> String {
+    let width = diff_panel::output_cols_with_panel()
+        .unwrap_or(100)
+        .saturating_sub(2 * render::OUTPUT_MARGIN)
+        .max(40);
+    diff_view::render(
+        hunks,
+        diff_view::Layout {
+            width,
+            indent: RESULT_PREFIX.len(),
+            path,
+            max_rows: Some(max_rows),
+        },
+    )
+    .iter()
+    .map(|row| keep_trailing_spaces(row))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+/// Turns the spaces at the end of `row` (before its final reset) into
+/// no-break spaces.
+fn keep_trailing_spaces(row: &str) -> String {
+    let body = row.strip_suffix(STYLE_RESET).unwrap_or(row);
+    let kept = body.trim_end_matches(' ');
+    let padding = body.len() - kept.len();
+    format!("{kept}{}{STYLE_RESET}", "\u{a0}".repeat(padding))
+}
+
+/// Review findings as a numbered list: where, what, and how it fails.
+fn format_findings_result(parsed: &serde_json::Value) -> String {
+    let findings = parsed
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if findings.is_empty() {
+        return result_block("No findings", TOOL_DIM_STYLE);
+    }
+    let text = |finding: &serde_json::Value, key: &str| {
+        finding
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut lines = vec![result_block(
+        &format!(
+            "{} finding{}",
+            findings.len(),
+            if findings.len() == 1 { "" } else { "s" }
+        ),
+        TOOL_DIM_STYLE,
+    )];
+    for (index, finding) in findings.iter().enumerate() {
+        let location = match finding.get("line").and_then(serde_json::Value::as_i64) {
+            Some(line) => format!("{}:{line}", text(finding, "file")),
+            None => text(finding, "file"),
+        };
+        let tags: Vec<String> = ["category", "verdict", "outcome"]
+            .iter()
+            .map(|key| text(finding, key))
+            .filter(|tag| !tag.is_empty())
+            .collect();
+        let tags = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" {TOOL_DIM_STYLE}[{}]{STYLE_RESET}", tags.join(", "))
+        };
+        lines.push(format!(
+            "{RESULT_PREFIX}{}. \x1b[1m{location}\x1b[0m{tags}",
+            index + 1
+        ));
+        lines.push(format!("{RESULT_PREFIX}   {}", text(finding, "summary")));
+        lines.push(format!(
+            "{RESULT_PREFIX}   {TOOL_DIM_STYLE}fails when: {}{STYLE_RESET}",
+            text(finding, "failure_scenario")
         ));
     }
-    if shown.is_empty() {
-        header
-    } else {
-        format!("{header}\n{}", shown.join("\n"))
+    lines.join("\n")
+}
+
+/// Files handed to the user: path, size, and whether they were opened.
+fn format_user_files_result(parsed: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(caption) = parsed.get("caption").and_then(serde_json::Value::as_str) {
+        lines.push(result_block(caption, ""));
     }
+    for file in parsed
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = file
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let bytes = file
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let opened = file
+            .get("opened")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        lines.push(result_block(
+            &format!(
+                "→ {path} ({bytes} bytes){}",
+                if opened { ", opened" } else { "" }
+            ),
+            TOOL_ADDED_STYLE,
+        ));
+    }
+    lines.join("\n")
 }
 
 fn format_glob_result(parsed: &serde_json::Value) -> String {
@@ -14908,6 +15742,13 @@ fn response_to_events(
         }
     }
 
+    if response
+        .stop_reason
+        .as_deref()
+        .is_some_and(runtime::is_output_limit_stop_reason)
+    {
+        events.push(AssistantEvent::OutputLimitReached);
+    }
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     Ok(events)
@@ -14945,6 +15786,11 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// The previous call (name, input, result) and how many times in a row
+    /// it came back unchanged, so a model stuck repeating it gets told.
+    last_call: Mutex<Option<(String, String, String, usize)>>,
+    /// The model the results go to; sizes `read_file` pages to its window.
+    model: Option<String>,
 }
 
 impl CliToolExecutor {
@@ -14960,7 +15806,46 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            last_call: Mutex::new(None),
+            model: None,
         }
+    }
+
+    fn with_model(mut self, model: &str) -> Self {
+        self.model = Some(model.to_string());
+        self
+    }
+
+    /// Appends a note when this exact call returned this exact result last
+    /// time too. Small local models otherwise re-issue a call whose output
+    /// they misread (e.g. a truncated file) until the turn runs out.
+    fn note_repeated_call(&self, tool_name: &str, input: &str, output: String) -> String {
+        let Ok(mut last) = self.last_call.lock() else {
+            return output;
+        };
+        let repeats = match last.as_ref() {
+            Some((name, last_input, last_output, count))
+                if name == tool_name && last_input == input && *last_output == output =>
+            {
+                count + 1
+            }
+            _ => 0,
+        };
+        *last = Some((
+            tool_name.to_string(),
+            input.to_string(),
+            output.clone(),
+            repeats,
+        ));
+        if repeats == 0 {
+            return output;
+        }
+        format!(
+            "{output}\n\n[note: this is the same call with the same result as your previous \
+             {} call(s). Repeating it will not return anything new: use what you already have, \
+             change the arguments (e.g. offset/limit), or try a different approach.]",
+            repeats
+        )
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -15057,6 +15942,10 @@ impl CliToolExecutor {
         input: &str,
         result: Result<String, ToolError>,
     ) -> Result<String, ToolError> {
+        match &result {
+            Ok(output) => desktop_agent::emit_tool_result(tool_name, output, false),
+            Err(error) => desktop_agent::emit_tool_result(tool_name, &error.to_string(), true),
+        }
         if self.emit_output {
             runtime::turn_keys::screen::focus_write(
                 format!(
@@ -15071,9 +15960,20 @@ impl CliToolExecutor {
                 if self.emit_output {
                     render::print_with_margins(&format_tool_result(tool_name, &output, false));
                 }
-                Ok(cap_tool_result_for_model(tool_result_for_model(
-                    tool_name, output,
-                )))
+                if matches!(
+                    tool_name,
+                    "write_file" | "Write" | "edit_file" | "Edit" | "NotebookEdit"
+                ) {
+                    diff_panel::refresh();
+                }
+                // read_file pages itself at line boundaries, sized to the
+                // model's window; the flat cap would cut it mid-line again.
+                let for_model = if matches!(tool_name, "read_file" | "Read") {
+                    read_file_result_for_model(output, read_file_budget(self.model.as_deref()))
+                } else {
+                    cap_tool_result_for_model(tool_result_for_model(tool_name, output))
+                };
+                Ok(self.note_repeated_call(tool_name, input, for_model))
             }
             Err(error) => {
                 if self.emit_output {
@@ -15148,6 +16048,13 @@ impl ToolExecutor for CliToolExecutor {
         self.check_allowed(tool_name)?;
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if tool_name == "AskUserQuestion" && desktop_agent::is_active() {
+            return self.report_result(
+                tool_name,
+                input,
+                desktop_agent::ask_user(&value).map_err(ToolError::new),
+            );
+        }
         if tool_name == "AskUserQuestion" && self.emit_output {
             // The picker shows the question and the answer itself.
             runtime::turn_keys::begin_tool("Waiting for your answer");
@@ -15176,6 +16083,148 @@ impl ToolExecutor for CliToolExecutor {
 
 /// WebFetch's page text as plain text with the HTTP status, instead of a JSON
 /// string whose every newline is an escaped `\n`.
+/// Smallest and largest `read_file` page, in characters.
+const MIN_READ_FILE_PAGE_CHARS: usize = 4_000;
+const MAX_READ_FILE_PAGE_CHARS: usize = 100_000;
+
+/// How many characters one `read_file` result may hold; `None` sends files
+/// whole. Only capped when `CLAW_TOOL_RESULT_MAX_CHARS` is set (the local
+/// launcher sets it). Then a page is about a quarter of the model's window
+/// (a token is roughly 4 characters), so a large-context machine reads a
+/// whole source file at once instead of in 12k pieces; without a known
+/// window it falls back to `CLAW_TOOL_RESULT_MAX_CHARS`.
+fn read_file_budget(model: Option<&str>) -> Option<usize> {
+    read_file_budget_from(
+        tool_result_max_chars(),
+        model.and_then(known_context_window),
+    )
+}
+
+fn read_file_budget_from(configured: Option<usize>, window_tokens: Option<u32>) -> Option<usize> {
+    let configured = configured?;
+    Some(window_tokens.map_or(configured, |window| {
+        (window as usize).clamp(MIN_READ_FILE_PAGE_CHARS, MAX_READ_FILE_PAGE_CHARS)
+    }))
+}
+
+/// `CLAW_TOOL_RESULT_MAX_CHARS`, when set to a positive number.
+fn tool_result_max_chars() -> Option<usize> {
+    env::var("CLAW_TOOL_RESULT_MAX_CHARS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|max| *max > 0)
+}
+
+/// Sends a text `read_file` result as plain text with a line-range header
+/// instead of escaped JSON. When `max_chars` would cut the file, it is cut
+/// at a line boundary and the model is told the exact `offset` to continue
+/// from; a mid-line cut of the JSON left models unsure where they were, and
+/// they re-read the whole file again and again.
+fn read_file_result_for_model(output: String, max_chars: Option<usize>) -> String {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return output;
+    };
+    let file = &parsed["file"];
+    let (Some("text"), Some(path), Some(content)) = (
+        parsed["type"].as_str(),
+        file["filePath"].as_str(),
+        file["content"].as_str(),
+    ) else {
+        return output;
+    };
+    let as_usize = |key: &str| file[key].as_u64().map_or(0, |n| n as usize);
+    let (start_line, total_lines) = (as_usize("startLine").max(1), as_usize("totalLines"));
+    if content.is_empty() {
+        return if start_line > total_lines && total_lines > 0 {
+            format!(
+                "[{path}: offset {} is past the end; the file has {total_lines} lines. \
+                 offset is a 0-based line number, not a character position.]",
+                start_line - 1
+            )
+        } else {
+            format!("[{path}: empty]")
+        };
+    }
+    // Leave room for the header and the continuation hint.
+    let budget = max_chars.map(|max| max.saturating_sub(300).max(1));
+    let mut shown = String::new();
+    let mut shown_lines = 0;
+    for line in content.split('\n') {
+        if budget.is_some_and(|budget| shown_lines > 0 && shown.len() + line.len() + 1 > budget) {
+            break;
+        }
+        shown.push_str(line);
+        shown.push('\n');
+        shown_lines += 1;
+    }
+    let end_line = start_line + shown_lines - 1;
+    let mut text = format!("[{path}: lines {start_line}-{end_line} of {total_lines}]\n{shown}");
+    if end_line < total_lines {
+        text.push_str(&format!(
+            "[{} more lines not shown. Continue with read_file offset={end_line}, \
+             or grep_search for what you need.]",
+            total_lines - end_line
+        ));
+    }
+    text
+}
+
+/// Sends an `edit_file`/`write_file` result as a short diff. The JSON
+/// carries the whole original file (and for writes the new content too),
+/// which on a small context window cost thousands of tokens per edit.
+fn file_change_result_for_model(output: String) -> String {
+    const MAX_DIFF_LINES: usize = 80;
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
+        return output;
+    };
+    let (Some(path), Some(hunks)) = (
+        parsed["filePath"].as_str(),
+        parsed["structuredPatch"].as_array(),
+    ) else {
+        return output;
+    };
+    let verb = match parsed["type"].as_str() {
+        Some("create") => "Created",
+        Some("update") => "Wrote",
+        _ => "Edited",
+    };
+    let mut text = format!("{verb} {path}");
+    if hunks.is_empty() {
+        text.push_str(" (no changes)");
+        return text;
+    }
+    let mut shown = 0;
+    let mut hidden = 0;
+    for hunk in hunks {
+        let lines = hunk["lines"].as_array().map_or(&[][..], Vec::as_slice);
+        if shown >= MAX_DIFF_LINES {
+            hidden += lines.len();
+            continue;
+        }
+        let number = |key: &str| hunk[key].as_u64().unwrap_or(0);
+        text.push_str(&format!(
+            "\n@@ -{},{} +{},{} @@",
+            number("oldStart"),
+            number("oldLines"),
+            number("newStart"),
+            number("newLines")
+        ));
+        for line in lines {
+            if shown >= MAX_DIFF_LINES {
+                hidden += 1;
+                continue;
+            }
+            text.push('\n');
+            text.push_str(line.as_str().unwrap_or_default());
+            shown += 1;
+        }
+    }
+    if hidden > 0 {
+        text.push_str(&format!("\n[{hidden} more diff lines not shown]"));
+    }
+    text
+}
+
 fn web_fetch_result_for_model(output: String) -> String {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
         return output;
@@ -15231,6 +16280,12 @@ fn tool_result_for_model(tool_name: &str, output: String) -> String {
         "bash" | "Bash" => {}
         "WebFetch" | "web_fetch" => return web_fetch_result_for_model(output),
         "WebSearch" | "web_search" => return web_search_result_for_model(output),
+        "read_file" | "Read" => {
+            return read_file_result_for_model(output, tool_result_max_chars());
+        }
+        "edit_file" | "Edit" | "write_file" | "Write" => {
+            return file_change_result_for_model(output);
+        }
         _ => return output,
     }
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&output) else {
@@ -15278,11 +16333,7 @@ fn tool_result_for_model(tool_name: &str, output: String) -> String {
 /// `CLAW_TOOL_RESULT_MAX_CHARS` (unset: no cap), so a large file or command
 /// output cannot overflow a small local model's context window.
 fn cap_tool_result_for_model(output: String) -> String {
-    let Some(max_chars) = env::var("CLAW_TOOL_RESULT_MAX_CHARS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|max| *max > 0)
-    else {
+    let Some(max_chars) = tool_result_max_chars() else {
         return output;
     };
     if output.len() <= max_chars {
@@ -15301,13 +16352,68 @@ fn cap_tool_result_for_model(output: String) -> String {
     )
 }
 
+/// Records the current folder in `~/.claw/workspaces.txt` (once), so the
+/// desktop app can list sessions started here from the terminal.
+fn remember_workspace() {
+    let Ok(cwd) = env::current_dir() else { return };
+    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    let path = runtime::default_config_home().join("workspaces.txt");
+    let known = fs::read_to_string(&path).unwrap_or_default();
+    let line = cwd.display().to_string();
+    if known.lines().any(|known| known == line) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// `claw desktop`: starts the desktop app (`claw-desktop`, installed next to
+/// the claw binary or on PATH) detached from this terminal.
+fn launch_desktop_app() -> Result<(), Box<dyn std::error::Error>> {
+    let beside = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("claw-desktop")))
+        .filter(|path| path.is_file());
+    let program = beside.unwrap_or_else(|| PathBuf::from("claw-desktop"));
+    let mut command = std::process::Command::new(&program);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Its own session, so closing the terminal does not close the app.
+        command.process_group(0);
+    }
+    command.spawn().map_err(|error| {
+        format!(
+            "could not start {}: {error}. Install it with scripts/install-claw.sh",
+            program.display()
+        )
+    })?;
+    println!("Started claw desktop.");
+    Ok(())
+}
+
 fn permission_policy(
     mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     tool_registry: &GlobalToolRegistry,
 ) -> Result<PermissionPolicy, String> {
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
-        PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
+        PermissionPolicy::new(mode)
+            .with_permission_rules(feature_config.permission_rules())
+            .with_sandbox_enabled(
+                feature_config
+                    .sandbox()
+                    .resolve_request(None, None, None, None, None)
+                    .enabled,
+            ),
         |policy, (name, required_permission)| {
             policy.with_tool_requirement(name, required_permission)
         },
@@ -15585,8 +16691,77 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// One lock for tests that change process-wide state (environment
+/// variables, the current directory). It is re-entrant: a test holding it
+/// can call helpers that take it again. Separate locks for the environment
+/// and the current directory let such tests interleave, so a parser test
+/// could read another test's temporary project.
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::thread::ThreadId;
+
+    /// The owning thread and how many guards it holds.
+    static STATE: Mutex<(Option<ThreadId>, usize)> = Mutex::new((None, 0));
+    static FREED: Condvar = Condvar::new();
+
+    pub(crate) struct Guard(());
+
+    pub(crate) fn lock() -> Guard {
+        let me = std::thread::current().id();
+        let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.0.is_some_and(|owner| owner != me) {
+            state = FREED.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        state.0 = Some(me);
+        state.1 += 1;
+        Guard(())
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+            state.1 -= 1;
+            if state.1 == 0 {
+                state.0 = None;
+                FREED.notify_all();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn context_window_comes_from_the_window_not_the_request() {
+        let llama = "api returned 400 Bad Request (exceed_context_size_error): request \
+                     (40010 tokens) exceeds the available context size (16384 tokens), try increasing it";
+        assert_eq!(
+            super::extract_context_window_tokens_from_error(llama),
+            Some(16384)
+        );
+        let openai = "This model's maximum context length is 8192 tokens.";
+        assert_eq!(
+            super::extract_context_window_tokens_from_error(openai),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn overflow_tool_result_limit_scales_with_the_window() {
+        use super::overflow_tool_result_limit_from as limit;
+        // Known window: a quarter of it, in characters.
+        assert_eq!(limit(None, Some(16_384), 40_000), Some(16_384));
+        assert_eq!(limit(None, Some(1_000_000), 1_200_000), Some(1_000_000));
+        // Unknown window: bounded by the request that overflowed.
+        assert_eq!(limit(None, None, 300_000), Some(300_000));
+        assert_eq!(limit(None, None, 100), Some(2_000));
+        // The user's setting wins, in either direction.
+        assert_eq!(limit(Some("64k"), Some(16_384), 40_000), Some(64_000));
+        assert_eq!(limit(Some("off"), Some(16_384), 40_000), None);
+        assert_eq!(limit(Some("junk"), Some(16_384), 40_000), Some(16_384));
+    }
+
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
@@ -15911,17 +17086,62 @@ mod tests {
         );
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn env_lock() -> crate::test_lock::Guard {
+        crate::test_lock::lock()
+    }
+
+    /// An empty home and config home and an empty project folder as the
+    /// current directory while it lives, so the developer's own settings
+    /// (`~/.claw`, `~/.claw.json`, `~/.config/claw`) and the repository's
+    /// cannot change what a test parses. Holds the test lock.
+    struct CleanConfig {
+        _lock: crate::test_lock::Guard,
+        root: PathBuf,
+        previous_cwd: PathBuf,
+        home: Option<std::ffi::OsString>,
+        config_home: Option<std::ffi::OsString>,
+    }
+
+    impl CleanConfig {
+        fn enter() -> Self {
+            let lock = env_lock();
+            let root = temp_dir();
+            let home = root.join("home");
+            let project = root.join("project");
+            fs::create_dir_all(home.join(".claw")).expect("clean home");
+            fs::create_dir_all(&project).expect("clean project");
+            let guard = Self {
+                _lock: lock,
+                previous_cwd: std::env::current_dir().expect("cwd"),
+                home: std::env::var_os("HOME"),
+                config_home: std::env::var_os("CLAW_CONFIG_HOME"),
+                root,
+            };
+            std::env::set_var("HOME", &home);
+            std::env::set_var("CLAW_CONFIG_HOME", home.join(".claw"));
+            std::env::set_current_dir(&project).expect("enter clean project");
+            guard
+        }
+    }
+
+    impl Drop for CleanConfig {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous_cwd);
+            for (name, value) in [
+                ("HOME", &self.home),
+                ("CLAW_CONFIG_HOME", &self.config_home),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     fn with_current_dir<T>(cwd: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = env_lock();
         let previous = std::env::current_dir().expect("cwd should load");
         std::env::set_current_dir(cwd).expect("cwd should change");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
@@ -15986,6 +17206,7 @@ mod tests {
     }
     #[test]
     fn defaults_to_repl_when_no_args() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
@@ -15997,6 +17218,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                resume: None,
             }
         );
     }
@@ -16112,6 +17334,7 @@ mod tests {
 
     #[test]
     fn parses_prompt_subcommand() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
@@ -16201,6 +17424,7 @@ mod tests {
 
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
@@ -16228,6 +17452,7 @@ mod tests {
 
     #[test]
     fn parses_dash_prefixed_prompt_text_434() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
 
@@ -16289,6 +17514,7 @@ mod tests {
 
     #[test]
     fn parses_compact_flag_for_prompt_mode() {
+        let _clean = CleanConfig::enter();
         // given a bare prompt invocation that includes the --compact flag
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
@@ -16352,6 +17578,7 @@ mod tests {
 
     #[test]
     fn resolves_model_aliases_in_args() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
@@ -16460,6 +17687,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                resume: None,
             }
         );
     }
@@ -16481,6 +17709,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                resume: None,
             }
         );
     }
@@ -16517,6 +17746,7 @@ mod tests {
 
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
@@ -16538,6 +17768,7 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+                resume: None,
             }
         );
     }
@@ -16641,11 +17872,12 @@ mod tests {
     }
 
     #[test]
-    fn removed_login_and_logout_subcommands_error_helpfully() {
-        let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
-        assert!(login.contains("ANTHROPIC_API_KEY"));
-        let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
-        assert!(logout.contains("ANTHROPIC_AUTH_TOKEN"));
+    fn login_and_logout_subcommands_point_to_the_repl_commands() {
+        let _clean = CleanConfig::enter();
+        let login = parse_args(&["login".to_string()]).expect_err("login is a REPL command");
+        assert!(login.contains("/login"), "{login}");
+        let logout = parse_args(&["logout".to_string()]).expect_err("logout is a REPL command");
+        assert!(logout.contains("/logout"), "{logout}");
         assert_eq!(
             parse_args(&["doctor".to_string()]).expect("doctor should parse"),
             CliAction::Doctor {
@@ -17437,6 +18669,7 @@ mod tests {
 
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
@@ -18155,6 +19388,7 @@ mod tests {
 
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
+        let _clean = CleanConfig::enter();
         let _guard = env_lock();
         let _cwd_guard = cwd_guard();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
@@ -18388,6 +19622,7 @@ mod tests {
 
     #[test]
     fn prompt_subcommand_allows_literal_typo_word() {
+        let _clean = CleanConfig::enter();
         assert_eq!(
             parse_args(&["prompt".to_string(), "doctorr".to_string()])
                 .expect("explicit prompt subcommand should allow literal typo word"),
@@ -18407,6 +19642,7 @@ mod tests {
 
     #[test]
     fn punctuation_bearing_single_token_still_dispatches_to_prompt() {
+        let _clean = CleanConfig::enter();
         // #140: Guard against test pollution — isolate cwd + env so this test
         // doesn't pick up a stale .claw/settings.json from other tests that
         // may have set `permissionMode: acceptEdits` in a shared cwd.
@@ -18647,12 +19883,16 @@ mod tests {
         assert!(help.contains("/status"));
         assert!(help.contains("/sandbox"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains(
+            "/permissions [read-only|workspace-write|danger-full-access|list|add|remove allow|ask|deny <rule>]"
+        ));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/config [key=value ...|edit|env|hooks|model|plugins]"));
+        assert!(
+            help.contains("/mcp [list|show <server>|enable|disable|reconnect [<server>|all]|help]")
+        );
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -19922,15 +21162,8 @@ UU conflicted.rs",
         assert!(usage.contains("/session list"));
     }
 
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn cwd_guard() -> MutexGuard<'static, ()> {
-        cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn cwd_guard() -> crate::test_lock::Guard {
+        crate::test_lock::lock()
     }
 
     #[test]
@@ -19955,9 +21188,7 @@ UU conflicted.rs",
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = cwd_guard();
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let rendered = crate::init::render_init_claude_md(&workspace_root);
         assert!(rendered.contains("# CLAUDE.md"));
@@ -20195,6 +21426,104 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn read_file_results_are_cut_at_lines_with_a_continue_offset() {
+        let content = (1..=100)
+            .map(|n| format!("line {n} {}", "x".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output = serde_json::json!({
+            "type": "text",
+            "file": {"filePath": "/w/a.cpp", "content": content, "numLines": 100,
+                     "startLine": 1, "totalLines": 100}
+        })
+        .to_string();
+
+        let full = super::read_file_result_for_model(output.clone(), None);
+        assert!(full.starts_with("[/w/a.cpp: lines 1-100 of 100]\nline 1 "));
+        assert!(!full.contains("more lines not shown"));
+
+        let cut = super::read_file_result_for_model(output, Some(1000));
+        assert!(cut.len() <= 1000);
+        let header = cut.lines().next().unwrap();
+        let end: usize = header
+            .trim_end_matches(" of 100]")
+            .rsplit('-')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(cut.contains(&format!("line {end} ")));
+        assert!(!cut.contains(&format!("line {} ", end + 1)));
+        assert!(cut.contains(&format!("Continue with read_file offset={end}")));
+
+        let past_end = serde_json::json!({
+            "type": "text",
+            "file": {"filePath": "/w/a.cpp", "content": "", "numLines": 0,
+                     "startLine": 636, "totalLines": 635}
+        })
+        .to_string();
+        assert!(super::read_file_result_for_model(past_end, Some(1000))
+            .contains("the file has 635 lines"));
+    }
+
+    #[test]
+    fn read_file_pages_scale_with_the_context_window() {
+        use super::read_file_budget_from as budget;
+        // Unset cap (hosted models): files are sent whole, whatever the window.
+        assert_eq!(budget(None, Some(32_768)), None);
+        // Unknown window: the flat cap.
+        assert_eq!(budget(Some(12_000), None), Some(12_000));
+        // About a quarter of the window, so a 25 KB file fits a 32k model in one read.
+        assert_eq!(budget(Some(12_000), Some(32_768)), Some(32_768));
+        assert_eq!(budget(Some(12_000), Some(2_048)), Some(4_000));
+        assert_eq!(budget(Some(12_000), Some(1_000_000)), Some(100_000));
+    }
+
+    #[test]
+    fn file_changes_reach_the_model_as_a_short_diff() {
+        let output = serde_json::json!({
+            "filePath": "/w/a.cpp",
+            "oldString": "b",
+            "newString": "B",
+            "originalFile": "a\nb\nc\n".repeat(1000),
+            "structuredPatch": [{"oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 3,
+                                 "lines": [" a", "-b", "+B", " c"]}],
+            "userModified": false,
+            "replaceAll": false,
+            "gitDiff": null
+        })
+        .to_string();
+        assert_eq!(
+            super::tool_result_for_model("edit_file", output),
+            "Edited /w/a.cpp\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c"
+        );
+        let created = serde_json::json!({
+            "type": "create", "filePath": "/w/new.txt", "content": "x",
+            "structuredPatch": [{"oldStart": 0, "oldLines": 0, "newStart": 1, "newLines": 1,
+                                 "lines": ["+x"]}],
+            "originalFile": null, "gitDiff": null
+        })
+        .to_string();
+        assert!(
+            super::tool_result_for_model("write_file", created).starts_with("Created /w/new.txt")
+        );
+    }
+
+    #[test]
+    fn repeating_the_same_call_with_the_same_result_is_flagged() {
+        let executor =
+            super::CliToolExecutor::new(None, false, super::GlobalToolRegistry::builtin(), None);
+        let first = executor.note_repeated_call("read_file", "{\"path\":\"a\"}", "out".into());
+        assert_eq!(first, "out");
+        let second = executor.note_repeated_call("read_file", "{\"path\":\"a\"}", "out".into());
+        assert!(second.contains("same call with the same result as your previous 1 call"));
+        let third = executor.note_repeated_call("read_file", "{\"path\":\"a\"}", "out".into());
+        assert!(third.contains("previous 2 call"));
+        let changed = executor.note_repeated_call("read_file", "{\"path\":\"a\"}", "new".into());
+        assert_eq!(changed, "new");
+    }
+
+    #[test]
     fn tool_results_for_the_model_are_capped_when_configured() {
         let _guard = env_lock();
         let original = std::env::var("CLAW_TOOL_RESULT_MAX_CHARS").ok();
@@ -20217,6 +21546,33 @@ UU conflicted.rs",
             Some(value) => std::env::set_var("CLAW_TOOL_RESULT_MAX_CHARS", value),
             None => std::env::remove_var("CLAW_TOOL_RESULT_MAX_CHARS"),
         }
+    }
+
+    #[test]
+    fn host_approval_is_separate_and_covers_the_complete_command() {
+        let request = |command: &str, host: bool| runtime::PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: serde_json::json!({"command":command,"dangerouslyDisableSandbox":host})
+                .to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: None,
+        };
+        let a = request("sudo emerge --sync", true);
+        let ordinary = request("sudo emerge --sync", false);
+        let b = request("sudo emerge --sync; printf extra", true);
+        assert_ne!(
+            super::permission_request_approval_key(&a, Some("sudo emerge --sync")),
+            super::permission_request_approval_key(&ordinary, Some("sudo emerge --sync"))
+        );
+        assert_ne!(
+            super::permission_request_approval_key(&a, None),
+            super::permission_request_approval_key(&b, None)
+        );
+        assert_eq!(
+            super::approval_request(&a, Some("sudo emerge --sync"), "exact command").title,
+            "Host command (outside sandbox)"
+        );
     }
 
     #[test]
@@ -21202,11 +22558,8 @@ mod dump_manifests_tests {
 
 #[cfg(test)]
 mod alias_resolution_tests {
-    fn ollama_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("ollama env lock poisoned")
+    fn ollama_env_lock() -> crate::test_lock::Guard {
+        crate::test_lock::lock()
     }
 
     struct EnvVarGuard {

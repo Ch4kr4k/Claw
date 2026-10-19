@@ -23,6 +23,13 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+pub use providers::hosted::{
+    all_hosted_providers, hosted_openai_provider, hosted_openai_provider_for_model, list_models,
+    HostedOpenAiProvider, HOSTED_OPENAI_PROVIDERS,
+};
+pub use providers::local_window::{
+    local_context_window, local_max_output_tokens_for_window, note_local_context_window,
+};
 pub use providers::openai_compat::{
     build_chat_completion_request, check_request_body_size, estimate_request_body_size,
     flatten_tool_result_content, is_reasoning_model, model_rejects_is_error_field,

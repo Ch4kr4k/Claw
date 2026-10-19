@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="70%">
+      <stop offset="0" stop-color="#0d5263"/>
+      <stop offset="0.6" stop-color="#073642"/>
+      <stop offset="1" stop-color="#002b36"/>
+    </radialGradient>
+    <linearGradient id="hair" x1="0" y1="0" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#7b5cd6"/>
+      <stop offset="0.55" stop-color="#5a3fb0"/>
+      <stop offset="1" stop-color="#2f6fd0"/>
+    </linearGradient>
+    <linearGradient id="hairShine" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c9b8ff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#c9b8ff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fde7d6"/>
+      <stop offset="1" stop-color="#f6cdb4"/>
+    </linearGradient>
+    <radialGradient id="iris" cx="50%" cy="40%" r="60%">
+      <stop offset="0" stop-color="#b8fff6"/>
+      <stop offset="0.45" stop-color="#2aa198"/>
+      <stop offset="1" stop-color="#0b4f63"/>
+    </radialGradient>
+    <linearGradient id="phone" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e7eef0"/>
+      <stop offset="1" stop-color="#93a1a1"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="badge"><circle cx="128" cy="128" r="120"/></clipPath>
+  </defs>
+
+  <circle cx="128" cy="128" r="120" fill="url(#bg)"/>
+  <g clip-path="url(#badge)">
+    <!-- circuit traces in the background -->
+    <g stroke="#2aa198" stroke-width="2.2" fill="none" opacity="0.45" stroke-linecap="round">
+      <path d="M18 92 H52 L64 80 H84"/>
+      <path d="M238 92 H204 L192 80 H172"/>
+      <path d="M22 160 H46 L58 172"/>
+      <path d="M234 160 H210 L198 172"/>
+    </g>
+    <g fill="#2aa198" opacity="0.7">
+      <circle cx="84" cy="80" r="3.2"/><circle cx="172" cy="80" r="3.2"/>
+      <circle cx="58" cy="172" r="3.2"/><circle cx="198" cy="172" r="3.2"/>
+    </g>
+
+    <!-- hair, back -->
+    <path d="M58 118 C52 62 92 34 128 34 C164 34 204 62 198 118 C202 170 206 214 214 256 H42 C50 214 54 170 58 118 Z" fill="url(#hair)"/>
+
+    <!-- shoulders / top -->
+    <path d="M60 256 C64 222 90 206 128 206 C166 206 192 222 196 256 Z" fill="#073642"/>
+    <path d="M98 210 L128 236 L158 210" fill="none" stroke="#268bd2" stroke-width="5" stroke-linejoin="round"/>
+    <circle cx="128" cy="236" r="5" fill="#2aa198" filter="url(#glow)"/>
+
+    <!-- neck -->
+    <path d="M112 176 H144 V206 C138 212 118 212 112 206 Z" fill="#f2c4a8"/>
+
+    <!-- face -->
+    <path d="M80 112 C80 78 102 60 128 60 C154 60 176 78 176 112 C176 146 156 180 128 186 C100 180 80 146 80 112 Z" fill="url(#skin)"/>
+
+    <!-- blush -->
+    <ellipse cx="98" cy="146" rx="11" ry="5.5" fill="#f28b9b" opacity="0.45"/>
+    <ellipse cx="158" cy="146" rx="11" ry="5.5" fill="#f28b9b" opacity="0.45"/>
+
+    <!-- eyes -->
+    <g>
+      <path d="M90 118 C96 106 116 104 122 116" fill="none" stroke="#2b1d4f" stroke-width="4" stroke-linecap="round"/>
+      <ellipse cx="106" cy="126" rx="12" ry="14" fill="#ffffff"/>
+      <ellipse cx="106" cy="128" rx="9.5" ry="12" fill="url(#iris)" filter="url(#glow)"/>
+      <ellipse cx="106" cy="129" rx="4.2" ry="6" fill="#06303a"/>
+      <circle cx="102" cy="122" r="3.4" fill="#ffffff"/>
+      <circle cx="110" cy="133" r="1.6" fill="#e6fffb"/>
+
+      <path d="M134 116 C140 104 160 106 166 118" fill="none" stroke="#2b1d4f" stroke-width="4" stroke-linecap="round"/>
+      <ellipse cx="150" cy="126" rx="12" ry="14" fill="#ffffff"/>
+      <ellipse cx="150" cy="128" rx="9.5" ry="12" fill="url(#iris)" filter="url(#glow)"/>
+      <ellipse cx="150" cy="129" rx="4.2" ry="6" fill="#06303a"/>
+      <circle cx="146" cy="122" r="3.4" fill="#ffffff"/>
+      <circle cx="154" cy="133" r="1.6" fill="#e6fffb"/>
+    </g>
+
+    <!-- brows, nose, mouth -->
+    <path d="M94 101 Q105 95 116 99" fill="none" stroke="#4a3590" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M140 99 Q151 95 162 101" fill="none" stroke="#4a3590" stroke-width="2.6" stroke-linecap="round"/>
+    <path d="M128 140 l-2 6 h3" fill="none" stroke="#d9a58a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M118 158 Q128 166 138 158" fill="none" stroke="#c0556a" stroke-width="3" stroke-linecap="round"/>
+
+    <!-- bangs -->
+    <path d="M76 116 C72 70 104 50 130 52 C160 54 184 76 180 116 C172 98 162 86 150 80 C152 92 148 100 142 104 C140 92 134 84 126 80 C124 92 116 100 106 104 C110 94 108 86 104 82 C92 90 82 102 76 116 Z" fill="url(#hair)"/>
+    <path d="M96 66 C110 56 134 54 150 62 C132 62 116 66 104 76 Z" fill="url(#hairShine)"/>
+
+    <!-- side locks -->
+    <path d="M80 112 C74 140 74 168 84 196 C88 170 90 146 88 120 Z" fill="url(#hair)"/>
+    <path d="M176 112 C182 140 182 168 172 196 C168 170 166 146 168 120 Z" fill="url(#hair)"/>
+
+    <!-- headset -->
+    <path d="M70 116 C66 62 98 40 128 40 C158 40 190 62 186 116" fill="none" stroke="url(#phone)" stroke-width="7" stroke-linecap="round"/>
+    <rect x="58" y="104" width="24" height="38" rx="11" fill="url(#phone)"/>
+    <rect x="174" y="104" width="24" height="38" rx="11" fill="url(#phone)"/>
+    <rect x="63" y="112" width="14" height="22" rx="6" fill="#268bd2"/>
+    <rect x="179" y="112" width="14" height="22" rx="6" fill="#268bd2"/>
+    <circle cx="70" cy="123" r="3.4" fill="#b8fff6" filter="url(#glow)"/>
+    <circle cx="186" cy="123" r="3.4" fill="#b8fff6" filter="url(#glow)"/>
+    <!-- mic boom -->
+    <path d="M72 140 C76 162 92 172 110 170" fill="none" stroke="#93a1a1" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="112" cy="170" r="4.5" fill="#2aa198" filter="url(#glow)"/>
+
+    <!-- antenna -->
+    <path d="M178 66 L194 40" stroke="#93a1a1" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="196" cy="37" r="6" fill="#d33682" filter="url(#glow)"/>
+  </g>
+  <circle cx="128" cy="128" r="120" fill="none" stroke="#2aa198" stroke-width="5" opacity="0.85"/>
+</svg>

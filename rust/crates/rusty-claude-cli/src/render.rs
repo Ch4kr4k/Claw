@@ -96,7 +96,7 @@ impl ThemeName {
         }
     }
 
-    fn syntax_theme_name(self) -> &'static str {
+    pub(crate) fn syntax_theme_name(self) -> &'static str {
         match self {
             // syntect bundles no Tokyo Night; Ocean is the closest blue-grey.
             Self::Dark | Self::TokyoNight | Self::None => "base16-ocean.dark",
@@ -415,11 +415,7 @@ enum PrefixState {
 impl<W: Write> MarginWriter<W> {
     /// Margins of [`OUTPUT_MARGIN`] when stdout is a terminal.
     pub fn for_stdout(inner: W) -> Self {
-        let width = runtime::turn_keys::stdout_is_terminal()
-            .then(|| crossterm::terminal::size().ok())
-            .flatten()
-            .map(|(cols, _)| usize::from(cols));
-        Self::with_width(inner, width, OUTPUT_MARGIN)
+        Self::with_width(inner, output_cols(), OUTPUT_MARGIN)
     }
 
     /// `terminal_cols` of `None` passes everything through; `left` is the
@@ -551,8 +547,8 @@ impl<W: Write> MarginWriter<W> {
             sequence.push(ch);
             let done = match sequence.as_bytes() {
                 [0x1b, b'[', .., last] => (0x40..=0x7e).contains(last) && sequence.len() > 2,
-                [0x1b, b']', ..] => ch == '\x07' || sequence.ends_with("\x1b\\"),
-                [0x1b, _] => !matches!(ch, '[' | ']'),
+                [0x1b, b']' | b'_', ..] => ch == '\x07' || sequence.ends_with("\x1b\\"),
+                [0x1b, _] => !matches!(ch, '[' | ']' | '_'),
                 _ => true,
             };
             if done {
@@ -635,6 +631,21 @@ impl<W: Write> Write for MarginWriter<W> {
         }
         self.inner.flush()
     }
+}
+
+/// Columns output can use when stdout is a terminal: the conversation's
+/// width in full-screen mode (less the side panel when it is shown), else
+/// the terminal's.
+#[must_use]
+pub fn output_cols() -> Option<usize> {
+    if !runtime::turn_keys::stdout_is_terminal() {
+        return None;
+    }
+    runtime::turn_keys::screen::conversation_cols().or_else(|| {
+        crossterm::terminal::size()
+            .ok()
+            .map(|(cols, _)| usize::from(cols))
+    })
 }
 
 /// Prints `text` and a newline through a [`MarginWriter`] on stdout.
@@ -785,6 +796,8 @@ struct RenderState {
     list_stack: Vec<ListKind>,
     link_stack: Vec<LinkState>,
     table: Option<TableState>,
+    /// Images seen, drawn after the text on terminals that can.
+    images: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,7 +912,21 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        let mut output = output.trim_end().to_string();
+        if !state.images.is_empty() && crate::term_image::enabled() {
+            let cols = output_cols().map_or(80, |cols| cols.saturating_sub(2 * OUTPUT_MARGIN + 1));
+            for url in &state.images {
+                output.push('\n');
+                match crate::term_image::show(url, cols) {
+                    Ok(image) => output.push_str(&image),
+                    Err(error) => output.push_str(&format!(
+                        "{}",
+                        format!("(image not shown: {error})").with(self.color_theme.quote)
+                    )),
+                }
+            }
+        }
+        output
     }
 
     #[must_use]
@@ -1014,6 +1041,7 @@ impl TerminalRenderer {
                     format!("[image:{dest_url}]").with(self.color_theme.link)
                 );
                 state.append_raw(output, &rendered);
+                state.images.push(dest_url.to_string());
             }
             Event::Start(Tag::Table(alignments)) => {
                 state.table = Some(TableState {

@@ -190,6 +190,33 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     }
 }
 
+/// Cuts every tool result longer than `max_chars` down to its head and a
+/// note. Compaction keeps recent messages word for word, so one huge result
+/// (a whole large file) can overflow a small context window on its own.
+/// Returns how many results were cut.
+pub fn truncate_large_tool_results(session: &mut Session, max_chars: usize) -> usize {
+    let mut cut = 0;
+    for message in &mut session.messages {
+        for block in &mut message.blocks {
+            let ContentBlock::ToolResult { output, .. } = block else {
+                continue;
+            };
+            let total = output.chars().count();
+            if total <= max_chars {
+                continue;
+            }
+            let mut head = output.chars().take(max_chars).collect::<String>();
+            head.push_str(&format!(
+                "\n\n[output cut to {max_chars} of {total} characters to fit the context window; \
+                 read smaller ranges to see the rest]"
+            ));
+            *output = head;
+            cut += 1;
+        }
+    }
+    cut
+}
+
 fn compacted_summary_prefix_len(session: &Session) -> usize {
     usize::from(
         session
@@ -244,6 +271,12 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         lines.push(format!("- Tools mentioned: {}.", tool_names.join(", ")));
     }
 
+    let work_done = collect_work_done(messages);
+    if !work_done.is_empty() {
+        lines.push(WORK_DONE_HEADER.to_string());
+        lines.extend(work_done.into_iter().map(|item| format!("  - {item}")));
+    }
+
     let recent_user_requests = collect_recent_role_summaries(messages, MessageRole::User, 3);
     if !recent_user_requests.is_empty() {
         lines.push("- Recent user requests:".to_string());
@@ -294,27 +327,53 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
         return new_summary.to_string();
     };
 
-    let previous_highlights = extract_summary_highlights(existing_summary);
     let new_formatted_summary = format_compact_summary(new_summary);
-    let new_highlights = extract_summary_highlights(&new_formatted_summary);
     let new_timeline = extract_summary_timeline(&new_formatted_summary);
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
-    // Flatten prior highlights directly — do NOT re-nest them under
-    // "- Previously compacted context:" or the nesting compounds with each
-    // compaction cycle, inflating the summary by ~depth * overhead per turn.
-    if !previous_highlights.is_empty() {
+    // The actions of every compaction so far, oldest first: without them a
+    // model on a small window forgets the edits it made and starts over.
+    let mut work_done = extract_work_done(existing_summary);
+    work_done.extend(extract_work_done(&new_formatted_summary));
+    let skip = work_done.len().saturating_sub(MAX_WORK_DONE_ITEMS);
+    if !work_done.is_empty() {
+        lines.push(WORK_DONE_HEADER.to_string());
         lines.extend(
-            previous_highlights
+            work_done
                 .into_iter()
-                .map(|line| format!("- {line}")),
+                .skip(skip)
+                .map(|item| format!("  - {item}")),
         );
     }
 
-    if !new_highlights.is_empty() {
-        lines.push("- Newly compacted context:".to_string());
-        lines.extend(new_highlights.into_iter().map(|line| format!("  {line}")));
+    // Earlier highlights (user requests, key files, pending work), each
+    // once. Per-chunk bookkeeping (scope, tools, current work) is dropped:
+    // carried forward it piled up with every compaction until the summary
+    // alone filled a small window, and was nested one level deeper each time.
+    let mut highlights = Vec::<String>::new();
+    for line in extract_summary_highlights(existing_summary)
+        .into_iter()
+        .chain(extract_summary_highlights(&new_formatted_summary))
+    {
+        let Some(line) = normalize_highlight(&line) else {
+            continue;
+        };
+        if let Some(position) = highlights.iter().position(|kept| *kept == line) {
+            highlights.remove(position);
+        }
+        highlights.push(line);
+    }
+    let skip = highlights.len().saturating_sub(MAX_CARRIED_HIGHLIGHTS);
+    lines.extend(highlights.into_iter().skip(skip));
+    if let Some(current_work) = extract_summary_highlights(&new_formatted_summary)
+        .iter()
+        .find_map(|line| {
+            line.trim_start_matches(['-', ' '])
+                .strip_prefix("Current work: ")
+        })
+    {
+        lines.push(format!("- Current work: {current_work}"));
     }
 
     if !new_timeline.is_empty() {
@@ -324,6 +383,38 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
 
     lines.push("</summary>".to_string());
     lines.join("\n")
+}
+
+/// The most earlier highlight lines a merged summary carries.
+const MAX_CARRIED_HIGHLIGHTS: usize = 24;
+
+/// A highlight line with however many list markers earlier merges stacked
+/// in front of it reduced to one level; `None` for per-chunk bookkeeping.
+fn normalize_highlight(line: &str) -> Option<String> {
+    let core = line.trim_start_matches(['-', ' ']).trim_end();
+    if core.is_empty()
+        || [
+            "Scope:",
+            "Tools mentioned:",
+            "Current work:",
+            "Newly compacted context:",
+            "Key timeline:",
+        ]
+        .iter()
+        .any(|noise| core.starts_with(noise))
+    {
+        return None;
+    }
+    // Section headers ("Recent user requests:") and one-line entries
+    // ("Key files referenced: …") are top level; the rest are their items.
+    let top_level = core.ends_with(':')
+        || core.starts_with("Key files referenced:")
+        || core.starts_with("Pending work:");
+    Some(if top_level {
+        format!("- {core}")
+    } else {
+        format!("  - {core}")
+    })
 }
 
 /// Rough token cost of one attached image.
@@ -539,12 +630,22 @@ fn extract_existing_compacted_summary(message: &ConversationMessage) -> Option<S
 fn extract_summary_highlights(summary: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut in_timeline = false;
+    let mut in_work_done = false;
 
     for line in format_compact_summary(summary).lines() {
         let trimmed = line.trim_end();
         if trimmed.is_empty() || trimmed == "Summary:" || trimmed == "Conversation summary:" {
             continue;
         }
+        // Carried separately (see `extract_work_done`).
+        if trimmed == WORK_DONE_HEADER {
+            in_work_done = true;
+            continue;
+        }
+        if in_work_done && trimmed.starts_with("  - ") {
+            continue;
+        }
+        in_work_done = false;
         if trimmed == "- Key timeline:" {
             in_timeline = true;
             continue;
@@ -556,6 +657,88 @@ fn extract_summary_highlights(summary: &str) -> Vec<String> {
     }
 
     lines
+}
+
+const WORK_DONE_HEADER: &str = "- Work done so far:";
+/// The most actions a summary lists; older ones are dropped first.
+const MAX_WORK_DONE_ITEMS: usize = 40;
+
+/// One line per tool call: what it was called on and how it came out, e.g.
+/// `edit_file /w/main.cpp: Edited /w/main.cpp` or `bash cmake --build build:
+/// [exit code 0]`.
+fn collect_work_done(messages: &[ConversationMessage]) -> Vec<String> {
+    let mut calls = std::collections::HashMap::new();
+    let mut work = Vec::new();
+    for block in messages.iter().flat_map(|message| message.blocks.iter()) {
+        match block {
+            ContentBlock::ToolUse { id, name, input } => {
+                calls.insert(id.as_str(), (name.as_str(), input.as_str()));
+            }
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } => {
+                let (name, input) = calls
+                    .get(tool_use_id.as_str())
+                    .copied()
+                    .unwrap_or((tool_name.as_str(), ""));
+                let target = tool_call_target(input);
+                let mut lines = output
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty());
+                // Commands end with their exit status; other tools lead with
+                // what they did.
+                let outcome = if matches!(name, "bash" | "Bash") {
+                    lines.next_back()
+                } else {
+                    lines.next()
+                }
+                .unwrap_or("");
+                let outcome = if *is_error {
+                    format!("failed: {outcome}")
+                } else {
+                    outcome.to_string()
+                };
+                work.push(truncate_summary(
+                    &format!("{name} {target}: {outcome}").replace("  ", " "),
+                    220,
+                ));
+            }
+            _ => {}
+        }
+    }
+    work
+}
+
+/// The argument that says what a tool call was about.
+fn tool_call_target(input: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
+        return truncate_summary(input, 100);
+    };
+    let mut target = ["path", "file_path", "command", "pattern", "url", "query"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map_or_else(
+            || truncate_summary(input, 100),
+            |text| truncate_summary(text, 120),
+        );
+    if let Some(offset) = value.get("offset").and_then(serde_json::Value::as_u64) {
+        target.push_str(&format!(" (offset {offset})"));
+    }
+    target.replace('\n', " ")
+}
+
+fn extract_work_done(summary: &str) -> Vec<String> {
+    format_compact_summary(summary)
+        .lines()
+        .skip_while(|line| line.trim_end() != WORK_DONE_HEADER)
+        .skip(1)
+        .take_while(|line| line.starts_with("  - "))
+        .map(|line| line["  - ".len()..].to_string())
+        .collect()
 }
 
 fn extract_summary_timeline(summary: &str) -> Vec<String> {
@@ -587,6 +770,63 @@ mod tests {
         get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+
+    fn tool_call(id: &str, name: &str, input: &str, output: &str) -> Vec<ConversationMessage> {
+        vec![
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: name.to_string(),
+                input: input.to_string(),
+            }]),
+            ConversationMessage::tool_result(id, name, output, false),
+        ]
+    }
+
+    #[test]
+    fn work_done_survives_repeated_compaction() {
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 0,
+        };
+        let mut session = Session::new();
+        session.messages = vec![ConversationMessage::user_text("fix it")];
+        session.messages.extend(tool_call(
+            "1",
+            "edit_file",
+            r#"{"path":"/w/main.cpp","old_string":"a","new_string":"b"}"#,
+            "Edited /w/main.cpp\n@@ -1,1 +1,1 @@\n-a\n+b",
+        ));
+        session
+            .messages
+            .extend(tool_call("2", "read_file", r#"{"path":"/w/x"}"#, "x"));
+        let first = compact_session(&session, config).compacted_session;
+
+        let mut session = first;
+        session.messages.extend(tool_call(
+            "3",
+            "bash",
+            r#"{"command":"cmake --build build"}"#,
+            "[2/2] Linking CXX executable wd\n[exit code 0]",
+        ));
+        session
+            .messages
+            .extend(tool_call("4", "read_file", r#"{"path":"/w/y"}"#, "y"));
+        let second = compact_session(&session, config);
+
+        let summary = &second.summary;
+        let edit = summary
+            .find("  - edit_file /w/main.cpp: Edited /w/main.cpp")
+            .expect("edit survives the second compaction");
+        let build = summary
+            .find("  - bash cmake --build build: [exit code 0]")
+            .expect("build is recorded");
+        assert!(edit < build, "oldest first: {summary}");
+        assert_eq!(summary.matches("- Work done so far:").count(), 1);
+        assert!(
+            !summary.contains("- - "),
+            "no compounding list markers: {summary}"
+        );
+    }
 
     #[test]
     fn formats_compact_summary_like_upstream() {
@@ -703,10 +943,10 @@ mod tests {
         assert!(!second
             .formatted_summary
             .contains("Previously compacted context:"));
-        assert!(second
-            .formatted_summary
-            .contains("Scope: 2 earlier messages compacted"));
-        assert!(second
+        // Per-chunk bookkeeping is not carried forward: it piled up with
+        // every compaction.
+        assert!(!second.formatted_summary.contains("Scope:"));
+        assert!(!second
             .formatted_summary
             .contains("Newly compacted context:"));
         assert!(second
@@ -716,7 +956,7 @@ mod tests {
             &second.compacted_session.messages[0].blocks[0],
             ContentBlock::Text { text }
                 if !text.contains("Previously compacted context:")
-                    && text.contains("Newly compacted context:")
+                    && text.contains("Also update rust/crates/runtime/src/conversation.rs")
         ));
         assert!(matches!(
             &second.compacted_session.messages[1].blocks[0],
@@ -852,5 +1092,28 @@ mod tests {
         ]);
         assert_eq!(pending.len(), 1);
         assert!(pending[0].contains("Next: update tests"));
+    }
+
+    #[test]
+    fn cuts_only_tool_results_over_the_limit() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("x".repeat(500)),
+            ConversationMessage::tool_result("1", "read_file", "a".repeat(500), false),
+            ConversationMessage::tool_result("2", "read_file", "short", false),
+        ];
+
+        assert_eq!(super::truncate_large_tool_results(&mut session, 100), 1);
+
+        let ContentBlock::ToolResult { output, .. } = &session.messages[1].blocks[0] else {
+            panic!("expected a tool result");
+        };
+        assert!(output.starts_with(&"a".repeat(100)));
+        assert!(output.contains("cut to 100 of 500 characters"));
+        let ContentBlock::ToolResult { output, .. } = &session.messages[2].blocks[0] else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(output, "short");
+        assert_eq!(session.messages[0].blocks.len(), 1);
     }
 }

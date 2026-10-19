@@ -1,0 +1,20 @@
+# Quadlet unit: podman runs SearXNG for claw's WebSearch on 127.0.0.1:8888.
+# Installed to ~/.config/containers/systemd/ by scripts/install-searxng.sh;
+# systemd generates searxng.service from it.
+[Unit]
+Description=SearXNG meta search for claw (127.0.0.1:8888)
+After=network-online.target
+
+[Container]
+Image=docker.io/searxng/searxng:latest
+ContainerName=searxng
+PublishPort=127.0.0.1:8888:8080
+Volume=%h/.config/searxng/settings.yml:/etc/searxng/settings.yml:ro
+Environment=SEARXNG_BASE_URL=http://127.0.0.1:8888/
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

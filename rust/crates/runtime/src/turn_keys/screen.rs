@@ -47,6 +47,44 @@ const FOCUS_HEADER: &str = "\x1b[2m── focus view · /focus for all ──\x1
 const PANE_WRITE_WAIT: Duration = Duration::from_millis(50);
 /// How long "Copied" stays in the bottom row after a selection.
 const NOTICE_TIME: Duration = Duration::from_secs(2);
+/// Narrowest window that has room for the side panel.
+pub const SIDE_PANEL_MIN_COLS: usize = 110;
+/// The rule between the conversation and the side panel.
+const PANEL_RULE: &str = "\x1b[38;5;240m│\x1b[0m";
+const CLOSE_MARK: &str = "✕";
+
+/// Draws the side panel's content `width` columns wide: one string per row,
+/// each exactly `width` columns. Called from the draw thread, outside the
+/// screen's lock, and again only when the width changes.
+pub type PanelRender = Arc<dyn Fn(usize) -> Vec<String> + Send + Sync>;
+
+/// A panel to the right of the conversation (the diff panel).
+struct Panel {
+    /// What it shows, for the notice when the window is too narrow.
+    name: String,
+    render: PanelRender,
+    /// The rows last drawn and the width they were drawn for.
+    rows: Option<(usize, Arc<Vec<String>>)>,
+    /// First content row shown.
+    scroll: usize,
+}
+
+/// Where the last frame put things, for mouse hits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Layout {
+    /// Columns the conversation used.
+    conversation_cols: usize,
+    /// Rows the conversation (and panel) used.
+    height: usize,
+    /// The panel's first column (its rule), when it is shown.
+    panel_left: Option<usize>,
+    /// The panel's ✕, as (row, col).
+    panel_close: Option<(usize, usize)>,
+    /// The too-narrow notice's ✕, as (row, col).
+    notice_close: Option<(usize, usize)>,
+    /// The "Jump to bottom" hint, as (row, first col, past last col).
+    jump_hint: Option<(usize, usize, usize)>,
+}
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
@@ -140,6 +178,12 @@ struct State {
     shown_rows: Vec<(usize, usize, usize)>,
     /// A short message in the bottom row ("Copied …"), until it expires.
     notice: Option<(String, Instant)>,
+    panel: Option<Panel>,
+    /// The user closed the panel (its ✕, `/diffpanel off`).
+    panel_closed: bool,
+    /// The user dismissed the "too narrow for the panel" notice.
+    narrow_notice_dismissed: bool,
+    layout: Layout,
 }
 
 /// Whether full-screen mode is wanted: `CLAW_FULLSCREEN=0` turns it off,
@@ -266,6 +310,7 @@ pub fn leave() {
         .rposition(|line| !line.is_empty())
         .map_or(0, |last| last + 1);
     let mut stdout = io::stdout().lock();
+    let _ = stdout.write_all(&state.conversation.graphics);
     for line in &lines[..end] {
         let _ = writeln!(stdout, "{}", vt::render_cells(line));
     }
@@ -403,6 +448,84 @@ pub fn clear_conversation() {
 /// Scrolls the conversation.
 pub fn scroll(scroll: Scroll) {
     with_state(|state| state.scroll(scroll));
+}
+
+/// The mouse wheel at a screen cell: scrolls the side panel when the
+/// pointer is over it, otherwise the conversation.
+pub fn wheel(scroll: Scroll, row: usize, col: usize) {
+    with_state(|state| {
+        if state.over_panel(row, col) {
+            state.scroll_panel(scroll);
+        } else {
+            state.scroll(scroll);
+        }
+    });
+}
+
+/// Shows `render`'s rows in a panel right of the conversation (when the
+/// window is at least [`SIDE_PANEL_MIN_COLS`] wide), or removes the panel
+/// with `None`. `name` says what it is ("diff"). Replacing the content keeps
+/// the panel's scroll position.
+pub fn set_side_panel(name: &str, render: Option<PanelRender>) {
+    with_state(|state| match render {
+        Some(render) => {
+            let scroll = state.panel.as_ref().map_or(0, |panel| panel.scroll);
+            state.panel = Some(Panel {
+                name: name.to_string(),
+                render,
+                rows: None,
+                scroll,
+            });
+        }
+        None => state.panel = None,
+    });
+}
+
+/// Closes the side panel, or opens it again (which also brings back the
+/// "too narrow" notice).
+pub fn set_side_panel_closed(closed: bool) {
+    with_state(|state| {
+        state.panel_closed = closed;
+        if !closed {
+            state.narrow_notice_dismissed = false;
+        }
+    });
+}
+
+/// Whether the user closed the side panel.
+#[must_use]
+pub fn side_panel_closed() -> bool {
+    shared().is_some_and(|shared| lock(&shared.state).panel_closed)
+}
+
+/// The width (without its rule) a side panel gets at the window's current
+/// size, when one would be shown: the window is wide enough and the user
+/// has not closed it.
+#[must_use]
+pub fn side_panel_width() -> Option<usize> {
+    let shared = shared()?;
+    let closed = lock(&shared.state).panel_closed;
+    let cols = super::terminal_cols();
+    (!closed && cols >= SIDE_PANEL_MIN_COLS).then(|| side_panel_width_for(cols))
+}
+
+/// Two fifths of a window `cols` wide, at least 44 columns.
+fn side_panel_width_for(cols: usize) -> usize {
+    (cols * 2 / 5).max(44)
+}
+
+/// Columns the conversation gets: the window's width, less the side panel
+/// when one is shown. `None` outside full-screen mode.
+#[must_use]
+pub fn conversation_cols() -> Option<usize> {
+    let shared = shared()?;
+    let state = lock(&shared.state);
+    let cols = super::terminal_cols();
+    Some(
+        state
+            .panel_width(cols)
+            .map_or(cols, |width| cols - width - 1),
+    )
 }
 
 /// Adds to the focus view (a tool call's one-line summary, the final
@@ -572,6 +695,13 @@ fn draw_loop(shared: &Shared, mut tty: File) {
         if animate {
             last_animation = Instant::now();
         }
+        if let Some((render, width)) = state.panel_render_needed(usize::from(size.1)) {
+            // Drawn without the lock: output keeps flowing meanwhile.
+            drop(state);
+            let rows = render(width);
+            state = lock(&shared.state);
+            state.store_panel_rows(&render, width, rows);
+        }
         let (frame, cursor) = state.compose(usize::from(size.0), usize::from(size.1));
         let passthrough = std::mem::take(&mut state.passthrough);
         drop(state);
@@ -623,6 +753,10 @@ impl State {
             selecting: false,
             shown_rows: Vec::new(),
             notice: None,
+            panel: None,
+            panel_closed: false,
+            narrow_notice_dismissed: false,
+            layout: Layout::default(),
         }
     }
 
@@ -715,9 +849,19 @@ impl State {
             pane_rows.drain(..skip);
             cursor = cursor.and_then(|(row, col)| row.checked_sub(skip).map(|row| (row, col)));
         }
-        let height = rows.saturating_sub(pane_rows.len());
-        self.view = (height, cols);
-        let mut frame = self.conversation_rows(height, cols);
+        let mut height = rows.saturating_sub(pane_rows.len());
+        self.layout = Layout::default();
+        let notice_rows = self.narrow_notice_rows(cols, height);
+        height -= notice_rows.len();
+        if !notice_rows.is_empty() {
+            self.layout.notice_close = Some((height, cols.saturating_sub(3)));
+        }
+        let panel_width = self.panel_width(cols);
+        let conversation_cols = panel_width.map_or(cols, |width| cols - width - 1);
+        self.layout.conversation_cols = conversation_cols;
+        self.layout.height = height;
+        self.view = (height, conversation_cols);
+        let mut frame = self.conversation_rows(height, conversation_cols);
         if self
             .notice
             .as_ref()
@@ -729,14 +873,153 @@ impl State {
             Some((notice, _)) => Some(format!(" {notice} ")),
             None => self.anchor.is_some().then(|| JUMP_HINT.to_string()),
         };
+        let is_jump_hint = self.notice.is_none() && self.anchor.is_some();
         if let (Some(hint), Some(last)) = (hint, frame.last_mut()) {
             let width = hint.chars().count();
-            let pad = cols.saturating_sub(width) / 2;
+            let pad = conversation_cols.saturating_sub(width) / 2;
             *last = format!("{}\x1b[7m{hint}\x1b[0m", " ".repeat(pad));
+            if is_jump_hint {
+                self.layout.jump_hint = Some((height - 1, pad, pad + width));
+            }
         }
-        let cursor = cursor.map(|(row, col)| (height + row, col));
+        if let Some(width) = panel_width {
+            self.add_panel(&mut frame, conversation_cols, width);
+        }
+        let cursor = cursor.map(|(row, col)| (height + notice_rows.len() + row, col));
+        frame.extend(notice_rows);
         frame.extend(pane_rows);
         (frame, cursor)
+    }
+
+    /// Whether a panel is set and the user has not closed it.
+    fn panel_wanted(&self) -> bool {
+        self.panel.is_some() && !self.panel_closed
+    }
+
+    /// The panel's width (without its rule) in a window `cols` wide, when
+    /// it is shown: two fifths of the window, at least 44 columns.
+    fn panel_width(&self, cols: usize) -> Option<usize> {
+        (self.panel_wanted() && cols >= SIDE_PANEL_MIN_COLS).then(|| side_panel_width_for(cols))
+    }
+
+    /// The boxed "too narrow for the panel" notice, with a ✕ to dismiss it.
+    fn narrow_notice_rows(&self, cols: usize, height: usize) -> Vec<String> {
+        let Some(panel) = &self.panel else {
+            return Vec::new();
+        };
+        if self.panel_closed
+            || self.narrow_notice_dismissed
+            || !(20..SIDE_PANEL_MIN_COLS).contains(&cols)
+            || height < 8
+        {
+            return Vec::new();
+        }
+        let inner = cols - 2;
+        let text = format!(
+            " Resize your terminal to at least {SIDE_PANEL_MIN_COLS} columns to show the {} panel",
+            panel.name
+        );
+        let text: String = text.chars().take(inner).collect();
+        let pad = inner.saturating_sub(text.chars().count());
+        vec![
+            format!(
+                "\x1b[38;5;245m╭{}{CLOSE_MARK}─╮\x1b[0m",
+                "─".repeat(inner.saturating_sub(2))
+            ),
+            format!(
+                "\x1b[38;5;245m│\x1b[0m{text}{}\x1b[38;5;245m│\x1b[0m",
+                " ".repeat(pad)
+            ),
+            format!("\x1b[38;5;245m╰{}╯\x1b[0m", "─".repeat(inner)),
+        ]
+    }
+
+    /// Draws the panel into the right of `frame`'s rows: a row with its ✕,
+    /// then its content from the scroll position.
+    fn add_panel(&mut self, frame: &mut [String], conversation_cols: usize, width: usize) {
+        let height = frame.len();
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        let content: Arc<Vec<String>> = match &panel.rows {
+            Some((drawn_for, rows)) if *drawn_for == width => Arc::clone(rows),
+            _ => Arc::new(Vec::new()),
+        };
+        let max_scroll = content.len().saturating_sub(height.saturating_sub(1));
+        panel.scroll = panel.scroll.min(max_scroll);
+        let left = conversation_cols + 1;
+        self.layout.panel_left = Some(conversation_cols);
+        self.layout.panel_close = Some((0, left + width.saturating_sub(2)));
+        for (index, row) in frame.iter_mut().enumerate() {
+            let cells = if index == 0 {
+                format!(
+                    "{}\x1b[38;5;245m{CLOSE_MARK}\x1b[0m ",
+                    " ".repeat(width.saturating_sub(2))
+                )
+            } else {
+                content
+                    .get(panel.scroll + index - 1)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            row.push_str(&format!("\x1b[0m\x1b[{left}G{PANEL_RULE}{cells}\x1b[0m"));
+        }
+    }
+
+    /// The panel's content needs drawing for this window width: its
+    /// renderer and the width.
+    fn panel_render_needed(&self, cols: usize) -> Option<(PanelRender, usize)> {
+        let width = self.panel_width(cols)?;
+        let panel = self.panel.as_ref()?;
+        match &panel.rows {
+            Some((drawn_for, _)) if *drawn_for == width => None,
+            _ => Some((Arc::clone(&panel.render), width)),
+        }
+    }
+
+    fn store_panel_rows(&mut self, render: &PanelRender, width: usize, rows: Vec<String>) {
+        if let Some(panel) = self.panel.as_mut() {
+            // The panel may have been replaced while it was drawn.
+            if Arc::ptr_eq(&panel.render, render) {
+                panel.rows = Some((width, Arc::new(rows)));
+            }
+        }
+    }
+
+    fn over_panel(&self, row: usize, col: usize) -> bool {
+        self.layout
+            .panel_left
+            .is_some_and(|left| col >= left && row < self.layout.height)
+    }
+
+    fn scroll_panel(&mut self, scroll: Scroll) {
+        let page = self.layout.height.saturating_sub(2).max(1);
+        if let Some(panel) = self.panel.as_mut() {
+            panel.scroll = match scroll {
+                Scroll::Up(rows) => panel.scroll.saturating_sub(rows),
+                Scroll::Down(rows) => panel.scroll + rows,
+                Scroll::PageUp => panel.scroll.saturating_sub(page),
+                Scroll::PageDown => panel.scroll + page,
+                Scroll::Top => 0,
+                Scroll::Bottom => usize::MAX,
+            };
+        }
+    }
+
+    /// A click on a ✕ (the panel's or the notice's); true when it hit one.
+    fn click_close(&mut self, row: usize, col: usize) -> bool {
+        let hit = |target: Option<(usize, usize)>| {
+            target.is_some_and(|(r, c)| r == row && col + 1 >= c && col <= c + 1)
+        };
+        if hit(self.layout.panel_close) {
+            self.panel_closed = true;
+            return true;
+        }
+        if hit(self.layout.notice_close) {
+            self.narrow_notice_dismissed = true;
+            return true;
+        }
+        false
     }
 
     /// The conversation's lines, without the empty line the cursor waits
@@ -846,6 +1129,32 @@ impl State {
 
     /// Applies a mouse event; returns the text to copy when a drag ends.
     fn mouse(&mut self, event: Mouse) -> Option<String> {
+        if let Mouse::Press { row, col } = event {
+            if self.click_close(row, col) || self.over_panel(row, col) {
+                return None;
+            }
+            // A click on "Jump to bottom" does what Ctrl+End does.
+            if let Some((hint_row, from, to)) = self.layout.jump_hint {
+                if row == hint_row && (from..to).contains(&col) {
+                    self.anchor = None;
+                    self.selection = None;
+                    self.selecting = false;
+                    return None;
+                }
+            }
+        }
+        // A drag into the panel selects up to the conversation's edge.
+        let event = match (event, self.layout.panel_left) {
+            (Mouse::Drag { row, col }, Some(left)) => Mouse::Drag {
+                row,
+                col: col.min(left.saturating_sub(1)),
+            },
+            (Mouse::Release { row, col }, Some(left)) => Mouse::Release {
+                row,
+                col: col.min(left.saturating_sub(1)),
+            },
+            (event, _) => event,
+        };
         match event {
             Mouse::Press { row, col } => {
                 self.selection = self.position_at(row, col).map(|position| Selection {
@@ -1087,6 +1396,94 @@ mod tests {
         // Rows 3.. are empty conversation rows and the pane.
         let copied = state.mouse(Mouse::Release { row: 9, col: 0 });
         assert_eq!(copied.as_deref(), Some("line 2"));
+    }
+
+    fn with_panel(state: &mut State, rows: usize) {
+        let render: super::PanelRender = std::sync::Arc::new(move |width: usize| {
+            (0..rows)
+                .map(|n| format!("{:<width$}", format!("diff row {n}")))
+                .collect()
+        });
+        state.panel = Some(super::Panel {
+            name: "diff".to_string(),
+            render,
+            rows: None,
+            scroll: 0,
+        });
+    }
+
+    /// What the draw thread does before composing: draws the panel's rows.
+    fn compose_with_panel(state: &mut State, rows: usize, cols: usize) -> Vec<String> {
+        if let Some((render, width)) = state.panel_render_needed(cols) {
+            let drawn = render(width);
+            state.store_panel_rows(&render, width, drawn);
+        }
+        state
+            .compose(rows, cols)
+            .0
+            .iter()
+            .map(|row| plain(row))
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_window_shows_the_panel_right_of_the_conversation() {
+        let mut state = state_with(3);
+        with_panel(&mut state, 30);
+        let frame = compose_with_panel(&mut state, 10, 120);
+        let width = 120 * 2 / 5;
+        assert_eq!(state.layout.conversation_cols, 120 - width - 1);
+        assert!(frame[0].starts_with("line 0"));
+        assert!(frame[0].ends_with("✕ "), "the panel's first row has its ✕");
+        assert!(frame[1].contains("│diff row 0"));
+        assert!(frame[2].contains("line 2") && frame[2].contains("diff row 1"));
+
+        // The wheel over the panel scrolls the panel, not the conversation.
+        let left = state.layout.panel_left.expect("panel shown");
+        state.scroll_panel(Scroll::Down(5));
+        let frame = compose_with_panel(&mut state, 10, 120);
+        assert!(frame[1].contains("diff row 5"));
+        assert!(state.over_panel(3, left + 2));
+        assert!(!state.over_panel(3, left - 1));
+
+        // Its ✕ closes it and gives the conversation the whole width.
+        let (row, col) = state.layout.panel_close.expect("close mark");
+        assert_eq!(state.mouse(Mouse::Press { row, col }), None);
+        assert!(state.panel_closed);
+        let frame = compose_with_panel(&mut state, 10, 120);
+        assert!(!frame.iter().any(|row| row.contains("diff row")));
+        assert_eq!(state.layout.conversation_cols, 120);
+    }
+
+    #[test]
+    fn clicking_the_jump_hint_goes_back_to_the_end() {
+        let mut state = state_with(40);
+        state.compose(10, 40);
+        state.scroll(Scroll::Up(10));
+        let frame = compose_with_panel(&mut state, 10, 40);
+        let (row, from, _) = state.layout.jump_hint.expect("hint shown");
+        assert!(frame[row].contains("Jump to bottom"));
+        assert_eq!(state.mouse(Mouse::Press { row, col: from + 2 }), None);
+        assert_eq!(state.anchor, None, "following the end again");
+        let frame = compose_with_panel(&mut state, 10, 40);
+        assert!(!frame.iter().any(|row| row.contains("Jump to bottom")));
+        assert_eq!(state.selection, None, "the click selected nothing");
+    }
+
+    #[test]
+    fn a_narrow_window_says_how_wide_it_must_be_until_dismissed() {
+        let mut state = state_with(3);
+        with_panel(&mut state, 30);
+        let frame = compose_with_panel(&mut state, 12, 80);
+        assert!(frame.iter().any(|row| row
+            .contains("Resize your terminal to at least 110 columns to show the diff panel")));
+        assert!(!frame.iter().any(|row| row.contains("diff row")));
+        assert_eq!(state.layout.conversation_cols, 80);
+
+        let (row, col) = state.layout.notice_close.expect("notice ✕");
+        state.mouse(Mouse::Press { row, col });
+        let frame = compose_with_panel(&mut state, 12, 80);
+        assert!(!frame.iter().any(|row| row.contains("Resize your terminal")));
     }
 
     fn state_with(lines: usize) -> State {

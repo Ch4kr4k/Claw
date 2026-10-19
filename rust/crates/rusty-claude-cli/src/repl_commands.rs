@@ -33,9 +33,15 @@ pub(crate) fn apply_configured_theme() {
         set_current_theme(ThemeName::from_env());
         return;
     }
-    if let Some(theme) = runtime::read_user_setting("theme")
-        .as_deref()
-        .and_then(|name| ThemeName::parse(name).ok())
+    if let Some(theme) = env::current_dir()
+        .ok()
+        .and_then(|cwd| runtime::ConfigLoader::default_for(cwd).load().ok())
+        .and_then(|config| {
+            config
+                .get("theme")
+                .and_then(|v| v.as_str())
+                .and_then(|name| ThemeName::parse(name).ok())
+        })
     {
         set_current_theme(theme);
     }
@@ -687,6 +693,22 @@ fn image_block(bytes: &[u8], source: &str) -> Result<ContentBlock, String> {
     })
 }
 
+/// The images among the desktop app's `[Attached file: …]` lines, to send
+/// as vision input with the message; other files are left to the tools.
+pub(crate) fn attached_images(text: &str) -> Vec<ContentBlock> {
+    text.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("[Attached file: ")?
+                .strip_suffix(']')
+        })
+        .filter_map(|path| {
+            let bytes = std::fs::read(expand_home(path)).ok()?;
+            image_block(&bytes, path).ok()
+        })
+        .collect()
+}
+
 /// PNG bytes of the clipboard image (Wayland or X11).
 fn clipboard_image() -> Result<Vec<u8>, String> {
     let mut readers: Vec<(&str, &[&str])> = Vec::new();
@@ -726,6 +748,56 @@ pub(crate) fn prompt_for_command(name: &str, scope: Option<&str>) -> Option<Stri
     let scope = scope.map(str::trim).filter(|s| !s.is_empty());
     let focus = scope.map_or_else(String::new, |s| format!("\n\nFocus: {s}"));
     let prompt = match name {
+        "reflect" => format!(
+            "Reflect on this session for auto memory before it ends. Do no other work: no code \
+             changes, no commands beyond reading.\n\
+             Look back over the conversation for durable knowledge that a future session in this \
+             project would need and could not get from the code or git history: decisions made \
+             and why, facts about the project or setup learned the hard way, mistakes made and how \
+             they were fixed, and the user's preferences or corrections. Skip anything about this \
+             task only.\n\
+             For each item: check MEMORY.md and update an existing memory instead of adding a \
+             duplicate; otherwise write a new memory file and its index line, as the memory \
+             instructions describe. When it is about specific code, add `anchors:` (path#symbol) \
+             so it can be flagged once that code changes. If a stale memory came up and you now \
+             know the truth, fix or delete it. Save at most 5. If nothing durable came up, save \
+             nothing.\n\
+             End with one line listing what you saved or updated (or \"nothing to save\").{focus}"
+        ),
+        "scope-check" => format!(
+            "Act as Scope Creeper, an adversarial second opinion, before any code is written for: \
+             {subject}\n\nDo not write or change files. Read just enough of the repository to ground \
+             your answer (the README and the files this would touch; CodeSearch and RepoSignals help), \
+             then give exactly three sections:\n\
+             1. Scan: a delusion score from 0 (clear, small, partly built already) to 10 (vague, \
+             huge, or solving a non-problem), a one-line verdict (build / shrink / don't build), and \
+             the 3-5 assumptions it rests on, each marked verified or unverified from what you read.\n\
+             2. Kill: a one-page autopsy written as if the project already failed: the likeliest \
+             causes (scope creep, an existing alternative such as a helper or tool already in this \
+             repository or its ecosystem, maintenance cost, no clear user), and what abandoning it \
+             costs now versus later.\n\
+             3. Shippable: a v0 plan: a one-sentence goal, the user and the single job it does, what \
+             is in and what is explicitly out, acceptance checks a script can run, the files it \
+             likely touches with rough line counts, and a first step that can be pasted and run \
+             (commands or a minimal skeleton). Keep v0 to what one focused session can ship.\n\
+             Be blunt and specific; no encouragement.",
+            subject = scope.unwrap_or("the task described above")
+        ),
+        "diverge" => format!(
+            "Think divergently about: {subject}\n\nDo not settle on the first good idea, and do not \
+             change files. First diagnose the kind of problem (optimization, open design, stuck \
+             debugging, naming or framing, strategy) and pick the two techniques that suit it best \
+             from: inversion (how to make it worse, then flip it), SCAMPER, an analogy from a distant \
+             field, removing or adding a constraint, random-word injection (take an unrelated word \
+             and force a link), deliberately bad ideas, reversing an assumption, a shift of \
+             perspective (user, attacker, maintainer, newcomer). Say which and why in one line.\n\
+             Then give at least 8 ideas that differ in kind, not degree, each labelled with its \
+             technique. Audit their diversity: group them into clusters, and if there are fewer \
+             than 4 clusters, add ideas in the missing directions. Map blind spots: 3 things nobody \
+             close to the problem would think of. Finish with the 2 most promising unusual ideas and \
+             a cheap test for each.",
+            subject = scope.unwrap_or("the problem described above")
+        ),
         "review" => format!(
             "Review the current uncommitted changes in this repository (use `git status` and \
              `git diff`, plus `git diff --cached`; if the tree is clean, review the latest commit). \
@@ -916,7 +988,7 @@ fn message_text(message: &runtime::ConversationMessage) -> String {
         .join("")
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = env::var_os("HOME") {
             return Path::new(&home).join(rest);
@@ -1003,7 +1075,7 @@ fn paste_from_clipboard() -> Result<String, String> {
     Err("no clipboard reader found (install wl-clipboard, xclip, or xsel)".to_string())
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -1063,6 +1135,27 @@ mod tests {
         assert!(image_block(b"plain text", "x.txt").is_err());
         let big = [&png[..], &vec![0; MAX_IMAGE_BYTES][..]].concat();
         assert!(image_block(&big, "big.png").unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn attached_images_keeps_only_readable_images() {
+        let dir = env::temp_dir().join(format!("claw-attach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("a.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let text = dir.join("b.txt");
+        std::fs::write(&text, "hello").unwrap();
+        let message = format!(
+            "look\n[Attached file: {}]\n[Attached file: {}]\n[Attached file: /nope.png]",
+            png.display(),
+            text.display()
+        );
+        let blocks = attached_images(&message);
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Image { media_type, .. } if media_type == "image/png")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
