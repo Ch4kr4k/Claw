@@ -16,7 +16,7 @@
 //! Ported from `KeyListener` in `AzureAiHarness`.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -113,6 +113,16 @@ static PARKED: AtomicBool = AtomicBool::new(false);
 static TYPE_AHEAD: Mutex<String> = Mutex::new(String::new());
 /// Prompts submitted with Enter while a turn was running, oldest first.
 static QUEUED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Set once something other than the key watcher (claw desktop's agent)
+/// queues prompts for the running turn.
+static EXTERNAL_QUEUE: AtomicBool = AtomicBool::new(false);
+/// Answers `/btw` typed during a turn right away (set by the CLI); without
+/// it the question waits in the queue until the turn ends.
+static SIDE_QUESTION_HANDLER: OnceLock<fn(String)> = OnceLock::new();
+/// `/btw` questions being answered while the turn runs.
+static SIDE_PENDING: AtomicUsize = AtomicUsize::new(0);
+/// Answered `/btw` questions waiting to be printed: (question, answer).
+static SIDE_ANSWERS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static ACTIVITY: Mutex<Option<Activity>> = Mutex::new(None);
 /// SGR sequence for the spinner and label (set from the CLI theme).
 static ACTIVITY_COLOR: Mutex<String> = Mutex::new(String::new());
@@ -331,6 +341,8 @@ struct Activity {
     last_reasoning: Option<Instant>,
     /// Characters received from the model this turn (text and reasoning).
     chars: usize,
+    /// How far a local server has read this request's prompt (done, total).
+    prompt_progress: Option<(u64, u64)>,
 }
 
 impl Activity {
@@ -343,6 +355,7 @@ impl Activity {
             last_text: None,
             last_reasoning: None,
             chars: 0,
+            prompt_progress: None,
         }
     }
 
@@ -354,6 +367,11 @@ impl Activity {
         let recent = |at: Option<Instant>| at.is_some_and(|at| now - at < STREAMING_WINDOW);
         if recent(self.last_text) {
             return ("Writing".to_string(), None);
+        }
+        if let (false, Some((done, total))) = (self.request_output, self.prompt_progress) {
+            if total > 0 && done < total {
+                return (format!("Reading the prompt {}%", done * 100 / total), None);
+            }
         }
         if recent(self.last_reasoning) || !self.request_output {
             return ("Thinking".to_string(), None);
@@ -492,7 +510,13 @@ pub fn begin_model_request() {
         activity.request_output = false;
         activity.last_text = None;
         activity.last_reasoning = None;
+        activity.prompt_progress = None;
     });
+}
+
+/// A local server has read `done` of the request's `total` prompt tokens.
+pub fn note_prompt_progress(done: u64, total: u64) {
+    with_activity(|activity| activity.prompt_progress = Some((done, total)));
 }
 
 /// Visible reply text arrived.
@@ -572,7 +596,7 @@ pub fn queued_count() -> usize {
 /// REPL turns only), so other callers of the conversation loop are unaffected.
 #[must_use]
 pub fn take_queued_for_running_turn() -> Vec<String> {
-    if !ACTIVE.load(Ordering::SeqCst) {
+    if !ACTIVE.load(Ordering::SeqCst) && !EXTERNAL_QUEUE.load(Ordering::SeqCst) {
         return Vec::new();
     }
     #[cfg(test)]
@@ -591,6 +615,77 @@ pub fn take_queued_for_running_turn() -> Vec<String> {
         draw_status_line();
     }
     queued
+}
+
+/// Queues `text` for the running turn from outside the terminal (claw
+/// desktop): it reaches the model before its next step, like a line typed
+/// with Enter during a REPL turn.
+pub fn queue_for_running_turn(text: &str) {
+    EXTERNAL_QUEUE.store(true, Ordering::SeqCst);
+    QUEUED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(text.trim().to_string());
+}
+
+/// Lets `/btw` typed during a turn be answered at once by `handler`
+/// (which gets the question and must return quickly, answering on its own
+/// thread and handing the answer to [`push_side_answer`]), like Claude Code.
+pub fn set_side_question_handler(handler: fn(String)) {
+    let _ = SIDE_QUESTION_HANDLER.set(handler);
+}
+
+/// Hands over the answer to a `/btw` asked during the turn; it is printed
+/// at the next step or when the turn ends ([`print_side_answers`]).
+pub fn push_side_answer(question: String, answer: String) {
+    SIDE_ANSWERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((question, answer));
+    SIDE_PENDING
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .ok();
+    draw_status_line();
+}
+
+/// Prints the `/btw` answers that are ready (between the turn's steps and
+/// after it, so they never cut into streamed output).
+pub fn print_side_answers() {
+    let answers = std::mem::take(&mut *SIDE_ANSWERS.lock().unwrap_or_else(|e| e.into_inner()));
+    if answers.is_empty() {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    for (question, answer) in answers {
+        let _ = write!(
+            stdout,
+            "\n\x1b[2m/btw {question}\x1b[0m\n{answer}\n\x1b[2m(side question, not added to the conversation)\x1b[0m\n"
+        );
+    }
+    let _ = stdout.flush();
+}
+
+/// Waits up to `limit` for `/btw` answers still being written, so a side
+/// question asked near the end of a turn is shown right after it.
+pub fn wait_for_side_answers(limit: Duration) {
+    if SIDE_PENDING.load(Ordering::SeqCst) > 0 {
+        println!("\x1b[2m  waiting for the /btw answer…\x1b[0m");
+    }
+    let deadline = Instant::now() + limit;
+    while SIDE_PENDING.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The question of a `/btw` line (`None` for other lines and a bare `/btw`).
+#[must_use]
+pub fn btw_question(line: &str) -> Option<&str> {
+    line.trim_start()
+        .strip_prefix("/btw ")
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
 }
 
 fn is_btw(line: &str) -> bool {
@@ -690,11 +785,16 @@ fn block_rows(cols: usize) -> Vec<String> {
         .unwrap_or_default();
     let typed = TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let queued = queued_count();
-    let queued_note = if queued > 0 {
+    let mut queued_note = if queued > 0 {
         format!("  [{queued} queued]")
     } else {
         String::new()
     };
+    match SIDE_PENDING.load(Ordering::SeqCst) {
+        0 => {}
+        1 => queued_note.push_str("  [answering /btw…]"),
+        n => queued_note.push_str(&format!("  [answering {n} /btw…]")),
+    }
     let input_line = if typed.is_empty() {
         format!(
             "\x1b[1;{}m❯\x1b[0m \x1b[7m \x1b[0m\x1b[2mtype to queue a message for the agent{queued_note}\x1b[0m",
@@ -950,7 +1050,12 @@ fn record_type_ahead(bytes: &[u8]) {
             }
             '\r' | '\n' => {
                 let line = std::mem::take(&mut *type_ahead);
-                if !line.trim().is_empty() {
+                if let (Some(question), Some(handler)) =
+                    (btw_question(&line), SIDE_QUESTION_HANDLER.get())
+                {
+                    SIDE_PENDING.fetch_add(1, Ordering::SeqCst);
+                    handler(question.to_string());
+                } else if !line.trim().is_empty() {
                     QUEUED
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1138,6 +1243,20 @@ pub fn note_tool_input(chars: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn btw_lines_name_their_question() {
+        assert_eq!(
+            super::btw_question("/btw what is the codename?"),
+            Some("what is the codename?")
+        );
+        assert_eq!(super::btw_question("  /btw   spaced  "), Some("spaced"));
+        assert_eq!(super::btw_question("/btw"), None);
+        assert_eq!(super::btw_question("/btw   "), None);
+        assert_eq!(super::btw_question("/btwx no"), None);
+        assert_eq!(super::btw_question("fix the build"), None);
+    }
+
     use std::time::{Duration, Instant};
 
     use super::{

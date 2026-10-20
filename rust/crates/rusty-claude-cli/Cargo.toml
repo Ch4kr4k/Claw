@@ -36,3 +36,5 @@ mock-anthropic-service = { path = "../mock-anthropic-service" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["fs"] }

@@ -55,7 +55,7 @@ pub fn events() -> impl iced::futures::Stream<Item = AgentEvent> {
 
 /// The claw launcher to run: `$CLAW_DESKTOP_CLAW`, else `~/.local/bin/claw`
 /// (the wrapper that points `local/` models at llama-gpu), else `claw`.
-fn claw_program() -> PathBuf {
+pub fn claw_program() -> PathBuf {
     if let Some(program) = std::env::var_os("CLAW_DESKTOP_CLAW") {
         return PathBuf::from(program);
     }

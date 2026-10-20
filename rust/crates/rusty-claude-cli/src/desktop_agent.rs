@@ -6,7 +6,11 @@
 //! nothing on disk. Commands arrive on stdin, one
 //! JSON object per line:
 //!
-//! - `{"cmd":"prompt","text":"..."}` runs a turn
+//! - `{"cmd":"prompt","text":"..."}` runs a turn; during one it is queued
+//!   (a terminal slash command such as `/undo` or `/compact` runs as in the
+//!   REPL instead, its output sent as a `notice`)
+//!   for the model's next step (`queued` event), and `/btw <question>` is
+//!   answered at once without entering the conversation (`btw` event)
 //! - `{"cmd":"cancel"}` stops the running turn (like Esc in the REPL)
 //! - `{"cmd":"permission","id":N,"decision":"allow"|"always"|"deny"}`
 //! - `{"cmd":"answer","id":N,"text":"..."}` answers an `AskUserQuestion`
@@ -14,7 +18,8 @@
 //!
 //! Events go to stdout, one JSON object per line with an `ev` field:
 //! `ready`, `turn_start`, `text`, `thinking`, `tool_call`, `tool_result`,
-//! `permission`, `question`, `turn_end`, `context`, `model`, `error`. Other
+//! `permission`, `question`, `turn_end`, `context`, `model`, `error`, and
+//! `progress` (`done`/`total` prompt tokens a local server has read). Other
 //! stdout lines (claw's own notices) are not JSON events; the app ignores
 //! them. Everything else (settings, sandbox, permission rules, sessions,
 //! `/model` aliases) is the same as in the terminal REPL.
@@ -50,7 +55,7 @@ static CURRENT_ABORT: Mutex<Option<runtime::HookAbortSignal>> = Mutex::new(None)
 static REPLIES: Mutex<Option<mpsc::Receiver<Reply>>> = Mutex::new(None);
 
 /// What the model should know about the app it is talking through.
-const DESKTOP_PROMPT: &str = "# Desktop app\nThe user is chatting through claw's desktop app, which renders your replies as Markdown with syntax-highlighted code blocks (always tag them with a language). It shows images: to show a picture, put it in the reply as Markdown, `![description](https://...)` for a web image or `![description](/absolute/path.png)` for a local file. To find pictures on the web, use WebSearch, then WebFetch on the result pages to get direct image URLs (ending in .png, .jpg, .gif, .webp or .svg) and show them that way. When the user wants a file saved (an image you showed, a document you found), use the Download tool; it saves into ~/Downloads unless told otherwise. Images the user attaches are sent to you with their message, so you can see them. Commands run without a terminal: never use interactive flags such as `emerge --ask`; the app asks the user before risky commands.";
+const DESKTOP_PROMPT: &str = "# Desktop app\nThe user is chatting through claw's desktop app, which renders your replies as Markdown with syntax-highlighted code blocks (always tag them with a language) and shows images. Images the user attaches are sent to you with their message. The app asks the user before risky commands.";
 
 /// Longest tool output sent to the app for display.
 const MAX_TOOL_OUTPUT_CHARS: usize = 20_000;
@@ -83,11 +88,23 @@ fn emit(event: &Value) {
     let _ = stdout.flush();
 }
 
+/// Whether a turn is running, so prompts that arrive meanwhile are queued
+/// for it instead of waiting for it to end.
+static TURN_RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// A piece of the reply as it streams.
 pub(crate) fn emit_text(text: &str) {
     if is_active() && !text.is_empty() {
         TEXT_SENT.store(true, Ordering::Relaxed);
         emit(&json!({"ev": "text", "text": text}));
+    }
+}
+
+/// How far the local server has read the prompt, so the app can show
+/// progress during a cold start (about two minutes on a 32k window).
+pub(crate) fn emit_prompt_progress(done: u64, total: u64) {
+    if is_active() {
+        emit(&json!({"ev": "progress", "done": done, "total": total}));
     }
 }
 
@@ -268,9 +285,46 @@ fn spawn_command_reader(commands: mpsc::Sender<Command>, replies: mpsc::Sender<R
             let field = |key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default();
             let id = value.get("id").and_then(Value::as_u64).unwrap_or_default();
             let sent = match field("cmd") {
-                "prompt" => commands
-                    .send(Command::Prompt(field("text").to_string()))
-                    .is_ok(),
+                "prompt" => {
+                    let text = field("text").to_string();
+                    if let Some(choice) = text.trim().strip_prefix("/fallback") {
+                        // Settings command: handled here, not sent to the model.
+                        let message = if choice.trim().is_empty() {
+                            format!(
+                                "Fallback model: {}. Set one with /fallback <model>, or /fallback off.",
+                                crate::fallback_models_for("")
+                                    .first()
+                                    .map_or("off", String::as_str)
+                            )
+                        } else {
+                            crate::apply_fallback_setting(choice).unwrap_or_else(|error| {
+                                format!("Could not set the fallback: {error}")
+                            })
+                        };
+                        emit(&json!({"ev": "info", "text": message}));
+                        true
+                    } else if let Some(question) = runtime::turn_keys::btw_question(&text) {
+                        // A side question: answered at once, beside any
+                        // running turn, and not added to the conversation.
+                        let question = question.to_string();
+                        std::thread::spawn(move || {
+                            let answer = crate::side_answer_from_last_request(&question)
+                                .unwrap_or_else(|error| {
+                                    format!("(could not answer the side question: {error})")
+                                });
+                            emit(&json!({"ev": "btw", "question": question, "answer": answer}));
+                        });
+                        true
+                    } else if TURN_RUNNING.load(Ordering::SeqCst) {
+                        // Sent while the agent works: it reaches the model
+                        // before its next step, as in the terminal.
+                        runtime::turn_keys::queue_for_running_turn(&text);
+                        emit(&json!({"ev": "queued", "text": text}));
+                        true
+                    } else {
+                        commands.send(Command::Prompt(text)).is_ok()
+                    }
+                }
                 "model" => commands
                     .send(Command::Model(field("model").to_string()))
                     .is_ok(),
@@ -361,6 +415,15 @@ pub(crate) fn run(
         }
     }
     cli.system_prompt.push(DESKTOP_PROMPT.to_string());
+    // The terminal's version (built with no terminal here) says pictures
+    // are not drawn; the app draws them.
+    cli.system_prompt
+        .retain(|section| !section.starts_with("# What you can do"));
+    cli.system_prompt.push(crate::capabilities_prompt(true));
+    // Files changed by each request are snapshotted, as in the terminal, so
+    // `/undo` and `/rewind` work in the app too; an incognito chat keeps
+    // nothing.
+    cli.checkpoints_enabled = !incognito;
     let (command_tx, command_rx) = mpsc::channel();
     let (reply_tx, reply_rx) = mpsc::channel();
     *REPLIES
@@ -393,10 +456,23 @@ pub(crate) fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match command {
-            Command::Prompt(text) => cli.run_desktop_turn(&text),
+            Command::Prompt(text) if desktop_slash_command(&text).is_some() => {
+                cli.run_desktop_slash_command(&text);
+            }
+            Command::Prompt(text) => {
+                TURN_RUNNING.store(true, Ordering::SeqCst);
+                cli.run_desktop_turn(&text);
+                // Messages sent after the turn's last step run next.
+                while let Some(queued) = runtime::turn_keys::take_queued() {
+                    cli.run_desktop_turn(&queued);
+                }
+                TURN_RUNNING.store(false, Ordering::SeqCst);
+            }
             Command::Model(model) => {
                 cli.model = resolve_model_alias_with_config(&model);
                 runtime::model_server::ensure_for_model(&cli.model);
+                // As in the terminal: the model picked last is the default.
+                let _ = crate::setup_wizard::save_settings_field("model", &cli.model);
                 emit(&json!({"ev": "model", "model": cli.model}));
                 cli.emit_context();
             }
@@ -437,6 +513,117 @@ fn spawn_background_reporter() {
 /// A prompt the user typed, as the app lists them: a user message with
 /// text that is not the "stopped" marker (tool results are user messages
 /// too, without text).
+/// Terminal slash commands the app runs itself: ones that print a result
+/// and need no keyboard (a picker would read the app's command pipe).
+const DESKTOP_SLASH_COMMANDS: &[&str] = &[
+    "help",
+    "status",
+    "compact",
+    "cost",
+    "context",
+    "memory",
+    "diff",
+    "undo",
+    "rewind",
+    "version",
+    "stats",
+    "files",
+    "doctor",
+    "skills",
+    "agents",
+    "mcp",
+    "config",
+    "plan",
+    "effort",
+    "fast",
+    "autocompact",
+    "fallback",
+    "recap",
+    "goal",
+    "export",
+    "sandbox",
+    "permissions",
+    "background",
+    "stop",
+    "reload-skills",
+    "reload-plugins",
+    "usage",
+];
+
+/// The command word of `text` when it is one the app runs itself.
+fn desktop_slash_command(text: &str) -> Option<&str> {
+    let word = text.trim().strip_prefix('/')?.split_whitespace().next()?;
+    // `/btw` is answered at once by the reader thread; never a command here.
+    DESKTOP_SLASH_COMMANDS.contains(&word).then_some(word)
+}
+
+/// What `run` prints to stdout and stderr while it runs. The agent's stdout
+/// is the app's event stream, so a REPL command's output is caught and sent
+/// as one event instead. A reader thread drains the pipe while `run` runs,
+/// so long output cannot fill it and block.
+#[cfg(unix)]
+fn capture_output(run: impl FnOnce()) -> String {
+    use nix::unistd::{close, dup, dup2, pipe};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    let Ok((read_end, write_end)) = pipe() else {
+        run();
+        return String::new();
+    };
+    let (Ok(saved_out), Ok(saved_err)) = (dup(1), dup(2)) else {
+        run();
+        return String::new();
+    };
+    let _ = dup2(write_end.as_raw_fd(), 1);
+    let _ = dup2(write_end.as_raw_fd(), 2);
+    drop(write_end);
+    let mut reader = std::fs::File::from(read_end);
+    let collector = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = reader.read_to_string(&mut text);
+        text
+    });
+    run();
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    // Restoring 1 and 2 closes the pipe's last write ends: the reader sees
+    // the end and returns.
+    let _ = dup2(saved_out, 1);
+    let _ = dup2(saved_err, 2);
+    let _ = close(saved_out);
+    let _ = close(saved_err);
+    collector.join().unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn capture_output(run: impl FnOnce()) -> String {
+    run();
+    String::new()
+}
+
+/// `text` without terminal colour codes.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn is_typed_prompt(message: &runtime::ConversationMessage) -> bool {
     message.role == runtime::MessageRole::User
         && message.blocks.iter().any(|block| {
@@ -479,7 +666,8 @@ impl LiveCli {
     /// type errors, the agent is asked to fix them (a few rounds at most).
     fn run_desktop_turn(&mut self, input: &str) {
         let _ = tools::leangate::take_edited_files();
-        let mut status = self.run_desktop_turn_once(input);
+        self.begin_checkpoint(input);
+        let mut status = self.run_desktop_turn_once(input, true);
         for _ in 0..crate::LEAN_GATE_ROUNDS {
             let edited = tools::leangate::take_edited_files();
             if status != "done" || edited.is_empty() {
@@ -491,11 +679,48 @@ impl LiveCli {
             emit(
                 &json!({"ev": "notice", "text": "LeanGate: the edited files have type errors; claw fixes them before finishing"}),
             );
-            status = self.run_desktop_turn_once(&report);
+            status = self.run_desktop_turn_once(&report, false);
         }
+        self.finish_checkpoint();
     }
 
-    fn run_desktop_turn_once(&mut self, input: &str) -> &'static str {
+    /// A terminal slash command typed in the app (`/undo`, `/compact`,
+    /// `/cost`, …): run as in the REPL, with what it prints shown in the
+    /// chat. They used to go to the model as plain text.
+    fn run_desktop_slash_command(&mut self, text: &str) {
+        let parsed = crate::SlashCommand::parse(text.trim());
+        let (output, changed) = match parsed {
+            Ok(Some(command)) => {
+                let mut changed = false;
+                let output = capture_output(|| match self.handle_repl_command(command) {
+                    Ok(result) => changed = result,
+                    Err(error) => eprintln!("error: {error}"),
+                });
+                (output, changed)
+            }
+            Ok(None) => (String::new(), false),
+            Err(error) => (error.to_string(), false),
+        };
+        if changed && !INCOGNITO.load(Ordering::Relaxed) {
+            if let Err(error) = self.persist_session() {
+                emit(
+                    &json!({"ev": "error", "message": format!("could not save the session: {error}")}),
+                );
+            }
+        }
+        let shown = strip_ansi(output.trim());
+        emit(&json!({
+            "ev": "notice",
+            "text": if shown.is_empty() { format!("{} done", text.trim()) } else { shown },
+        }));
+        self.emit_context();
+    }
+
+    /// One turn. With `check_images`, the reply's images are checked before
+    /// the turn ends, so the app shows claw still working; ones that do not
+    /// load go back to the model in one more turn (it had guessed addresses
+    /// that did not exist).
+    fn run_desktop_turn_once(&mut self, input: &str, check_images: bool) -> &'static str {
         drain_replies();
         TEXT_SENT.store(false, Ordering::Relaxed);
         emit(&json!({"ev": "turn_start"}));
@@ -528,6 +753,13 @@ impl LiveCli {
                 if let Err(error) = self.replace_runtime(runtime) {
                     emit(&json!({"ev": "error", "message": error.to_string()}));
                 }
+                // As in the terminal: review the turn for memories and skills.
+                let added = 1 + summary.assistant_messages.len() + summary.tool_results.len();
+                let messages = &self.runtime.session().messages;
+                crate::learning::review_turn_in_background(
+                    self.model.clone(),
+                    messages[messages.len().saturating_sub(added)..].to_vec(),
+                );
                 emit(&json!({
                     "ev": "usage",
                     "input_tokens": usage.input_tokens,
@@ -559,6 +791,14 @@ impl LiveCli {
             emit(
                 &json!({"ev": "error", "message": format!("could not save the session: {error}")}),
             );
+        }
+        if check_images && status == "done" {
+            if let Some(report) = crate::image_check(self.runtime.session()) {
+                emit(
+                    &json!({"ev": "notice", "text": "Some images in the reply do not load; claw asks for working ones"}),
+                );
+                return self.run_desktop_turn_once(&report, false);
+            }
         }
         emit(&json!({"ev": "turn_end", "status": status}));
         self.emit_context();

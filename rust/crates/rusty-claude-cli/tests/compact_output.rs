@@ -60,7 +60,9 @@ fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
     let trimmed = stdout.trim_end_matches('\n');
     assert_eq!(
-        trimmed, "read_file roundtrip complete: alpha parity line",
+        // The mock model echoes the file as it got it: numbered lines.
+        trimmed,
+        "read_file roundtrip complete: 1\talpha parity line",
         "compact stdout should contain only the final assistant text"
     );
     assert!(

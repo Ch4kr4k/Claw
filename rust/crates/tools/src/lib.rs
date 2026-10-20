@@ -4,9 +4,6 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use aspect_macros::aspect;
-use aspect_std::LoggingAspect;
-
 use api::{
     max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
     ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
@@ -796,6 +793,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "SocialMedia",
+            description: "Save the images and videos of an Instagram, Facebook or Pinterest post, reel, video or pin, given its link (share and short links such as pin.it and fb.watch work), or of an Instagram profile's latest posts (its link, or `@username`; `count` posts, default 6). Uses each site's own web API, so there is no need to dig image addresses out of the page. Saves into ~/Downloads/claw-social/<platform> and returns the saved paths plus `show` lines (`![…](path)`) that display the images in your reply. Public posts work without login; for others a Netscape cookie file at ~/.claw/cookies/<platform>.txt is used when present.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Link to the post, reel, video or pin" },
+                    "dest": { "type": "string", "description": "Directory to save into; default ~/Downloads/claw-social/<platform>" },
+                    "count": { "type": "integer", "minimum": 1, "maximum": 24, "description": "Instagram profile: how many of its latest posts (default 6)" }
+                },
+                "required": ["url"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "WebSearch",
             description: "Search the web for current information and return cited results.",
             input_schema: json!({
@@ -1572,6 +1584,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     .chain(dev_tools::specs())
     .chain(media::specs())
     .chain(signals::specs())
+    .chain(session_search::specs())
     .collect()
 }
 
@@ -1595,7 +1608,6 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
 }
 
 #[allow(clippy::too_many_lines)]
-#[aspect(LoggingAspect::new().log_args().log_result())]
 fn execute_tool_with_enforcer(
     enforcer: Option<&PermissionEnforcer>,
     name: &str,
@@ -1734,6 +1746,16 @@ fn execute_tool_with_enforcer(
             )?;
             com::run(com_input).and_then(to_pretty_json)
         }
+        "SocialMedia" => {
+            let social_input = from_value::<social::SocialMediaInput>(input)?;
+            maybe_enforce_permission_check_with_mode(
+                enforcer,
+                name,
+                input,
+                PermissionMode::DangerFullAccess,
+            )?;
+            social::run(social_input).and_then(to_pretty_json)
+        }
         "Download" => {
             let download_input = from_value::<download::DownloadInput>(input)?;
             maybe_enforce_permission_check_with_mode(
@@ -1830,6 +1852,7 @@ fn execute_tool_with_enforcer(
             .or_else(|| dev_tools::execute(name, input))
             .or_else(|| media::execute(name, input))
             .or_else(|| signals::execute(name, input))
+            .or_else(|| session_search::execute(name, input))
             .unwrap_or_else(|| Err(format!("unsupported tool: {name}"))),
     }
 }
@@ -3508,8 +3531,12 @@ fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
 }
 
+// Models trained on other agents (Claude Code, opencode) send their
+// argument names (`file_path`, `filePath`, `oldString`, …); accept those too
+// instead of failing the call with "missing field".
 #[derive(Debug, Deserialize)]
 struct ReadFileInput {
+    #[serde(alias = "file_path", alias = "filePath", alias = "filename")]
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -3562,15 +3589,21 @@ struct WriteXlsxInput {
 
 #[derive(Debug, Deserialize)]
 struct WriteFileInput {
+    #[serde(alias = "file_path", alias = "filePath", alias = "filename")]
     path: String,
+    #[serde(alias = "contents", alias = "text")]
     content: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct EditFileInput {
+    #[serde(alias = "file_path", alias = "filePath", alias = "filename")]
     path: String,
+    #[serde(alias = "oldString", alias = "old_str", alias = "old")]
     old_string: String,
+    #[serde(alias = "newString", alias = "new_str", alias = "new")]
     new_string: String,
+    #[serde(alias = "replaceAll")]
     replace_all: Option<bool>,
 }
 
@@ -4037,7 +4070,7 @@ struct AgentJob {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolSearchOutput {
-    matches: Vec<String>,
+    pub matches: Vec<String>,
     query: String,
     normalized_query: String,
     #[serde(rename = "total_deferred_tools")]
@@ -5558,6 +5591,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebFetch",
             "WebSearch",
             "Download",
+            "SocialMedia",
             "TodoWrite",
             "Skill",
             "ToolSearch",
@@ -8109,7 +8143,9 @@ mod media;
 pub mod pdf_extract;
 mod pty_tool;
 mod search_fallback;
+mod session_search;
 mod signals;
+mod social;
 
 /// Fingerprints a memory anchor's code, for `runtime::set_anchor_hasher`.
 #[must_use]
@@ -11222,6 +11258,12 @@ mod tests {
         let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
         assert!(!read_error.is_empty());
+        // Errors reach the model as plain text, not a Debug-printed wrapper.
+        assert!(!read_error.contains("ExecutionError"), "{read_error}");
+        // Other agents' argument names are accepted.
+        let read_alias = execute_tool("read_file", &json!({ "file_path": "nested/demo.txt" }))
+            .expect("file_path alias should read");
+        assert!(read_alias.contains("alpha"));
 
         let edit_once = execute_tool(
             "edit_file",

@@ -287,30 +287,46 @@ async fn execute_bash_async(
     // Its own process group, so stopping it reaches everything it started.
     #[cfg(unix)]
     command.process_group(0);
-    let child = command
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = child.id();
-    let output = child.wait_with_output();
-    tokio::pin!(output);
+    // The output is read on its own tasks, and the command counts as done
+    // when the shell exits, not when its output closes: a program started
+    // in the background (`./server &`) keeps the pipes open for as long as
+    // it runs, and waiting for them hung the turn for hours.
+    let (stdout_buf, stdout_reader) = drain(child.stdout.take());
+    let (stderr_buf, stderr_reader) = drain(child.stderr.take());
     let deadline = async {
         match input.timeout {
             Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
             None => std::future::pending().await,
         }
     };
-    let (output, ended) = tokio::select! {
-        result = &mut output => (result?, None),
-        () = deadline => (stop_group(pid, &mut output).await?, Some(Ended::Timeout)),
-        () = aborted(abort) => (stop_group(pid, &mut output).await?, Some(Ended::Stopped)),
+    let (status, ended) = tokio::select! {
+        status = child.wait() => (status?, None),
+        () = deadline => (stop_group(pid, &mut child).await?, Some(Ended::Timeout)),
+        () = aborted(abort) => (stop_group(pid, &mut child).await?, Some(Ended::Stopped)),
     };
     if let (Some(Ended::Timeout), Some(timeout_ms)) = (&ended, input.timeout) {
         return Ok(timeout_output(&input, timeout_ms, sandbox_status));
     }
+    let output_closed = timeout(OUTPUT_GRACE, async {
+        let _ = stdout_reader.await;
+        let _ = stderr_reader.await;
+    })
+    .await
+    .is_ok();
     let interrupted = ended.is_some();
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let mut stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    let stdout = truncate_output(&String::from_utf8_lossy(&taken(&stdout_buf)));
+    let mut stderr = truncate_output(&String::from_utf8_lossy(&taken(&stderr_buf)));
+    if !output_closed {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(BACKGROUND_HOLDS_OUTPUT_NOTE);
+    }
     if interrupted {
         if !stderr.is_empty() && !stderr.ends_with('\n') {
             stderr.push('\n');
@@ -325,7 +341,7 @@ async fn execute_bash_async(
             stderr.push_str(&note);
         }
     }
-    if output.status.code() != Some(0) {
+    if status.code() != Some(0) {
         if let Some(note) = no_terminal_note(&stdout, &stderr) {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
                 stderr.push('\n');
@@ -334,7 +350,7 @@ async fn execute_bash_async(
         }
     }
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
+    let return_code_interpretation = status.code().and_then(|code| {
         if code == 0 {
             None
         } else {
@@ -362,20 +378,54 @@ async fn execute_bash_async(
 }
 
 /// Asks the command's process group to end, then kills it if it has not
-/// within three seconds, and returns what it printed.
-async fn stop_group<F>(
+/// within three seconds, and returns how the shell exited.
+async fn stop_group(
     pid: Option<u32>,
-    output: &mut std::pin::Pin<&mut F>,
-) -> io::Result<std::process::Output>
-where
-    F: std::future::Future<Output = io::Result<std::process::Output>>,
-{
+    child: &mut tokio::process::Child,
+) -> io::Result<std::process::ExitStatus> {
     signal_group(pid, false);
-    if let Ok(result) = timeout(Duration::from_secs(3), output.as_mut()).await {
+    if let Ok(result) = timeout(Duration::from_secs(3), child.wait()).await {
         return result;
     }
     signal_group(pid, true);
-    output.as_mut().await
+    child.wait().await
+}
+
+/// How long the output may stay open after the shell has exited.
+const OUTPUT_GRACE: Duration = Duration::from_secs(1);
+
+const BACKGROUND_HOLDS_OUTPUT_NOTE: &str = "[claw] The command finished, but a program it started in the background (`&`) still holds its output open, so claw stopped reading it; the program keeps running. To start a long-running program, use run_in_background, or redirect its output: `prog > /tmp/prog.log 2>&1 &`.";
+
+type SharedBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Reads `pipe` to its end on a task, into a buffer that can be taken
+/// before the end comes.
+fn drain<R>(pipe: Option<R>) -> (SharedBuf, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let buf = SharedBuf::default();
+    let sink = buf.clone();
+    let reader = tokio::spawn(async move {
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut sink) = sink.lock() {
+                sink.extend_from_slice(&chunk[..n]);
+            }
+        }
+    });
+    (buf, reader)
+}
+
+fn taken(buf: &SharedBuf) -> Vec<u8> {
+    buf.lock()
+        .map(|mut buf| std::mem::take(&mut *buf))
+        .unwrap_or_default()
 }
 
 fn timeout_output(
@@ -503,6 +553,25 @@ fn validate_sandbox_overrides(
     Ok(())
 }
 
+/// The shell the model's commands run in: bash when it is installed, as
+/// the tool's name promises (Claude Code runs bash too), else `sh`. On
+/// systems where `sh` is dash, models' bash syntax (`<(...)`, `[[ ]]`,
+/// arrays, `{a,b}`) failed: Qwen's `diff <(…)` got "Syntax error: \"(\"
+/// unexpected".
+#[must_use]
+pub fn shell_program() -> &'static str {
+    static SHELL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    SHELL.get_or_init(|| {
+        let on_path = std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("bash").is_file()));
+        if on_path || std::path::Path::new("/bin/bash").is_file() {
+            "bash"
+        } else {
+            "sh"
+        }
+    })
+}
+
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
@@ -514,7 +583,7 @@ fn prepare_command(
             prepared.args(launcher.args).envs(launcher.env);
             prepared
         } else {
-            let mut prepared = Command::new("sh");
+            let mut prepared = Command::new(shell_program());
             prepared.arg("-c").arg(command);
             prepared
         };
@@ -627,6 +696,41 @@ mod tests {
         // The background child was in the same group and was stopped too.
         std::thread::sleep(std::time::Duration::from_secs(4));
         assert!(!marker.exists(), "child kept running after Stop");
+    }
+
+    #[test]
+    fn a_program_left_running_in_the_background_does_not_hang_the_command() {
+        let _config = IsolatedConfigHome::new();
+        let input: BashCommandInput = serde_json::from_value(serde_json::json!({
+            "command": "sleep 30 & echo started",
+            "dangerouslyDisableSandbox": true
+        }))
+        .unwrap();
+        let started = std::time::Instant::now();
+        let output = execute_bash(input).expect("runs");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(output.stdout.trim(), "started");
+        assert!(!output.interrupted);
+        assert!(
+            output.stderr.contains("still holds its output open"),
+            "{}",
+            output.stderr
+        );
+    }
+
+    #[test]
+    fn commands_run_in_bash_when_it_is_installed() {
+        if super::shell_program() != "bash" {
+            return;
+        }
+        let _config = IsolatedConfigHome::new();
+        let input: BashCommandInput = serde_json::from_value(serde_json::json!({
+            "command": "diff <(echo a) <(echo a) && [[ -n x ]] && echo {one,two}",
+            "dangerouslyDisableSandbox": true
+        }))
+        .unwrap();
+        let output = execute_bash(input).expect("runs");
+        assert_eq!(output.stdout.trim(), "one two", "{}", output.stderr);
     }
 
     #[test]

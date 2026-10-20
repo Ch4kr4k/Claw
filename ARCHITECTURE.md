@@ -119,7 +119,13 @@ Key points:
   block, keeping only the newest two. The OpenAI-compatible request moves
   such image messages after the whole run of tool results, so parallel tool
   calls stay paired. The `X11` tool (`tools/src/x11.rs`, over xdotool,
-  wmctrl, ffmpeg and xclip) uses this for screenshots.
+  wmctrl, ffmpeg and xclip) uses this for screenshots. A model that takes no
+  images (the models.dev catalog's `modalities.input`, or a provider that
+  refused one: OpenRouter's "No endpoints found that support image input",
+  llama-server without `mmproj`) gets each image as text instead: what the
+  `visionModel` setting's model says it shows (cached per image), else a
+  note that it was left out (`sends_images`, `images_as_text`). A refusal is
+  retried at once without the image.
 - **COM automation.** `tools/src/com.rs` keeps one PowerShell process per
   claw session (started with `-EncodedCommand`, `-STA`), so COM objects
   survive between calls. Each call sends a JSON line with base64 PowerShell
@@ -196,7 +202,100 @@ Key points:
   `[path: lines a-b of n]` header and are cut at a line boundary, ending with
   the `offset` to continue from. When the cap is set, a `read_file` page is
   sized to the model's context window instead (about a quarter of it, 4k-100k
-  characters; `read_file_budget`), so large-context models read whole files.
+  characters; `read_file_budget`), so large-context models read whole files;
+  up to 64k windows a page is half that, as the prompt, tools and reply
+  already take half the window. Lines are numbered (`<n>\t<text>`, as
+  Claude Code, opencode and hermes number them). A read of a whole file
+  (no `offset`/`limit`) that does not fit in one page returns the file's
+  outline instead: the numbered lines that start its functions, types and
+  sections (`read_file_outline_for_model`); the same call again returns the
+  first page. Paging through whole files filled a 32k window, compaction
+  dropped them, and the model read them again (nine compactions in one run).
+  The terminal shows the range the model got, not the range the tool read.
+  A `read_file` result identical to one still in the session (unpruned) is
+  replaced by a short "unchanged, see above" note
+  (`ConversationRuntime::note_unchanged_read`, after hermes' read dedup).
+- **Deferred tools.** For every model, tools outside `ALWAYS_LOADED_TOOLS`
+  are sent only as names in `ToolSearch`'s description
+  (`defer_tool_definitions`); a search loads its matches into
+  `LOADED_TOOLS`, returns their full definitions, and they are sent from the
+  next request on (hosted models used to get all 87 in full; Nemotron then
+  told the user it had no tool for the web). `NEVER_SENT_TOOLS` (the
+  test-only `TestingPermission`) never reach a model. The system prompt
+  names the loaded settings files but no
+  longer includes the merged settings.
+- **Model-sized limits.** Auto-compaction triggers at the model's window
+  minus its reply budget and a margin for every model whose window is known
+  (`window_auto_compaction_threshold`), not only local ones. Hosted models
+  write the compaction summary themselves (`ApiClient::summarize`,
+  `runtime::SUMMARY_SYSTEM_PROMPT`); local ones keep the summary built from the
+  messages. Non-`read_file` tool results are capped per model
+  (`tool_output_budget`) and saved whole to `~/.claw/tool-output/` when cut.
+  Session JSONL keeps blocks up to 256k characters. OpenRouter requests for
+  Anthropic and Gemini models carry `cache_control` markers
+  (`openai_compat::add_cache_markers`).
+- **Side questions during a turn.** `/btw` typed while a turn runs goes to
+  `turn_keys::set_side_question_handler`: the CLI answers it on a thread from
+  the last request sent to the model (`SIDE_CONTEXT`) and the answer is printed
+  between steps (`turn_keys::print_side_answers`). claw desktop's agent queues
+  prompts that arrive during a turn with `turn_keys::queue_for_running_turn`.
+- **Reasoning across a turn's steps.** The OpenAI-compatible request sends
+  each assistant message's thinking back as `reasoning_content` for the running
+  turn (after the last user request) to local models and to models models.dev
+  marks `interleaved` (as `reasoning` to OpenRouter, which passes it on), as
+  hermes and opencode do. Without it, thinking models
+  lost their plan between tool calls and re-derived it at every step. For
+  `local/` models each step's reasoning is replayed from its end, at most
+  4,000 characters (`replayed_reasoning`, `CLAW_REASONING_REPLAY_MAX_CHARS`):
+  one 36k-character step otherwise took ~9k tokens of a 32k window on every
+  later step. A reply
+  cut off while still thinking is continued with the tail of that thinking and
+  an instruction to decide and act, not a bare "continue"; the cut-off reply
+  itself is not kept, since replaying a whole reply budget of thinking filled
+  small windows and forced a compaction that dropped the files just read.
+  For `local/` models that next request also switches thinking off
+  (`chat_template_kwargs.enable_thinking = false`), since Qwen asked to think
+  briefly still thought up to the limit again. The 3-continuation cap counts
+  cut-offs in a row; a tool call in between resets it. The request after a
+  tool call cut off at the limit also goes without thinking
+  (`ApiRequest::follows_thinking_cut_off`). A reply that stops
+  with only thinking is handled like one cut off mid-thought (hermes treats
+  such replies as empty and retries); it used to end the turn silently.
+- **Social media.** `tools/src/social/` holds `igd` (Instagram), `fbd`
+  (Facebook) and `pind` (Pinterest), ported from the herald service with
+  their SSRF hardening (per-platform host allowlists, DNS-pinned public
+  addresses, size caps); `social::run` is the `SocialMedia` tool around them.
+- **Capabilities prompt.** `capabilities_prompt` (terminal and desktop agent)
+  tells the model what it can do beyond code: showing pictures, which tool
+  fetches what, `/undo`.
+- **Desktop slash commands.** The desktop agent runs the REPL's
+  non-interactive slash commands (`DESKTOP_SLASH_COMMANDS`) through
+  `handle_repl_command`, capturing what they print (stdout/stderr redirected
+  to a pipe with `nix`) and sending it as a `notice`; its turns are
+  checkpointed for `/undo`.
+- **Image check.** After a turn (REPL and desktop agent), the reply's
+  Markdown images are fetched as the app fetches them (`image_check`,
+  `image_problem`); ones that fail or are not images go back to the model in
+  one follow-up turn, as LeanGate does for type errors.
+- **Prompt progress.** Requests to `local/` models ask llama.cpp for
+  `return_progress`; its `prompt_progress` chunks reach
+  `api::set_prompt_progress_hook`, which the CLI shows on the activity row
+  and spinner and the desktop agent sends as `progress` events.
+- **Shell.** The bash tool, its sandbox and `Monitor` run commands with
+  `bash -c` when bash is installed (`runtime::shell_program`), else `sh -c`;
+  where `sh` is dash, models' bash syntax (`<(...)`, `[[ ]]`) failed.
+- **Tolerant tool calls.** Calls by other agents' tool names (`Read`, `read`,
+  `Bash`) resolve to claw's tools (`CliToolExecutor::resolve_tool_name`), and
+  the file tools accept their argument names (`file_path`, `oldString`, …).
+  `edit_file` matches exactly, then with typographic quotes/dashes/spaces as
+  plain ones, then line by line ignoring trailing whitespace and `\r`, then
+  ignoring indentation when that finds a single place (`find_edit_matches`,
+  after opencode), re-indenting `new_string` to the file (`reindent`); line
+  numbers copied from `read_file` output are stripped.
+  It refuses an `old_string` that occurs more than once unless `replace_all`
+  is set. A miss shows the closest lines of the file, numbered
+  (`closest_lines`, as aider does), so the model fixes `old_string` without
+  re-reading the file. Tool errors reach the model as plain text.
 - **Repeat guard.** When a tool call repeats the previous call exactly and
   gets the same result, the CLI adds a note to that result telling the model
   that repeating it will not return anything new (`CliToolExecutor::note_repeated_call`).
@@ -292,7 +391,11 @@ Each round also cuts tool results longer than about a quarter of the window
 since one whole large file in a kept message can overflow the window alone.
 The window is the one the error reports, else the model's known window
 (`known_context_window`: `api::local_context_window` for `local/` models, else
-`api::model_token_limit`), else the size of the request that overflowed, an
+`api::model_token_limit`, else `api::hosted_context_window`: the models.dev
+catalog in `api::providers::catalog`, cached in `~/.claw/cache/`, then the
+provider's `/models` list). The same catalog supplies the OpenAI-compatible
+providers that `api::all_hosted_providers` lists after the built-in and custom
+ones (`catalog_hosted`, loaded only when a model prefix is not otherwise known), else the size of the request that overflowed, an
 upper bound that shrinks each round; so large-context models are cut only for
 enormous results. `CLAW_OVERFLOW_TOOL_RESULT_CHARS` or the
 `overflowToolResultChars` setting overrides it (`off` never cuts). A round

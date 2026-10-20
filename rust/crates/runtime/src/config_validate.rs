@@ -111,6 +111,10 @@ impl FieldType {
     }
 
     fn matches(self, value: &JsonValue) -> bool {
+        // `null` is a placeholder for "not set" (dropped when files merge).
+        if matches!(value, JsonValue::Null) {
+            return true;
+        }
         match self {
             Self::String => value.as_str().is_some(),
             Self::Bool => value.as_bool().is_some(),
@@ -231,6 +235,58 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "providerFallbacks",
         expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "auxiliaryModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "visionModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "fastModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "viewMode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "outputStyle",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "diffPanel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "scrollSpeed",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "autoCompactWindow",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "overflowToolResultChars",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "statusLine",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "lspServers",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "apiTimeout",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "learning",
+        expected: FieldType::String,
     },
     FieldSpec {
         name: "trustedRoots",

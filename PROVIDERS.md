@@ -61,7 +61,10 @@ echo '[ -f ~/.config/claw-keys.env ] && . ~/.config/claw-keys.env' >> ~/.bashrc
 ```
 
 Only add the keys you have. Never commit this file or paste keys into
-`.claw.json`.
+`.claw.json`. The `claw` launcher also loads this file itself
+(`CLAW_KEYS_FILE` names another one), so claw started outside a shell, such
+as claw desktop or a menu entry, has the keys too; variables already set in
+the environment win.
 
 Which variable to use:
 
@@ -129,6 +132,26 @@ that provider's key is set. Model ids change often: `/login` shows the
 current ones. For Z.ai's GLM Coding Plan set
 `ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4`; in China,
 `https://open.bigmodel.cn/api/paas/v4`.
+
+**Every other provider opencode supports** works the same way: the
+[models.dev](https://models.dev) catalog lists about 190 OpenAI-compatible
+providers (OpenCode Zen and Go, Fireworks, Chutes, Moonshot, Together, Deep
+Infra's compatible API, …) with their API URL and key variable. Export the key
+it names and use `<provider id>/<model>`, for example
+`OPENCODE_API_KEY=… claw --model opencode/qwen3.6-plus` or
+`FIREWORKS_API_KEY=… claw --model fireworks-ai/accounts/fireworks/models/<model>`.
+`<PROVIDER_ID>_BASE_URL` overrides the URL (`fireworks-ai` → `FIREWORKS_AI_BASE_URL`).
+Built-in providers and `customProviders` take precedence over a catalog entry
+with the same id. `/login` lists them all (type to filter), and `/model` lists
+the models of each one whose key is set. OpenCode Zen's free models only work
+from the opencode app itself; through claw they need a paid Zen key.
+
+claw learns each hosted model's context window and output limit from the
+[models.dev](https://models.dev) catalog (the one opencode uses), cached in
+`~/.claw/cache/models-dev.json` and refreshed daily, else from the provider's
+`/models` list (OpenRouter's `context_length`). The window sizes file reads and
+auto-compaction; the output limit (at most 64k) is the reply budget. Models the
+catalog doesn't know keep the provider's default budget.
 
 ```bash
 env -u OLLAMA_HOST ZAI_API_KEY=... ~/.local/lib/claw/claw --model zai/glm-4.6

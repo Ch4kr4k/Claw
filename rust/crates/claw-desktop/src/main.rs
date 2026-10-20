@@ -20,7 +20,7 @@ use std::time::Duration;
 use iced::keyboard;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    button, checkbox, column, container, markdown, mouse_area, pick_list, rich_text, row, rule,
+    button, checkbox, column, combo_box, container, markdown, mouse_area, rich_text, row, rule,
     scrollable, space, span, text, text_editor, text_input, toggler, tooltip, Column,
 };
 use iced::{Alignment, Element, Font, Length, Subscription, Task, Theme};
@@ -119,6 +119,9 @@ struct Chat {
     rewind: Option<usize>,
     /// Background shells and monitors the agent has running: (id, command).
     background: Vec<(String, String)>,
+    /// How far the local model has read the prompt (done, total tokens),
+    /// until its reply starts: a cold server takes minutes over it.
+    progress: Option<(u64, u64)>,
     /// The user named the chat, so the first message does not, and the name
     /// is saved once the chat has a session file.
     custom_title: bool,
@@ -133,6 +136,7 @@ impl Chat {
             items: Vec::new(),
             agent: None,
             busy: false,
+            progress: None,
             model: None,
             active_model: None,
             pending: None,
@@ -311,6 +315,10 @@ struct App {
     composer: text_editor::Content,
     default_model: Option<String>,
     models: Vec<String>,
+    /// The model picker: type to filter `models`.
+    model_box: combo_box::State<String>,
+    /// Every model claw can reach (`claw __list-models`), once listed.
+    listed_models: Vec<String>,
     confirm_delete: Option<PathBuf>,
     confirm_delete_project: Option<usize>,
     /// Multi-select mode for deleting several chats.
@@ -365,6 +373,7 @@ enum Message {
     PickFolder,
     FolderPicked(Option<PathBuf>),
     ModelSelected(String),
+    ModelsListed(Vec<String>),
     Decide(&'static str),
     Answer(String),
     AnswerText(String),
@@ -461,7 +470,9 @@ impl App {
             current: 0,
             composer: text_editor::Content::new(),
             default_model,
+            model_box: combo_box::State::new(models.clone()),
             models,
+            listed_models: Vec::new(),
             confirm_delete: None,
             confirm_delete_project: None,
             selecting: false,
@@ -489,7 +500,14 @@ impl App {
             app.scanning = true;
             scan_task()
         };
-        (app, task)
+        (app, Task::batch([task, list_models_task()]))
+    }
+
+    /// Replaces the picker's models: local ones and aliases first, then
+    /// every listed one.
+    fn set_models(&mut self, base: Vec<String>) {
+        self.models = store::merge_model_choices(base, self.listed_models.clone());
+        self.model_box = combo_box::State::new(self.models.clone());
     }
 
     fn title(&self) -> String {
@@ -839,7 +857,14 @@ impl App {
                 if let Some(agent) = chat.agent.as_mut() {
                     agent.set_model(&model);
                 }
-                chat.model = Some(model);
+                chat.model = Some(model.clone());
+                // The agent saves it as the default, as `/model` does.
+                self.default_model = Some(model);
+            }
+            Message::ModelsListed(listed) => {
+                self.listed_models = listed;
+                let (_, base) = store::model_choices();
+                self.set_models(base);
             }
             Message::Decide(decision) => {
                 let chat = self.chat();
@@ -971,7 +996,8 @@ impl App {
                 self.refresh_sessions();
                 let (default_model, models) = store::model_choices();
                 self.default_model = default_model;
-                self.models = models;
+                self.set_models(models);
+                return list_models_task();
             }
             Message::Rescan => {
                 if !self.scanning {
@@ -1245,8 +1271,48 @@ impl App {
         let Some(chat) = self.chats.get_mut(&key) else {
             return false;
         };
-        if chat.busy {
-            return false;
+        // `/btw` and `/fallback` are answered by the agent without a turn.
+        let setting = text.trim_start().starts_with("/fallback");
+        let side_question = text.trim_start().starts_with("/btw ") || setting;
+        if setting && chat.agent.is_none() {
+            // A settings command needs no conversation: start the agent for it.
+            match Agent::spawn(
+                key,
+                &chat.cwd,
+                chat.session_path.as_deref(),
+                chat.model.as_deref(),
+                chat.incognito,
+            ) {
+                Ok(agent) => chat.agent = Some(agent),
+                Err(error) => {
+                    chat.items
+                        .push(Item::Error(format!("Could not start claw: {error}")));
+                    return false;
+                }
+            }
+        }
+        if chat.busy || side_question {
+            // While the agent works a message is queued for its next step,
+            // and a `/btw` side question is answered at once (as in the
+            // terminal and Claude Code). Neither starts a turn here.
+            let Some(agent) = chat.agent.as_mut() else {
+                if side_question {
+                    chat.items.push(Item::Notice(
+                        "/btw needs a conversation first: send a message, then ask.".to_string(),
+                    ));
+                    return true;
+                }
+                return false;
+            };
+            agent.prompt(text);
+            chat.items.push(if setting {
+                Item::Notice(text.trim().to_string())
+            } else if side_question {
+                Item::Notice(format!("{} (side question)", text.trim()))
+            } else {
+                Item::User(text.to_string())
+            });
+            return true;
         }
         if chat.agent.is_none() {
             match Agent::spawn(
@@ -1451,6 +1517,15 @@ impl App {
                 });
             }
             "error" => chat.items.push(Item::Error(field("message"))),
+            "info" => chat.items.push(Item::Notice(field("text"))),
+            "queued" => chat.items.push(Item::Notice(
+                "Queued: the agent reads it before its next step.".to_string(),
+            )),
+            "btw" => chat.items.push(Item::Notice(format!(
+                "/btw {}\n{}\n(side question, not added to the conversation)",
+                field("question"),
+                field("answer")
+            ))),
             "context" => {
                 chat.context = Some((
                     value
@@ -1467,6 +1542,12 @@ impl App {
                 ));
             }
             "turn_start" => chat.busy = true,
+            "progress" => {
+                let number = |key: &str| value.get(key).and_then(Value::as_u64);
+                if let (Some(done), Some(total)) = (number("done"), number("total")) {
+                    chat.progress = Some((done, total));
+                }
+            }
             // A note from the agent between turns (LeanGate, …).
             "notice" => chat.items.push(Item::Notice(field("text"))),
             "background" => {
@@ -1485,6 +1566,7 @@ impl App {
             }
             "turn_end" => {
                 chat.busy = false;
+                chat.progress = None;
                 chat.pending = None;
                 if field("status") == "stopped" {
                     chat.items.push(Item::Notice("Stopped".to_string()));
@@ -2002,9 +2084,14 @@ impl App {
             .clone()
             .or_else(|| chat.active_model.clone())
             .or_else(|| self.default_model.clone());
-        let model_picker = pick_list(self.models.clone(), selected_model, Message::ModelSelected)
-            .text_size(13)
-            .placeholder("Model");
+        let model_picker = combo_box(
+            &self.model_box,
+            "Model (type to filter)",
+            selected_model.as_ref(),
+            Message::ModelSelected,
+        )
+        .size(13)
+        .width(Length::Fixed(320.0));
         let project = self
             .store
             .project_for(&chat.cwd)
@@ -2104,7 +2191,16 @@ impl App {
             items = items.push(self.item_view(index, item, &theme, retry));
         }
         if chat.busy && chat.pending.is_none() {
-            items = items.push(text("claw is working…").size(13).style(theme::muted));
+            let status = match chat.progress {
+                Some((done, total)) if total > 0 && done < total => format!(
+                    "Reading the prompt: {}% ({} of {} tokens)…",
+                    done * 100 / total,
+                    done,
+                    total
+                ),
+                _ => "claw is working…".to_string(),
+            };
+            items = items.push(text(status).size(13).style(theme::muted));
         }
         let conversation = scrollable(container(items).center_x(Length::Fill))
             .anchor_bottom()
@@ -3250,6 +3346,11 @@ fn notify(summary: &str, body: &str) {
     let _ = std::process::Command::new("notify-send")
         .args(["-a", "Claw", "-i", "claw", summary, body])
         .spawn();
+}
+
+/// Lists every model claw can reach, in the background.
+fn list_models_task() -> Task<Message> {
+    Task::perform(store::listed_models(), Message::ModelsListed)
 }
 
 fn scan_task() -> Task<Message> {

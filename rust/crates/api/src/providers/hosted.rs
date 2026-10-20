@@ -156,11 +156,81 @@ pub const HOSTED_OPENAI_PROVIDERS: &[HostedOpenAiProvider] = &[
     },
 ];
 
-/// Built-in providers, then the ones from `customProviders` in settings.
+/// Built-in providers, then the ones from `customProviders` in settings,
+/// then the models.dev catalog's OpenAI-compatible providers (opencode's
+/// list: OpenCode Zen, Fireworks, Chutes, Moonshot, …). The catalog is only
+/// loaded when iteration gets that far.
 pub fn all_hosted_providers() -> impl Iterator<Item = &'static HostedOpenAiProvider> {
     HOSTED_OPENAI_PROVIDERS
         .iter()
         .chain(custom().providers.iter())
+        .chain(std::iter::once(()).flat_map(|()| catalog_hosted().iter()))
+}
+
+/// Model prefixes claw routes itself (the local server, OpenAI, xAI,
+/// DashScope, Anthropic), which a catalog provider must not take over.
+const RESERVED_PREFIXES: &[&str] = &[
+    "local",
+    "openai",
+    "xai",
+    "qwen",
+    "kimi",
+    "dashscope",
+    "anthropic",
+    "claude",
+    "ollama",
+];
+
+/// The catalog's OpenAI-compatible providers as hosted providers, built
+/// once per process. Ids that are built in, custom or reserved are skipped.
+fn catalog_hosted() -> &'static [HostedOpenAiProvider] {
+    static CATALOG: OnceLock<Vec<HostedOpenAiProvider>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        super::catalog::catalog_providers()
+            .into_iter()
+            .filter(|provider| {
+                !provider.id.contains('/')
+                    && !RESERVED_PREFIXES.contains(&provider.id.as_str())
+                    && hosted_builtin(&provider.id).is_none()
+                    && !custom()
+                        .providers
+                        .iter()
+                        .any(|custom| custom.id.eq_ignore_ascii_case(&provider.id))
+            })
+            .map(|provider| {
+                let key_env = leak(provider.key_env);
+                let label = leak(provider.name);
+                HostedOpenAiProvider {
+                    id: leak(provider.id.clone()),
+                    label,
+                    bare_model_prefixes: &[],
+                    config: OpenAiCompatConfig {
+                        provider_name: label,
+                        api_key_env: key_env,
+                        base_url_env: leak(format!("{}_BASE_URL", env_stem(&provider.id))),
+                        default_base_url: leak(provider.api),
+                        max_request_body_bytes: OPENAI_MAX_REQUEST_BODY_BYTES,
+                    },
+                    credential_env_vars: Box::leak(vec![key_env].into_boxed_slice()),
+                    default_max_output_tokens: 8_192,
+                    base_url_note: None,
+                }
+            })
+            .collect()
+    })
+}
+
+/// `fireworks-ai` -> `FIREWORKS_AI`, for the provider's variable names.
+fn env_stem(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 struct Custom {
@@ -213,16 +283,7 @@ fn parse_custom(entries: &serde_json::Map<String, Value>) -> Custom {
         if id.is_empty() || id.contains('/') || id == "local" || hosted_builtin(&id).is_some() {
             continue;
         }
-        let stem: String = id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_uppercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let stem = env_stem(&id);
         let key_env = entry
             .get("apiKeyEnv")
             .and_then(Value::as_str)
@@ -273,6 +334,9 @@ fn hosted_builtin(id: &str) -> Option<&'static HostedOpenAiProvider> {
 /// The provider saved as `provider.kind` = `id`.
 #[must_use]
 pub fn hosted_openai_provider(id: &str) -> Option<&'static HostedOpenAiProvider> {
+    if RESERVED_PREFIXES.contains(&id.to_ascii_lowercase().as_str()) {
+        return None;
+    }
     all_hosted_providers().find(|provider| provider.id.eq_ignore_ascii_case(id))
 }
 
@@ -281,12 +345,18 @@ pub fn hosted_openai_provider(id: &str) -> Option<&'static HostedOpenAiProvider>
 #[must_use]
 pub fn hosted_openai_provider_for_model(model: &str) -> Option<&'static HostedOpenAiProvider> {
     let lowered = model.trim().to_ascii_lowercase();
-    if let Some(provider) = all_hosted_providers().find(|provider| {
-        lowered
-            .strip_prefix(provider.id)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .is_some_and(|rest| !rest.is_empty())
-    }) {
+    let reserved = lowered
+        .split_once('/')
+        .is_none_or(|(prefix, _)| RESERVED_PREFIXES.contains(&prefix));
+    if let Some(provider) = all_hosted_providers()
+        .take_while(|_| !reserved)
+        .find(|provider| {
+            lowered
+                .strip_prefix(provider.id)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|rest| !rest.is_empty())
+        })
+    {
         return Some(provider);
     }
     HOSTED_OPENAI_PROVIDERS.iter().find(|provider| {
@@ -343,6 +413,141 @@ pub async fn list_models(
     parse_model_ids(&body)
 }
 
+/// The context window of a hosted model in tokens: from the models.dev
+/// catalog ([`super::catalog`]), else as its provider's `/models` list
+/// reports it (`context_length` on OpenRouter,
+/// `context_window` on Groq, `max_context_length` on Mistral). Fetched once
+/// per provider and cached for the process; a failed fetch is retried after
+/// [`HOSTED_WINDOW_RETRY`]. `None` for models not routed to a hosted
+/// provider, or when the provider does not say.
+#[must_use]
+pub fn hosted_context_window(model: &str) -> Option<u32> {
+    let provider = hosted_openai_provider_for_model(model)?;
+    let wire_id = strip_hosted_prefix(model).unwrap_or(model);
+    super::catalog::catalog_limit(provider.id, wire_id)
+        .map(|limit| limit.context)
+        .filter(|context| *context > 0)
+        .or_else(|| hosted_windows(provider)?.get(wire_id).copied())
+}
+
+/// Whether a hosted model takes images, per the models.dev catalog; `None`
+/// when the catalog does not say.
+#[must_use]
+pub fn hosted_accepts_images(model: &str) -> Option<bool> {
+    let provider = hosted_openai_provider_for_model(model)?;
+    let wire_id = strip_hosted_prefix(model).unwrap_or(model);
+    super::catalog::catalog_limit(provider.id, wire_id)?.images
+}
+
+/// What a hosted model costs per the models.dev catalog: USD per million
+/// input and output tokens (`(0.0, 0.0)` for free models).
+#[must_use]
+pub fn hosted_model_cost(model: &str) -> Option<(f64, f64)> {
+    let provider = hosted_openai_provider_for_model(model)?;
+    let wire_id = strip_hosted_prefix(model).unwrap_or(model);
+    super::catalog::catalog_limit(provider.id, wire_id)?.cost
+}
+
+/// Whether a hosted model wants the reasoning of the turn's earlier steps
+/// sent back (`reasoning_content`), per the models.dev catalog.
+#[must_use]
+pub fn hosted_replays_reasoning(model: &str) -> bool {
+    let Some(provider) = hosted_openai_provider_for_model(model) else {
+        return false;
+    };
+    let wire_id = strip_hosted_prefix(model).unwrap_or(model);
+    super::catalog::catalog_limit(provider.id, wire_id).is_some_and(|limit| limit.replays_reasoning)
+}
+
+/// The reply budget for a hosted model the models.dev catalog knows: its
+/// output limit, at most `cap`. `None` leaves the provider's default.
+#[must_use]
+pub fn hosted_max_output_tokens(model: &str, cap: u32) -> Option<u32> {
+    let provider = hosted_openai_provider_for_model(model)?;
+    let wire_id = strip_hosted_prefix(model).unwrap_or(model);
+    super::catalog::catalog_limit(provider.id, wire_id)
+        .map(|limit| limit.output)
+        .filter(|output| *output > 0)
+        .map(|output| output.min(cap))
+}
+
+/// How long a failed `/models` fetch is remembered before trying again.
+const HOSTED_WINDOW_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+type WindowTable = HashMap<String, u32>;
+
+fn hosted_windows(provider: &HostedOpenAiProvider) -> Option<std::sync::Arc<WindowTable>> {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    type Cache = HashMap<&'static str, (Instant, Option<Arc<WindowTable>>)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((at, table)) = cache.lock().ok()?.get(provider.id) {
+        if table.is_some() || at.elapsed() < HOSTED_WINDOW_RETRY {
+            return table.clone();
+        }
+    }
+    let base_url = std::env::var(provider.config.base_url_env)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| provider.config.default_base_url.to_string());
+    let api_key = std::env::var(provider.config.api_key_env).unwrap_or_default();
+    let table = fetch_model_windows(&base_url, &api_key).map(Arc::new);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(provider.id, (Instant::now(), table.clone()));
+    }
+    table
+}
+
+/// Fetches `<base>/models` on its own thread and runtime, so it can be
+/// called from synchronous code whether or not a Tokio runtime is running.
+fn fetch_model_windows(base_url: &str, api_key: &str) -> Option<WindowTable> {
+    let base = base_url.trim().trim_end_matches('/').to_string();
+    let api_key = api_key.trim().to_string();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(async {
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .ok()?;
+            let mut request = http.get(format!("{base}/models"));
+            if !api_key.is_empty() {
+                request = request.bearer_auth(api_key);
+            }
+            let response = request.send().await.ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            parse_model_windows(&response.text().await.ok()?)
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
+}
+
+fn parse_model_windows(body: &str) -> Option<WindowTable> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let entries = json.get("data")?.as_array()?;
+    let table = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?;
+            let window = ["context_length", "context_window", "max_context_length"]
+                .iter()
+                .find_map(|key| entry.get(*key)?.as_u64())
+                .or_else(|| entry.get("top_provider")?.get("context_length")?.as_u64())?;
+            Some((id.to_string(), u32::try_from(window).ok()?))
+        })
+        .filter(|(_, window)| *window > 0)
+        .collect::<WindowTable>();
+    Some(table)
+}
+
 fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
     let json: serde_json::Value =
         serde_json::from_str(body).map_err(|error| format!("unexpected reply: {error}"))?;
@@ -370,8 +575,26 @@ fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::{
         hosted_openai_provider, hosted_openai_provider_for_model, parse_model_ids,
-        strip_hosted_prefix,
+        parse_model_windows, strip_hosted_prefix,
     };
+
+    #[test]
+    fn parses_context_windows_from_model_lists() {
+        let body = r#"{"data":[
+            {"id":"poolside/laguna-s-2.1:free","context_length":262144},
+            {"id":"llama-3.3-70b-versatile","context_window":131072},
+            {"id":"mistral-large-latest","max_context_length":128000},
+            {"id":"x/nested","top_provider":{"context_length":8192}},
+            {"id":"x/unknown"}
+        ]}"#;
+        let table = parse_model_windows(body).expect("table");
+        assert_eq!(table.get("poolside/laguna-s-2.1:free"), Some(&262_144));
+        assert_eq!(table.get("llama-3.3-70b-versatile"), Some(&131_072));
+        assert_eq!(table.get("mistral-large-latest"), Some(&128_000));
+        assert_eq!(table.get("x/nested"), Some(&8_192));
+        assert_eq!(table.get("x/unknown"), None);
+        assert!(parse_model_windows("{}").is_none());
+    }
 
     #[test]
     fn parses_model_lists() {

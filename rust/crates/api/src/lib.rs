@@ -24,7 +24,8 @@ pub use prompt_cache::{
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::hosted::{
-    all_hosted_providers, hosted_openai_provider, hosted_openai_provider_for_model, list_models,
+    all_hosted_providers, hosted_accepts_images, hosted_context_window, hosted_max_output_tokens,
+    hosted_model_cost, hosted_openai_provider, hosted_openai_provider_for_model, list_models,
     HostedOpenAiProvider, HOSTED_OPENAI_PROVIDERS,
 };
 pub use providers::local_window::{
@@ -54,3 +55,20 @@ pub use telemetry::{
     MemoryTelemetrySink, SessionTraceRecord, SessionTracer, TelemetryEvent, TelemetrySink,
     DEFAULT_ANTHROPIC_VERSION,
 };
+
+/// Called with (prompt tokens read so far, of how many) while a local
+/// llama.cpp server reads a request's prompt (`return_progress`). A cold
+/// server reads claw's ~10k-token prompt for about two minutes before the
+/// first word; without this the app looked frozen.
+static PROMPT_PROGRESS_HOOK: std::sync::OnceLock<fn(u64, u64)> = std::sync::OnceLock::new();
+
+/// Sets the function that shows prompt-reading progress (once per process).
+pub fn set_prompt_progress_hook(hook: fn(u64, u64)) {
+    let _ = PROMPT_PROGRESS_HOOK.set(hook);
+}
+
+pub(crate) fn report_prompt_progress(done: u64, total: u64) {
+    if let Some(hook) = PROMPT_PROGRESS_HOOK.get() {
+        hook(done, total);
+    }
+}

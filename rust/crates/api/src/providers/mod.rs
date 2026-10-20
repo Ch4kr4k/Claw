@@ -9,6 +9,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod catalog;
 pub mod hosted;
 pub mod local_window;
 pub mod openai_compat;
@@ -634,7 +635,13 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
     if model_token_limit(model).is_none() {
         if let Some(hosted) = hosted::hosted_openai_provider_for_model(&canonical) {
-            return hosted.default_max_output_tokens;
+            let budget = hosted::hosted_max_output_tokens(&canonical, 64_000)
+                .unwrap_or(hosted.default_max_output_tokens);
+            // At most a quarter of the window, like a local model: a 128k
+            // model asked for 64k of reply has room for only 64k of history.
+            return hosted::hosted_context_window(&canonical).map_or(budget, |window| {
+                budget.min(local_window::local_max_output_tokens_for_window(window))
+            });
         }
     }
     let heuristic = if canonical.contains("opus") {

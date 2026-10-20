@@ -233,15 +233,67 @@ pub fn model_choices() -> (Option<String>, Vec<String>) {
     (default, choices)
 }
 
-/// The model id behind a choice from [`model_choices`]: an alias shown as
-/// `coder → local/x` is selected as `coder`.
+/// The model id behind a choice from [`model_choices`] or [`listed_models`]:
+/// an alias shown as `coder → local/x` is selected as `coder`, a listed
+/// model `openrouter/x  ·  OpenRouter · free` as `openrouter/x`.
 pub fn model_id(choice: &str) -> String {
     choice
         .split(" → ")
         .next()
         .unwrap_or(choice)
+        .split(MODEL_NOTES_SEPARATOR)
+        .next()
+        .unwrap_or(choice)
         .trim()
         .to_string()
+}
+
+/// Between a listed model and what is known about it.
+const MODEL_NOTES_SEPARATOR: &str = "  ·  ";
+
+/// Every model claw can switch to, as `/model` in the terminal lists it
+/// (each provider whose key is set, with context size and price), from
+/// `claw __list-models` run through the launcher, which loads the keys.
+/// Empty when claw cannot be run.
+pub async fn listed_models() -> Vec<String> {
+    let Ok(output) = tokio::process::Command::new(crate::agent::claw_program())
+        .arg("__list-models")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|row| {
+            let model = row.get("model")?.as_str()?.to_string();
+            let notes = row.get("notes").and_then(Value::as_str).unwrap_or("");
+            Some(if notes.is_empty() {
+                model
+            } else {
+                format!("{model}{MODEL_NOTES_SEPARATOR}{notes}")
+            })
+        })
+        .collect()
+}
+
+/// `base` (local models and aliases) followed by the `listed` models it
+/// does not already offer.
+pub fn merge_model_choices(base: Vec<String>, listed: Vec<String>) -> Vec<String> {
+    let mut seen = base
+        .iter()
+        .map(|choice| model_id(choice))
+        .collect::<BTreeSet<_>>();
+    let mut merged = base;
+    for choice in listed {
+        if seen.insert(model_id(&choice)) {
+            merged.push(choice);
+        }
+    }
+    merged
 }
 
 /// Whether claw can reach Anthropic: an API key in the environment or a

@@ -100,6 +100,9 @@ struct Picker {
     typing: Option<String>,
     /// Whether the last row offers "Type something else".
     allow_other: bool,
+    /// Type-to-filter, for long lists (`/model`): every choice, and the
+    /// query; `choices` holds the ones matching it.
+    filter: Option<(Vec<Choice>, String)>,
 }
 
 /// Most option rows shown at once; longer lists scroll with the cursor.
@@ -124,7 +127,64 @@ impl Picker {
             choices,
             typing,
             allow_other: true,
+            filter: None,
         }
+    }
+
+    /// Turns on type-to-filter: typed text narrows the list to choices whose
+    /// label or description contains every word of it (any case).
+    fn filterable(mut self) -> Self {
+        self.allow_other = false;
+        self.typing = None;
+        self.filter = Some((self.choices.clone(), String::new()));
+        self
+    }
+
+    fn refilter(&mut self) {
+        let Some((all, query)) = &self.filter else {
+            return;
+        };
+        let words = query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        self.choices = all
+            .iter()
+            .filter(|choice| {
+                let text = format!(
+                    "{} {}",
+                    choice.label,
+                    choice.description.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                words.iter().all(|word| text.contains(word.as_str()))
+            })
+            .cloned()
+            .collect();
+        self.checked = vec![false; self.choices.len()];
+        self.cursor = 0;
+    }
+
+    /// Keys of a filterable list that edit the query. `None` when the key
+    /// is not one of them (arrows, Enter, Esc on an empty query).
+    fn handle_filter_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<KeyOutcome> {
+        let (_, query) = self.filter.as_mut()?;
+        match key.code {
+            KeyCode::Char('u') if ctrl => query.clear(),
+            KeyCode::Char(ch) if !ctrl => query.push(ch),
+            KeyCode::Backspace => {
+                query.pop()?;
+            }
+            KeyCode::Esc if !query.is_empty() => query.clear(),
+            // Nothing matches: Enter uses the query as typed.
+            KeyCode::Enter if self.choices.is_empty() && !query.trim().is_empty() => {
+                return Some(KeyOutcome::Done(Answer::Typed(query.trim().to_string())));
+            }
+            KeyCode::Enter if self.choices.is_empty() => return Some(KeyOutcome::Continue),
+            _ => return None,
+        }
+        self.refilter();
+        Some(KeyOutcome::Continue)
     }
 
     /// Rows the cursor can be on: the choices plus "Type something else".
@@ -161,6 +221,15 @@ impl Picker {
                 _ => {}
             }
             return KeyOutcome::Continue;
+        }
+        if let Some(outcome) = self.handle_filter_key(key, ctrl) {
+            return outcome;
+        }
+        if self.rows() == 0 {
+            return match key.code {
+                KeyCode::Esc => KeyOutcome::Done(Answer::Cancelled),
+                _ => KeyOutcome::Continue,
+            };
         }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -222,8 +291,22 @@ impl Picker {
             .clone()]))
     }
 
-    /// The picker's screen lines (without the left margin), fitted to `width`.
-    fn lines(&self, width: usize, colored: bool) -> Vec<String> {
+    /// The picker's screen lines (without the left margin), fitted to
+    /// `width` and, by showing fewer options at once, to `height` lines: a
+    /// picker taller than the terminal scrolls its question, filter and
+    /// highlighted row out of sight.
+    fn lines(&self, width: usize, height: usize, colored: bool) -> Vec<String> {
+        let mut visible = MAX_VISIBLE_ROWS;
+        loop {
+            let lines = self.lines_showing(visible, width, colored);
+            if lines.len() <= height || visible == 1 {
+                return lines;
+            }
+            visible -= 1;
+        }
+    }
+
+    fn lines_showing(&self, visible: usize, width: usize, colored: bool) -> Vec<String> {
         let paint = |style: &str, text: &str| {
             if colored {
                 format!("{style}{text}\x1b[0m")
@@ -264,16 +347,25 @@ impl Picker {
                 paint("\x1b[1m", &rest)
             ));
         }
+        if let Some((_, query)) = &self.filter {
+            lines.push(format!("{} {query}▏", paint("\x1b[2m", "filter:")));
+            if self.choices.is_empty() {
+                let note = if query.trim().is_empty() {
+                    "nothing to choose from".to_string()
+                } else {
+                    format!("no match · Enter uses “{}”", query.trim())
+                };
+                lines.push(paint("\x1b[2m", &format!("  {}", fit(&note, width))));
+            }
+        }
         // A long list shows a window around the cursor.
         let rows = self.rows();
-        let start = if rows > MAX_VISIBLE_ROWS {
-            self.cursor
-                .saturating_sub(MAX_VISIBLE_ROWS / 2)
-                .min(rows - MAX_VISIBLE_ROWS)
+        let start = if rows > visible {
+            self.cursor.saturating_sub(visible / 2).min(rows - visible)
         } else {
             0
         };
-        let end = (start + MAX_VISIBLE_ROWS).min(rows);
+        let end = (start + visible).min(rows);
         if start > 0 {
             lines.push(paint("\x1b[2m", &format!("  ↑ {start} more")));
         }
@@ -324,6 +416,8 @@ impl Picker {
         }
         let hint = if self.typing.is_some() {
             "type your answer · Enter send · Esc back"
+        } else if self.filter.is_some() {
+            "type to filter · ↑↓ move · Enter select · Esc clear/cancel"
         } else if self.multi {
             "↑↓ move · Space toggle · Enter confirm · Esc cancel"
         } else {
@@ -376,9 +470,13 @@ fn run_picker(mut picker: Picker) -> io::Result<Answer> {
     let result: io::Result<(Answer, usize)> = (|| {
         let mut drawn = 0_usize;
         loop {
-            let width = terminal::size().map_or(80, |(cols, _)| usize::from(cols));
-            let width = width.saturating_sub(2 * OUTPUT_MARGIN).max(20);
-            let lines = picker.lines(width, colored);
+            let (cols, term_rows) = terminal::size().map_or((80, 24), |(cols, rows)| {
+                (usize::from(cols), usize::from(rows))
+            });
+            let width = cols.saturating_sub(2 * OUTPUT_MARGIN).max(20);
+            // Leave room for the blank line above and the status lines below.
+            let height = term_rows.saturating_sub(4).max(6);
+            let lines = picker.lines(width, height, colored);
             let mut frame = String::new();
             if drawn > 0 {
                 frame.push_str(&format!("\x1b[{drawn}A"));
@@ -506,6 +604,40 @@ pub fn pick(
     if !allow_other && options.is_empty() {
         return Ok(Pick::Cancelled);
     }
+    terminal_keys_paused(|| {
+        Ok(match run_picker(picker)? {
+            Answer::Chosen(labels) => labels
+                .first()
+                .and_then(|label| options.iter().position(|(option, _)| option == label))
+                .map_or(Pick::Cancelled, Pick::Index),
+            Answer::Typed(text) => Pick::Typed(text),
+            Answer::Cancelled => Pick::Cancelled,
+        })
+    })
+}
+
+/// [`pick`] for long lists: typing filters the options (see
+/// `Picker::filterable`), and Enter with no match returns the typed text.
+pub fn pick_filtered(
+    question: &str,
+    options: &[(String, Option<String>)],
+    default: usize,
+) -> io::Result<Pick> {
+    let mut picker = Picker::new(AskInput {
+        question: question.to_string(),
+        header: None,
+        options: options
+            .iter()
+            .map(|(label, description)| AskOptionInput::Detailed {
+                label: label.clone(),
+                description: description.clone(),
+                recommended: false,
+            })
+            .collect(),
+        multi_select: false,
+    })
+    .filterable();
+    picker.cursor = default.min(options.len().saturating_sub(1));
     terminal_keys_paused(|| {
         Ok(match run_picker(picker)? {
             Answer::Chosen(labels) => labels
@@ -678,6 +810,55 @@ mod tests {
     }
 
     #[test]
+    fn filterable_lists_narrow_as_you_type() {
+        let mut p = picker(json!({
+            "question": "Switch model",
+            "options": [
+                {"label": "openrouter/poolside/laguna-s-2.1:free", "description": "OpenRouter · free"},
+                {"label": "nvidia/deepseek-ai/deepseek-v4.1-flash", "description": "NVIDIA NIM"},
+                {"label": "openrouter/deepseek/deepseek-v4.1-flash", "description": "OpenRouter"},
+            ]
+        }))
+        .filterable();
+        // Letters and digits go to the filter, not to j/k or 1-9.
+        for ch in "deep 4.1".chars() {
+            press(&mut p, KeyCode::Char(ch));
+        }
+        assert_eq!(p.choices.len(), 2);
+        for ch in " nvidia".chars() {
+            press(&mut p, KeyCode::Char(ch));
+        }
+        assert_eq!(p.choices.len(), 1);
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            KeyOutcome::Done(Answer::Chosen(vec![
+                "nvidia/deepseek-ai/deepseek-v4.1-flash".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn filterable_lists_use_unmatched_text_and_esc_clears_first() {
+        let mut p = picker(json!({"question": "q", "options": ["alpha", "beta"]})).filterable();
+        for ch in "zai/glm-4.6".chars() {
+            press(&mut p, KeyCode::Char(ch));
+        }
+        assert!(p.choices.is_empty());
+        assert_eq!(press(&mut p, KeyCode::Esc), KeyOutcome::Continue);
+        assert_eq!(p.choices.len(), 2);
+        press(&mut p, KeyCode::Char('x'));
+        assert_eq!(
+            press(&mut p, KeyCode::Enter),
+            KeyOutcome::Done(Answer::Typed("x".to_string()))
+        );
+        let mut p = picker(json!({"question": "q", "options": ["alpha"]})).filterable();
+        assert_eq!(
+            press(&mut p, KeyCode::Esc),
+            KeyOutcome::Done(Answer::Cancelled)
+        );
+    }
+
+    #[test]
     fn cursor_starts_on_the_recommended_option_and_enter_selects_it() {
         let mut p = picker(json!({
             "question": "Which database?",
@@ -767,6 +948,22 @@ mod tests {
     }
 
     #[test]
+    fn long_lists_shrink_to_fit_the_terminal_height() {
+        let options = (1..=30)
+            .map(|n| json!({"label": format!("model-{n}"), "description": "provider · 128k context"}))
+            .collect::<Vec<_>>();
+        let p = picker(json!({"question": "Switch model", "options": options})).filterable();
+        let tall = p.lines(80, 100, false);
+        let short = p.lines(80, 12, false);
+        assert!(tall.len() > 12);
+        assert!(short.len() <= 12, "{short:#?}");
+        // The question, the filter and the highlighted row stay in view.
+        assert!(short[0].contains("Switch model"));
+        assert!(short[1].contains("filter:"));
+        assert!(short.iter().any(|line| line.contains("❯ 1. model-1")));
+    }
+
+    #[test]
     fn lines_show_recommendation_checkboxes_and_fit_the_width() {
         let p = picker(json!({
             "question": "Which tests should I add?",
@@ -777,7 +974,7 @@ mod tests {
             ],
             "multi_select": true
         }));
-        let lines = p.lines(40, false);
+        let lines = p.lines(40, 100, false);
         assert_eq!(lines[0], "[Tests] Which tests should I add?");
         assert_eq!(lines[1], "❯ [ ] 1. Unit (Recommended)");
         assert_eq!(lines[2], "         fast checks for each function");

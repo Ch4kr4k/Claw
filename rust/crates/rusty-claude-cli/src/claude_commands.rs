@@ -306,6 +306,15 @@ impl LiveCli {
     /// Answers `prompt` from the conversation without tools, on a copy of
     /// the session that is not saved, and returns the answer.
     fn side_answer(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        // A side-task model (`auxiliaryModel`) answers when one is set, so
+        // the main model's quota is left alone.
+        if let Some(answer) = crate::auxiliary_side_answer(
+            self.runtime.session(),
+            &self.effective_system_prompt(),
+            prompt,
+        ) {
+            return Ok(answer);
+        }
         let session = self.runtime.session().clone().without_persistence();
         let mut runtime = build_runtime(
             session,
@@ -1184,7 +1193,7 @@ fn wait_unless_key(interval: Duration) -> io::Result<bool> {
 }
 
 /// The message for `/btw`: a quick answer from what is already known.
-fn btw_prompt(question: &str) -> String {
+pub(crate) fn btw_prompt(question: &str) -> String {
     format!(
         "<system-reminder>The user is asking a quick side question (/btw). Answer it briefly from what this conversation already contains. You have no tools for this answer. If the conversation does not contain the answer, say so in one sentence. This exchange is not kept in the conversation.</system-reminder>\n\n{question}"
     )

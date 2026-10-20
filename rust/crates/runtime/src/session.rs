@@ -11,9 +11,14 @@ use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
-const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
+/// Every save writes the whole session; past this size the previous file
+/// is kept as a backup first (`MAX_ROTATED_FILES` of them).
+const ROTATE_AFTER_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
-const MAX_JSONL_FIELD_CHARS: usize = 16 * 1024;
+/// Longest text one block keeps in the session file. Resumed sessions read
+/// it back, so 16k cut a large-context model's tool results and thinking on
+/// every resume; a quarter of a megabyte keeps whole files and long replies.
+const MAX_JSONL_FIELD_CHARS: usize = 256 * 1024;
 const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
 const JSONL_REDACTION_MARKER: &str = "[redacted]";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);

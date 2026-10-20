@@ -63,7 +63,9 @@ or `/model uncensored` from `"aliases"` in `~/.claw/settings.json`) switches to
 it mid-session. The server loads the model on the first request and unloads the
 previous one, so the first reply after a switch waits for the load. `/model`
 also switches to API models (`/model sonnet`, `/model gpt-4.1`) as long as that
-provider's key is exported; the history carries over.
+provider's key is exported; the history carries over. `/model` on its own
+opens a searchable list of every model you can switch to, and the model you
+switch to becomes the default for the next start.
 
 `llama-gpu` runs `llama-server` from the async-prefetch llama.cpp fork
 (`~/ws/src/cpp/nn/llama-abominated`, about 6–8% faster prompt processing).
@@ -319,7 +321,11 @@ The time counts the whole request; tokens are an estimate of what the model
 has sent. The input row shows what you are typing and how many messages are
 queued. When you stop a reply, queued messages go back into the input box
 instead of running. A `/btw` question typed during a reply is not passed to
-the running task; it is answered on its own as soon as the reply ends.
+the running task: it is answered at once, beside it, from the conversation as
+last sent to the model (no tools), and the answer is printed between the task's
+steps (the input row shows `answering /btw…` meanwhile). claw desktop works the
+same way: a message sent while the agent works is queued for its next step, and
+`/btw <question>` is answered without starting a turn.
 
 With `CLAW_FULLSCREEN=0` (inline view), the block follows the reply down
 the screen and stays at the bottom once the screen is full; the reply scrolls
@@ -549,12 +555,13 @@ request or change billing.
 |---|---|
 | `/help` | List commands |
 | `/status` | Model, permissions, workspace, loaded memory files |
-| `/model [name]` | Show or switch the model |
+| `/model [name]` | Switch the model. Without a name it opens a list: the current model, your aliases, and the models of every provider whose key is set, plus the local server's when it is running. Each row shows the provider, context size and whether it's free. Type to filter (every word must match), ↑↓ and Enter to pick, Esc clears the filter, then cancels. Enter on text that matches nothing uses it as the model name. The list fits the terminal height, and the model lists load in the background when claw starts. A switch (from the list or `/model <name>`) is saved as `model` in `~/.claw/settings.json`, so claw starts with it next time |
 | `/permissions [mode]` | Show or switch the permission mode |
 | `/effort [low\|medium\|high\|default]` | Reasoning effort for models that support it |
 | `/fast [on\|off]` | Quicker replies: low reasoning effort, and the `fastModel` setting's model if you set one; `off` restores both |
 | `/clear [--confirm]` | Start a fresh session |
-| `/compact` | Summarize old history to free context |
+| `/compact` | Summarize old history to free context. Hosted models write the summary themselves (objective, requirements, decisions, work state, files, next steps); local models get the one built from the messages, which costs no request |
+| `/fallback [model\|off]` | The model to switch to when the current one fails (rate limit, no credit, errors, silence, empty replies). Without an argument, a list like `/model`'s with `off` at the top; type to filter. Saved as `providerFallbacks.fallbacks`; a `local/` fallback starts its model server when needed. Works in claw desktop too |
 | `/btw [question]` | Quick side question, answered from the conversation without tools; neither question nor answer is kept in the conversation or the saved session. Without a question, shows the last one |
 | `/recap` | One-line summary of the session (not kept in the conversation) |
 | `/goal [condition\|clear]` | Keep working across turns until the condition holds (up to 20 rounds; Esc pauses). No argument shows the goal |
@@ -575,7 +582,7 @@ request or change billing.
 | `/run-skill-generator` | Write a project skill that teaches `/run` and `/verify` to start the app |
 | `/context [show\|clear]` | Estimated tokens versus the model's context window |
 | `/usage`, `/cost`, `/stats` | Token usage, estimated cost, cache hit rate |
-| `/resume <session>`, `/session` | Load, list, fork or delete saved sessions |
+| `/resume [session]`, `/session` | Load, list, fork or delete saved sessions. `/resume` alone lists this folder's sessions (newest first, by their first request, with age and size) to pick from; type to filter |
 | `/rename <name>` | Name the session |
 | `/history [count]` | Summary of recent turns |
 | `/export [file]` | Save the conversation |
@@ -682,6 +689,11 @@ builds) in the background and keep working. You manage them with:
 
 When a job finishes on its own, the agent is told at once, even when the
 prompt is idle. All jobs are stopped when you exit.
+
+A plain shell command that leaves a program running with `&`
+(`./server &`) no longer blocks the turn: claw returns once the shell
+exits, waits a second for the rest of the output, and tells the agent the
+program is still running and holds the output open.
 
 The agent can also **monitor** a command (the Monitor tool): each batch of
 new output lines (a log line, a test result) reaches it as soon as it
@@ -881,9 +893,61 @@ not empty the results; claw uses it whenever it answers.
 Manage it with `systemctl --user status|restart|stop searxng`; update it with
 `podman pull docker.io/searxng/searxng:latest && systemctl --user restart searxng`.
 
-The `claw` launcher offers the local model a core set of tools to save
+The `claw` launcher offers a `local/` model a core set of tools to save
 context (`CodeSearch`, `Pty`, `Checkpoint`, `Diagnostics`, `GoogleDork`,
 `vision_analyze`, `RepoSignals` and `Trail` are in it); `CLAW_ALL_TOOLS=1 claw` offers all of them.
+When claw starts with a hosted model (`--model`, else `model` in settings, aliases
+resolved), it gets every tool. A `/model` switch later keeps the starting set.
+
+Every model gets the everyday tools (shell, files, search, web, `Browser`,
+`Download`, `X11`, `vision_analyze`, `Monitor`, `CodeSearch`, notebooks, todo
+list, questions, skills, sub-agents) with their full description. The other
+specialised tools are listed by name, with a one-line summary, in
+`ToolSearch`; the model loads one with `ToolSearch` (`select:GitBlame`) when it
+needs it, and it then stays loaded for the session, as in Claude Code. This
+keeps each request about 15k tokens smaller and the model's choice of tools
+short. `CLAW_DEFER_TOOLS=0` sends every description.
+
+`SocialMedia` saves the images and videos of an Instagram, Facebook or
+Pinterest post, reel or pin from its link (share and short links work) into
+`~/Downloads/claw-social/<platform>`, and returns lines that show the images
+in the reply. It also takes an Instagram profile (its link or `@username`)
+and fetches its latest `count` posts (default 6): the post links come from
+the profile page in claw's browser. Public posts need no login; a Netscape cookie file at
+`~/.claw/cookies/<platform>.txt` (as a browser's "export cookies" extension
+writes it) is used when present, which Instagram needs for private posts.
+
+Every session's system prompt has a short "What you can do" section (the
+same in the terminal and the desktop app): how to show pictures, which tool
+fetches what, `/undo`. It is built into claw so it always matches its tools;
+keep `AGENTS.md` for your own instructions.
+
+In the desktop app, the terminal's non-interactive slash commands work too
+(`/undo`, `/rewind`, `/compact`, `/cost`, `/status`, `/context`, `/memory`,
+`/diff`, `/plan`, `/effort`, `/fast`, `/permissions`, `/export`, …): their
+output appears in the chat. Each request is checkpointed as in the
+terminal, so `/undo` reverts its file changes (not in incognito chats).
+
+After a reply with Markdown images (`![alt](url or path)`), claw checks that
+each one loads (in the terminal and the desktop app). If one definitely does
+not (a missing page or file, or something that is not an image), the model is
+told which and asked once to replace it. Rate limits and server errors do not
+count: the picture may still show.
+
+While a local server reads the prompt, the activity line (and the desktop
+app) shows "Reading the prompt N%": on a cold llama-gpu the first reply waits
+a minute or two for that.
+
+`read_file` shows numbered lines. Asked for a whole file that is larger than
+one page (16k characters on a 32k window), it returns the file's outline: the
+numbered lines where its functions, types and sections start. The model then
+reads the part it needs with `offset` and `limit`; asking for the whole file
+again gets the first page. When an edit's `old_string` is not in the file,
+the error shows the closest lines, numbered, so the model can fix the edit
+without re-reading the file. Reading the same lines again while the earlier
+result is still in the conversation returns a short "unchanged" note instead
+of the text. Shell commands run in bash (in `sh` only where bash is not
+installed).
 `claude-tool-list.md` lists every tool and its status.
 
 ## 11. Instructions and memory
@@ -965,6 +1029,46 @@ Settings merge in this order, later files winning:
 4. `<repo>/.claw/settings.json`
 5. `<repo>/.claw/settings.local.json` (personal, not committed)
 
+**Every key.** `~/.claw/settings.json` can list all of them; `null` means
+"not set" (the default applies, and a lower file's value is kept), so a full
+file works as a template.
+
+| Key | Value (default) | What it does |
+|---|---|---|
+| `model` | model or alias | Model claw starts with; `/model` saves it |
+| `fastModel` | model (null) | Model for fast mode (`/fast`) |
+| `subagentModel` | model (null = main model) | Model for sub-agents |
+| `auxiliaryModel` | model (null = main model) | Side tasks: summaries, `/btw`, `/recap`, learning |
+| `aliases` | `{name: model}` | Short names for `/model`, `/fallback`, `--model` |
+| `providerFallbacks` | `{primary, fallbacks: [model]}` | Model to switch to on failures; `/fallback` sets it |
+| `provider` | `{kind, apiKey, baseUrl, model}` (null) | Provider saved by `/login` |
+| `customProviders` | `{id: {baseUrl, apiKeyEnv, apiKey, label, maxOutputTokens}}` | Extra OpenAI-compatible providers (`id/model`) |
+| `modelServers` | `{provider: {start, stop, health, stopOnExit}}` | Start/stop a model server (llama-gpu for `local/`) |
+| `permissions` | `{defaultMode, bashApproval, allow, ask, deny, deniedTools}` | Permission mode and rules (section 6) |
+| `sandbox` | `{enabled, namespaceRestrictions (true), networkIsolation (false), filesystemMode ("workspace-only"\|"off"\|"allow-list"), allowedMounts}` | Command sandbox |
+| `trustedRoots` | `[path]` ([]) | Folders trusted without asking |
+| `hooks` | `{PreToolUse, PostToolUse, PostToolUseFailure: [command]}` | Commands run around tool calls |
+| `env` | `{NAME: value}` | Environment for claw and its commands |
+| `mcpServers` | `{name: {command, args, env} \| {url}}` | MCP servers |
+| `mcpServerStates` | `{name: bool}` | MCP servers turned off with `/mcp` |
+| `plugins` | `{enabled, externalDirectories, installRoot, registryPath, bundledRoot, maxOutputTokens}` | Plugins |
+| `lspServers` | `{extension: {command, args}}` | Language servers for the Diagnostics tool |
+| `oauth` | `{clientId, authorizeUrl, tokenUrl, callbackPort, manualRedirectUrl, scopes}` (null) | Custom OAuth login |
+| `rulesImport` | `"auto"` \| `"none"` \| `[framework]` | Import Cursor/Copilot/… rule files |
+| `autoMemoryEnabled` | bool (true) | Memory files in the prompt |
+| `memoryReflectOnExit` | bool (true) | Save what the session learned when it ends |
+| `learning` | `"on"` \| `"off"` | Background memory/skill reviews and the skill curator |
+| `leanGate` | bool (true) | Lean checks after edits |
+| `theme` | theme name | `/theme` saves it |
+| `editorMode` | `"normal"` \| `"vim"` | Input editor keys (`/vim`) |
+| `viewMode` | `"normal"` \| `"focus"` | Focus view (`/focus`) |
+| `outputStyle` | style name (`"default"`) | `/output-style` saves it |
+| `diffPanel` | `"on"` \| `"off"` | Diff panel (`/diffpanel`) |
+| `scrollSpeed` | rows as a string (`"3"`) | Mouse-wheel rows per step |
+| `autoCompactWindow` | tokens as a string (null = from the model) | Auto-compaction threshold (`/autocompact`) |
+| `overflowToolResultChars` | characters as a string, or `"off"` (null = a quarter of the window) | How far tool results are cut after a context overflow |
+| `statusLine` | `{command}` (null) | Command whose output is shown in the status line |
+
 Some user-level settings (theme, provider) are saved by the REPL to
 `~/.claw/settings.json`. `modelServers` there makes claw start a provider's
 model server (for `local/...` models: `llama-gpu`) when it starts and stop it
@@ -1001,7 +1105,11 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_CONFIG_HOME` | Use another directory instead of `~/.claw` |
 | `CLAW_API_CONNECT_TIMEOUT` | Seconds to wait for a connection (default 30) |
 | `CLAW_API_REQUEST_TIMEOUT` | Seconds to wait for the next piece of a reply before giving up (default 300; 1800 for local servers such as Ollama). Long replies that keep streaming are never cut off |
-| `CLAW_TOOL_RESULT_MAX_CHARS` | Cap on what one tool call sends to the model (useful for small local models) |
+| `CLAW_REASONING_REPLAY_MAX_CHARS` | How much of each earlier step's thinking (its end) goes back to a `local/` model within a turn; default 4000, `0` for all of it. Hosted models always get all of it |
+| `CLAW_DEFER_TOOLS` | `0` sends every tool's full description, instead of listing the specialised tools by name in `ToolSearch` |
+| `CLAW_TOOL_RESULT_MAX_CHARS` | Cap on what one tool call sends to a local model (the launcher sets 12000). Hosted models get a quarter of their context window instead (4k–100k characters). A cut result is saved whole under `~/.claw/tool-output/` (kept a week) and the note tells the model where to read the rest |
+| `CLAW_MODELS_CATALOG=0` | Don't look up hosted models' context and output limits in the models.dev catalog |
+| `CLAW_MODELS_URL` | Where to fetch the catalog's `api.json` (default `https://models.dev`) |
 | `CLAW_SNAPSHOTS=0` | Turn off checkpoints |
 | `CLAW_THEME` | Theme, overriding the saved one |
 | `CLAW_DIFF_PANEL=0` | No diff panel this run (`/diffpanel off` saves it) |
@@ -1014,6 +1122,49 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_OUTPUT_FORMAT=json` | Default to JSON output for non-interactive commands |
 | `CLAW_LOG`, `RUST_LOG` | Logging |
 | `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | Proxies |
+
+### Fallback, side tasks and learning
+
+These settings in `~/.claw/settings.json` keep a session going and let claw
+learn across sessions:
+
+```json
+"providerFallbacks": { "fallbacks": ["local/qwen36-35b-a3b"] },
+"auxiliaryModel": "nvidia/nvidia/nemotron-3-super-120b-a12b",
+"learning": "on"
+```
+
+- **`providerFallbacks.fallbacks`** (set it with `/fallback`): when the model in use is rate-limited
+  (429), out of credit (402), failing (5xx), silent (no reply within 60s), or
+  replies with nothing twice, claw switches to the first fallback that works
+  for the next 10 minutes, then tries the configured model again. A `local/`
+  fallback starts its model server (llama-gpu) when it is stopped, and with
+  `modelServers.local.stopOnExit` it stops again when claw exits. A session that
+  falls back to a local model uses the launcher's short tool list. With a
+  fallback set, a failing provider is retried twice instead of eight times.
+  A 402 that names the reply size the account can afford (OpenRouter's "can
+  only afford N") is first retried with that smaller reply budget, which
+  then holds for that model until claw exits.
+- **`visionModel`**: a model that reads images, e.g. the local
+  `"local/qwen36-35b-a3b"` (llama-gpu loads its `mmproj`, as for the desktop's
+  Attach) or `"openrouter/nvidia/nemotron-3.5-super-vl:free"`. When the model in use
+  takes no images (screenshots from `Browser` or `X11`, `vision_analyze`),
+  claw sends it this model's description of each image instead. Unset, such
+  a model gets a note that the image was left out. Images go to this model's
+  provider, so pick one you are happy to send screenshots to.
+- **`auxiliaryModel`**: the model for side tasks (compaction summaries,
+  `/btw`, `/recap`, learning), so they do not spend the main model's quota and
+  keep working while it is limited. Unset, the main model does them (a local
+  main model keeps the summary built from the messages, which costs nothing).
+- **`learning`**: after a turn with four or more tool calls, a background
+  request decides whether to save a memory or a skill
+  (`~/.claw/skills/<name>/SKILL.md`, marked `learned-by: claw`); what it saved is
+  shown at the next prompt. Once a week, while idle, the learned skills are
+  merged or archived (`~/.claw/skills/.archive/`; never deleted, and skills you
+  wrote are never touched). `"off"` turns it off. It needs `auxiliaryModel` or a
+  hosted main model.
+- **`SessionSearch`** (tool): the model can search every past claw session
+  for words, to recall earlier fixes and decisions.
 
 ## 13. Troubleshooting
 
@@ -1045,8 +1196,11 @@ a large-context model keeps them whole unless one is enormous; set
 
 **`(reply cut off at the N-token limit; asking the model to continue)`**
 The reply reached its token budget. `claw` asks the model to continue where it
-stopped (up to 3 times per turn); a tool call that was cut off is not run, and
-the model is told to send less per call. For `local/` models the budget is a
+stopped (up to 3 times in a row); a tool call that was cut off is not run, and
+the model is told to send less per call. A `local/` model cut off while still
+thinking answers the next request with thinking switched off. A reply that
+stops with only thinking (no answer, no tool call) is treated the same way:
+the model is asked to act on it instead of the turn ending with nothing. For `local/` models the budget is a
 quarter of the server's context window, which `claw` reads from llama.cpp's
 `/props` (`CLAW_CONTEXT_WINDOW` is only the fallback for servers that don't
 report it), and the session is compacted once it fills the window less the

@@ -5,8 +5,9 @@ use serde_json::{Map, Value};
 use telemetry::SessionTracer;
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, truncate_large_tool_results, CompactionConfig,
-    CompactionResult,
+    compact_session, compact_session_with, estimate_session_tokens, prune_old_tool_results,
+    summary_transcript, truncate_large_tool_results, CompactionConfig, CompactionResult,
+    SUMMARY_SYSTEM_PROMPT,
 };
 use crate::config::RuntimeFeatureConfig;
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
@@ -29,11 +30,45 @@ const CUT_OFF_TOOL_CALL_RESULT: &str = "This tool call was cut off: the reply re
      one call: for a large file, write the first part with write_file and add the rest in \
      further edit_file calls.";
 
+/// Sent instead of a `read_file` result the session already holds.
+const UNCHANGED_READ_NOTE: &str = "[Unchanged: your earlier read of these same lines is still \
+     in this conversation, above. Use it instead of reading again; to see other lines, pass a \
+     different offset and limit.]";
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+}
+
+/// Starts the prompt sent after a reply that ended while still thinking
+/// (cut off at the token limit, or stopped with nothing but thinking);
+/// clients can switch thinking off for that one request.
+pub const THINKING_CUT_OFF_PROMPT: &str =
+    "<system-reminder>\nYour previous reply ended while you were still thinking";
+
+impl ApiRequest {
+    /// The request continues after a reply cut off mid-thought, or after a
+    /// tool call cut off at the token limit. Models that were asked to think
+    /// briefly still thought up to the limit again, so a client should send
+    /// this request with thinking switched off. A cut-off tool call is
+    /// included: Qwen thought 36k characters before an edit, the edit was cut
+    /// off, and the retry thought at length again.
+    #[must_use]
+    pub fn follows_thinking_cut_off(&self) -> bool {
+        self.messages.last().is_some_and(|message| {
+            message.blocks.iter().any(|block| match block {
+                ContentBlock::Text { text } => {
+                    message.role == MessageRole::User && text.starts_with(THINKING_CUT_OFF_PROMPT)
+                }
+                ContentBlock::ToolResult { output, .. } => {
+                    output.starts_with(CUT_OFF_TOOL_CALL_RESULT)
+                }
+                _ => false,
+            })
+        })
+    }
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -81,6 +116,15 @@ pub fn is_output_limit_stop_reason(stop_reason: &str) -> bool {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    /// Asks the model for a compaction summary of `transcript` (see
+    /// [`crate::summary_transcript`]) under `system`, without tools and
+    /// without showing it. `None` (the default, and for clients that would
+    /// rather not spend a request on it) keeps the summary built from the
+    /// messages themselves.
+    fn summarize(&mut self, _system: &str, _transcript: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -193,6 +237,8 @@ pub struct TurnSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+    /// Old tool results cleared before (or instead of) summarizing.
+    pub pruned_tool_results: usize,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -612,29 +658,63 @@ where
                 &assistant_message,
                 pending_tool_uses.len(),
             );
+            // A reply cut off while still thinking (no text, no tool call):
+            // what it thought so far, so the continuation can pick it up.
+            // A reply that stopped with only thinking (no text, no tool
+            // call) is handled the same way: Nemotron ended a turn after 19k
+            // characters of thinking, with no answer and nothing changed.
+            let cut_off_thinking = Self::cut_off_thinking_tail(&assistant_message);
+            let reply_cut_off = reply_cut_off || cut_off_thinking.is_some();
 
-            self.session
-                .push_message(assistant_message.clone())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            // A reply cut off mid-thought is not kept: its thinking (the whole
+            // reply budget, 8k tokens on a 32k local window) went back to the
+            // model with every later step of the turn, so the next request
+            // overflowed, compaction dropped the files just read, and the
+            // model read them again and was cut off again. Its tail goes
+            // into the continuation prompt instead.
+            let keep_reply = cut_off_thinking.is_none();
+            if keep_reply {
+                self.session
+                    .push_message(assistant_message.clone())
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+            }
             assistant_messages.push(assistant_message);
 
             // Run auto-compaction check before next API call, including on the terminal
             // (no-tool) iteration, to prevent unbounded session growth (#3106).
-            if let Some(compaction) = self.maybe_auto_compact(&turn_request) {
+            if let Some(compaction) = self.maybe_auto_compact(&turn_request, keep_reply) {
                 auto_compaction = Some(compaction);
             }
 
             if pending_tool_uses.is_empty() && cut_off_tool_use.is_none() {
                 if reply_cut_off && cut_off_continuations < MAX_CUT_OFF_CONTINUATIONS {
                     cut_off_continuations += 1;
+                    // After a cut-off in the middle of thinking, a bare "continue"
+                    // made models start the same reasoning over (their thinking is
+                    // not shown back to them), so they ran into the limit again.
+                    let prompt = cut_off_thinking.as_deref().map_or_else(
+                        || CUT_OFF_CONTINUE_PROMPT.to_string(),
+                        |tail| {
+                            format!(
+                                "{THINKING_CUT_OFF_PROMPT}, without an answer or a tool call: nothing \
+                                 was shown or done. Your thinking \
+                                 ended with:\n\n…{tail}\n\nDo not start that reasoning over. Decide now and act \
+                                 on it: call the next tool or give the answer, with only a short thought \
+                                 first.\n</system-reminder>"
+                            )
+                        },
+                    );
                     self.session
-                        .push_message(crate::session::ConversationMessage::user_text(
-                            CUT_OFF_CONTINUE_PROMPT,
-                        ))
+                        .push_message(crate::session::ConversationMessage::user_text(prompt))
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     continue;
                 }
                 break;
+            }
+            // The limit is on cut-offs in a row: a long turn that keeps
+            // making progress between them is not ended without an answer.
+            if !pending_tool_uses.is_empty() {
+                cut_off_continuations = 0;
             }
 
             // Consecutive read-only calls run concurrently; every other call
@@ -689,7 +769,9 @@ where
                             let result = results.next().unwrap_or_else(|| {
                                 Err(ToolError::new("tool executor returned no result"))
                             });
-                            self.finish_tool_use(call, result)
+                            let mut message = self.finish_tool_use(call, result);
+                            self.note_unchanged_read(&mut message);
+                            message
                         }
                         PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
                             call.tool_use_id,
@@ -737,6 +819,8 @@ where
                 }
             }
 
+            // `/btw` answers that came in while the tools ran.
+            crate::turn_keys::print_side_answers();
             // Prompts the user queued while the tools ran are passed to the
             // model before its next step, so a running task can be steered.
             for text in crate::turn_keys::take_queued_for_running_turn() {
@@ -763,6 +847,18 @@ where
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
         compact_session(&self.session, config)
+    }
+
+    /// [`Self::compact`] with the summary written by the model when the
+    /// client offers that ([`ApiClient::summarize`]).
+    pub fn compact_with_model_summary(&mut self, config: CompactionConfig) -> CompactionResult {
+        let api_client = &mut self.api_client;
+        compact_session_with(&self.session, config, &mut |previous, removed| {
+            api_client.summarize(
+                SUMMARY_SYSTEM_PROMPT,
+                &summary_transcript(previous, removed),
+            )
+        })
     }
 
     #[must_use]
@@ -798,11 +894,70 @@ where
         self.session
     }
 
+    /// Replaces a `read_file` result with a short note when the session
+    /// already holds the identical result, unpruned: the file is unchanged
+    /// and the model can still see it (hermes answers such reads with "File
+    /// unchanged since last read"). Qwen read the same file whole four times
+    /// in one turn with the first copy still in its context, each time
+    /// adding 4k tokens to a 32k window.
+    fn note_unchanged_read(&self, message: &mut ConversationMessage) {
+        const MIN_CHARS: usize = 600;
+        for block in &mut message.blocks {
+            let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error: false,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if !matches!(tool_name.as_str(), "read_file" | "Read") || output.len() < MIN_CHARS {
+                continue;
+            }
+            let seen = self.session.messages.iter().any(|earlier| {
+                earlier.blocks.iter().any(|earlier_block| {
+                    matches!(earlier_block, ContentBlock::ToolResult { output: earlier_output, is_error: false, .. }
+                        if earlier_output == output)
+                })
+            });
+            if seen {
+                *output = UNCHANGED_READ_NOTE.to_string();
+            }
+        }
+    }
+
+    /// The last ~1500 characters of a reply's thinking when the reply has no
+    /// text and no tool call (it was cut off mid-thought).
+    fn cut_off_thinking_tail(message: &ConversationMessage) -> Option<String> {
+        let mut thinking = String::new();
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } if !text.trim().is_empty() => return None,
+                ContentBlock::ToolUse { .. } => return None,
+                ContentBlock::Thinking { thinking: part, .. } => thinking.push_str(part),
+                _ => {}
+            }
+        }
+        let thinking = thinking.trim();
+        if thinking.is_empty() {
+            return None;
+        }
+        let skip = thinking.chars().count().saturating_sub(1_500);
+        Some(thinking.chars().skip(skip).collect())
+    }
+
     /// Compacts when the last request filled the context past the
     /// threshold. `turn_request` is the prompt of the running turn: if it is
     /// summarized away, it is kept word for word in the summary message, so
     /// the model still knows what it is in the middle of doing.
-    fn maybe_auto_compact(&mut self, turn_request: &str) -> Option<AutoCompactionEvent> {
+    /// `reply_kept`: the last reply is in the session (a reply cut off
+    /// while thinking is not, so its tokens do not count).
+    fn maybe_auto_compact(
+        &mut self,
+        turn_request: &str,
+        reply_kept: bool,
+    ) -> Option<AutoCompactionEvent> {
         // What the last request sent, cached or not. The cumulative total
         // counts the context again for every step of every turn, so it
         // crossed the threshold long before the context was full, and once
@@ -815,7 +970,7 @@ where
             .input_tokens
             .saturating_add(latest.cache_creation_input_tokens)
             .saturating_add(latest.cache_read_input_tokens)
-            .saturating_add(latest.output_tokens);
+            .saturating_add(if reply_kept { latest.output_tokens } else { 0 });
         let threshold = self.auto_compaction_input_tokens_threshold;
         if context_tokens < threshold {
             return None;
@@ -836,6 +991,19 @@ where
                 .saturating_add(u32::try_from(estimate_session_tokens(session)).unwrap_or(u32::MAX))
         };
 
+        // First the cheap step: clear old tool output. When that alone gets
+        // under the target, no messages are dropped and no summary is
+        // written (no extra request, nothing lost but stale output).
+        let mut pruned_session = self.session.clone();
+        let pruned = prune_old_tool_results(&mut pruned_session, 8);
+        if pruned > 0 && size(&pruned_session) <= target {
+            self.session = pruned_session;
+            return Some(AutoCompactionEvent {
+                removed_message_count: 0,
+                pruned_tool_results: pruned,
+            });
+        }
+
         // When the prompt alone (nearly) fills the threshold no compaction
         // gets under it: keep the usual 4 messages rather than strip the
         // session bare.
@@ -846,6 +1014,7 @@ where
             &[4]
         };
         let mut compacted = None;
+        let mut kept = schedule[0];
         for &preserve_recent_messages in schedule {
             let result = compact_session(
                 &self.session,
@@ -859,11 +1028,31 @@ where
             }
             let fits = size(&result.compacted_session) <= target;
             compacted = Some(result);
+            kept = preserve_recent_messages;
             if fits {
                 break;
             }
         }
         let mut result = compacted?;
+        // The cut is chosen; now let the model write the summary for it, if
+        // the client offers that (one request, only for the chosen cut).
+        let api_client = &mut self.api_client;
+        let written = compact_session_with(
+            &self.session,
+            CompactionConfig {
+                preserve_recent_messages: kept,
+                max_estimated_tokens: 0,
+            },
+            &mut |previous, removed| {
+                api_client.summarize(
+                    SUMMARY_SYSTEM_PROMPT,
+                    &summary_transcript(previous, removed),
+                )
+            },
+        );
+        if written.removed_message_count > 0 {
+            result = written;
+        }
         if size(&result.compacted_session) > target {
             // The kept messages hold large tool output: cut it to an even
             // share of the room left (~4 characters per token).
@@ -875,6 +1064,7 @@ where
         keep_turn_request(&mut self.session, turn_request);
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
+            pruned_tool_results: 0,
         })
     }
 
@@ -1560,6 +1750,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp/project"),
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
+                git_checked: false,
                 git_diff: None,
                 git_context: None,
                 instruction_files: Vec::new(),
@@ -2058,6 +2249,196 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_cut_off_while_thinking_is_not_sent_back() {
+        let thought = "x".repeat(40_000);
+        let api = CutOffApi {
+            replies: vec![
+                vec![
+                    AssistantEvent::Thinking {
+                        thinking: thought.clone(),
+                        signature: None,
+                    },
+                    AssistantEvent::OutputLimitReached,
+                    AssistantEvent::MessageStop,
+                ],
+                vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime.run_turn("fix it", None).expect("turn runs");
+
+        // Only the tail of the thinking goes back, in the continuation prompt.
+        let continue_request = &runtime.api_client_mut().requests[1];
+        let sent = continue_request
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .map(|block| match block {
+                ContentBlock::Thinking { thinking, .. } => thinking.len(),
+                ContentBlock::Text { text } => text.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert!(sent < 3_000, "sent {sent} characters");
+        assert!(continue_request
+            .messages
+            .iter()
+            .all(|message| message.role != MessageRole::Assistant));
+        assert!(continue_request.follows_thinking_cut_off());
+        assert!(!runtime.api_client_mut().requests[0].follows_thinking_cut_off());
+    }
+
+    #[test]
+    fn a_reply_with_only_thinking_is_answered_with_a_nudge() {
+        let api = CutOffApi {
+            replies: vec![
+                vec![
+                    AssistantEvent::Thinking {
+                        thinking: "the blur pass never clears its buffers".to_string(),
+                        signature: None,
+                    },
+                    AssistantEvent::MessageStop,
+                ],
+                vec![
+                    AssistantEvent::TextDelta("fixed".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("fix it", None).expect("turn runs");
+
+        // The turn did not end on the thinking: the model was asked to act.
+        assert_eq!(summary.assistant_messages.len(), 2);
+        let requests = &runtime.api_client_mut().requests;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].follows_thinking_cut_off());
+        let ContentBlock::Text { text } = &requests[1].messages.last().unwrap().blocks[0] else {
+            panic!("a text nudge");
+        };
+        assert!(text.contains("never clears its buffers"), "{text}");
+    }
+
+    #[test]
+    fn reading_the_same_lines_again_gets_a_short_note() {
+        let read = |id: &str, path: &str| {
+            vec![
+                AssistantEvent::ToolUse {
+                    id: id.to_string(),
+                    name: "read_file".to_string(),
+                    input: format!(r#"{{"path":"{path}"}}"#),
+                },
+                AssistantEvent::MessageStop,
+            ]
+        };
+        let api = CutOffApi {
+            replies: vec![
+                read("t1", "a"),
+                read("t2", "b"),
+                read("t3", "a"),
+                vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ],
+            ],
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new().register("read_file", |input| {
+                let path = if input.contains("\"a\"") { "a" } else { "b" };
+                Ok(format!(
+                    "[{path}: lines 1-100 of 100]\n{}",
+                    path.repeat(2_000)
+                ))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("read", None).expect("turn runs");
+
+        let outputs = summary
+            .tool_results
+            .iter()
+            .map(|message| match &message.blocks[0] {
+                ContentBlock::ToolResult { output, .. } => output.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(outputs[0].starts_with("[a:"));
+        assert!(outputs[1].starts_with("[b:"));
+        assert_eq!(outputs[2], super::UNCHANGED_READ_NOTE);
+    }
+
+    #[test]
+    fn cut_offs_count_only_in_a_row() {
+        let cut_off = || {
+            vec![
+                AssistantEvent::TextDelta("more".to_string()),
+                AssistantEvent::OutputLimitReached,
+                AssistantEvent::MessageStop,
+            ]
+        };
+        let mut replies: Vec<_> = (0..super::MAX_CUT_OFF_CONTINUATIONS)
+            .map(|_| cut_off())
+            .collect();
+        replies.push(vec![
+            AssistantEvent::ToolUse {
+                id: "t1".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"a"}"#.to_string(),
+            },
+            AssistantEvent::MessageStop,
+        ]);
+        replies.extend((0..super::MAX_CUT_OFF_CONTINUATIONS).map(|_| cut_off()));
+        replies.push(vec![
+            AssistantEvent::TextDelta("fixed".to_string()),
+            AssistantEvent::MessageStop,
+        ]);
+        let api = CutOffApi {
+            replies,
+            requests: Vec::new(),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new().register("read_file", |_input| Ok("text".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("fix it", None).expect("turn runs");
+
+        // Progress between cut-offs resets the count, so the turn still
+        // reaches its answer.
+        assert_eq!(
+            summary.assistant_messages.len(),
+            2 * super::MAX_CUT_OFF_CONTINUATIONS + 2
+        );
+    }
+
+    #[test]
     fn stops_continuing_cut_off_replies_after_the_limit() {
         let cut_off = || {
             vec![
@@ -2125,6 +2506,8 @@ mod tests {
 
         assert_eq!(ran.get(), 0);
         assert_eq!(summary.tool_results.len(), 1);
+        // The retry goes without thinking, so the call fits this time.
+        assert!(runtime.api_client_mut().requests[1].follows_thinking_cut_off());
         assert!(matches!(
             &summary.tool_results[0].blocks[0],
             ContentBlock::ToolResult { output, is_error: true, .. }
@@ -2304,6 +2687,68 @@ mod tests {
     }
 
     #[test]
+    fn auto_compaction_uses_the_summary_the_model_writes() {
+        struct SummarizingApi {
+            transcript: Option<String>,
+        }
+        impl ApiClient for SummarizingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 120_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+
+            fn summarize(&mut self, system: &str, transcript: &str) -> Option<String> {
+                assert!(system.contains("## Objective"));
+                self.transcript = Some(transcript.to_string());
+                Some("## Objective\nAdd a blur option to lightcomp.".to_string())
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("add blur to lightcomp"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "reading config.cpp".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SummarizingApi { transcript: None },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime.run_turn("trigger", None).expect("turn");
+        assert!(summary.auto_compaction.is_some());
+        let first = match &runtime.session().messages[0].blocks[0] {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("unexpected block {other:?}"),
+        };
+        assert!(first.contains("Add a blur option to lightcomp."), "{first}");
+        // The model saw the dropped messages, not the kept ones.
+        let transcript = runtime.api_client_mut().transcript.clone().expect("asked");
+        assert!(transcript.contains("User: add blur to lightcomp"));
+        assert!(transcript.contains("Assistant: reading config.cpp"));
+    }
+
+    #[test]
     fn auto_compacts_when_the_last_request_crosses_the_threshold() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
@@ -2353,6 +2798,7 @@ mod tests {
             summary.auto_compaction,
             Some(AutoCompactionEvent {
                 removed_message_count: 2,
+                pruned_tool_results: 0,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
@@ -2487,7 +2933,10 @@ mod tests {
                 calls: 0,
                 overhead: 13_400,
             },
-            StaticToolExecutor::new().register("read_file", |_| Ok("x".repeat(12_000))),
+            // Each offset is a different part of the file.
+            StaticToolExecutor::new().register("read_file", |input| {
+                Ok(format!("{input}{}", "x".repeat(12_000)))
+            }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )

@@ -83,25 +83,25 @@ pub use approval_tokens::{
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
 pub use background_jobs::{global_background_jobs, BackgroundJobs, JobRead, JobState, JobSummary};
-pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
+pub use bash::{execute_bash, shell_program, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, truncate_large_tool_results,
-    CompactionConfig, CompactionResult,
+    compact_session, compact_session_with, estimate_session_tokens, format_compact_summary,
+    get_compact_continuation_message, prune_old_tool_results, should_compact, summary_transcript,
+    truncate_large_tool_results, CompactionConfig, CompactionResult, SUMMARY_SYSTEM_PROMPT,
 };
 pub use config::{
     claude_config_home, clear_user_provider_settings, default_config_home, read_user_setting,
-    save_user_provider_settings, save_user_setting, suppress_config_warnings_for_json_mode,
-    ApiTimeoutConfig, ConfigEntry, ConfigError, ConfigFileReport, ConfigFileStatus,
-    ConfigInspection, ConfigLoader, ConfigSource, McpConfigCollection, McpInvalidServerConfig,
-    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
-    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
-    ProviderFallbackConfig, ResolvedPermissionMode, RulesImportConfig, RuntimeConfig,
-    RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig, RuntimeInvalidHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig,
-    CLAW_SETTINGS_SCHEMA_NAME,
+    read_user_setting_value, save_user_provider_settings, save_user_setting,
+    suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
+    ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
+    McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
+    McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
+    RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
+    RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
+    RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -111,7 +111,7 @@ pub use conversation::{
     auto_compaction_threshold_from_env, configured_auto_compaction_threshold,
     is_output_limit_stop_reason, set_auto_compaction_threshold_override, ApiClient, ApiRequest,
     AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-    StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
+    StaticToolExecutor, ToolError, ToolExecutor, TurnSummary, THINKING_CUT_OFF_PROMPT,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,

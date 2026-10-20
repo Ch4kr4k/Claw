@@ -94,6 +94,104 @@ pub fn get_compact_continuation_message(
 /// Compacts a session by summarizing older messages and preserving the recent tail.
 #[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
+    compact_session_with(session, config, &mut |_, _| None)
+}
+
+/// What a model is asked to do with [`summary_transcript`] when it writes the
+/// compaction summary (`ApiClient::summarize`). Modelled on opencode's.
+pub const SUMMARY_SYSTEM_PROMPT: &str = "You summarize a coding-agent conversation so the agent can \
+continue the work after the earlier messages are dropped. The summary replaces them entirely: anything \
+not in it is lost. Write it for the agent, not the user. Be specific: exact file paths, function names, \
+commands, error messages, numbers and decisions. Do not invent anything, do not continue the work, and \
+do not call tools. Reply with only this structure (omit sections that do not apply):
+
+<summary>
+## Objective
+One or two sentences: what the user is trying to accomplish.
+
+## Requirements
+Constraints, preferences and scope boundaries the user stated, in their words where it matters.
+
+## Decisions
+Decisions already made and why.
+
+## Work state
+### Completed
+### In progress
+### Blocked
+
+## Files
+Files read, created or changed, and what about each matters.
+
+## Next steps
+What the agent should do next, in order.
+</summary>";
+
+/// The conversation `messages` as plain text for the summarizing model:
+/// `previous` (an earlier compaction summary) first, tool output cut to its
+/// head so a few large results do not crowd out the conversation.
+#[must_use]
+pub fn summary_transcript(previous: Option<&str>, messages: &[ConversationMessage]) -> String {
+    const TOOL_OUTPUT_CHARS: usize = 1_500;
+    let cut = |text: &str, max: usize| -> String {
+        if text.chars().count() <= max {
+            text.to_string()
+        } else {
+            let head = text.chars().take(max).collect::<String>();
+            format!("{head}… [{} more characters]", text.chars().count() - max)
+        }
+    };
+    let mut out = String::new();
+    if let Some(previous) = previous {
+        out.push_str("Summary of the conversation before these messages:\n");
+        out.push_str(previous.trim());
+        out.push_str("\n\nMessages since then:\n\n");
+    }
+    for message in messages {
+        let role = match message.role {
+            MessageRole::System => "System",
+            MessageRole::User => "User",
+            MessageRole::Assistant => "Assistant",
+            MessageRole::Tool => "Tool",
+        };
+        for block in &message.blocks {
+            let line = match block {
+                ContentBlock::Text { text } => format!("{role}: {text}"),
+                ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => continue,
+                ContentBlock::ToolUse { name, input, .. } => {
+                    format!("{role} called {name}: {}", cut(input, TOOL_OUTPUT_CHARS))
+                }
+                ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error,
+                    ..
+                } => format!(
+                    "{tool_name} {}: {}",
+                    if *is_error { "failed" } else { "returned" },
+                    cut(output, TOOL_OUTPUT_CHARS)
+                ),
+            };
+            out.push_str(&line);
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str("Write the summary now.");
+    out
+}
+
+/// Writes a compaction summary from (previous summary, removed messages);
+/// `None` falls back to the summary built from the messages.
+pub type SummaryWriter<'a> = dyn FnMut(Option<&str>, &[ConversationMessage]) -> Option<String> + 'a;
+
+/// [`compact_session`] with the summary written by `summarize(previous
+/// summary, removed messages)` when it returns one (a model-written
+/// summary), else built from the messages as usual.
+pub fn compact_session_with(
+    session: &Session,
+    config: CompactionConfig,
+    summarize: &mut SummaryWriter<'_>,
+) -> CompactionResult {
     if !should_compact(session, config) {
         return CompactionResult {
             summary: String::new(),
@@ -166,8 +264,12 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     };
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    let summary = match summarize(existing_summary.as_deref(), removed) {
+        // The tags let the next compaction find and replace it.
+        Some(written) if written.contains("<summary>") => written,
+        Some(written) => format!("<summary>\n{}\n</summary>", written.trim()),
+        None => merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed)),
+    };
     let formatted_summary = format_compact_summary(&summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
@@ -188,6 +290,34 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+/// The cheap first step of compaction (hermes' prune): replaces the output
+/// of tool results older than the last `keep_recent` messages with a short
+/// note, without asking any model. Old file reads and command output are
+/// most of a long session and are rarely needed again in full; often this
+/// alone frees enough room that no summary is written. Returns how many
+/// results were cleared.
+pub fn prune_old_tool_results(session: &mut Session, keep_recent: usize) -> usize {
+    const KEEP_CHARS: usize = 400;
+    let old = session.messages.len().saturating_sub(keep_recent);
+    let mut pruned = 0;
+    for message in &mut session.messages[..old] {
+        for block in &mut message.blocks {
+            if let ContentBlock::ToolResult { output, .. } = block {
+                let chars = output.chars().count();
+                if chars > KEEP_CHARS * 2 {
+                    let head = output.chars().take(KEEP_CHARS).collect::<String>();
+                    *output = format!(
+                        "{head}\n[older tool output cleared to save context ({chars} characters); \
+                         run the tool again if it is needed]"
+                    );
+                    pruned += 1;
+                }
+            }
+        }
+    }
+    pruned
 }
 
 /// Cuts every tool result longer than `max_chars` down to its head and a

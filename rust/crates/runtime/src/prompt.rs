@@ -97,6 +97,8 @@ pub struct ProjectContext {
     pub cwd: PathBuf,
     pub current_date: String,
     pub git_status: Option<String>,
+    /// Whether git was asked (so a missing status means "not a repository").
+    pub git_checked: bool,
     pub git_diff: Option<String>,
     pub git_context: Option<GitContext>,
     pub instruction_files: Vec<ContextFile>,
@@ -113,6 +115,7 @@ impl ProjectContext {
             cwd,
             current_date: current_date.into(),
             git_status: None,
+            git_checked: false,
             git_diff: None,
             git_context: None,
             instruction_files,
@@ -130,6 +133,7 @@ impl ProjectContext {
             cwd,
             current_date: current_date.into(),
             git_status: None,
+            git_checked: false,
             git_diff: None,
             git_context: None,
             instruction_files,
@@ -142,6 +146,7 @@ impl ProjectContext {
     ) -> std::io::Result<Self> {
         let mut context = Self::discover(cwd, current_date)?;
         context.git_status = read_git_status(&context.cwd);
+        context.git_checked = true;
         context.git_diff = read_git_diff(&context.cwd);
         context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
@@ -155,6 +160,7 @@ fn discover_with_git_and_rules_import(
 ) -> std::io::Result<ProjectContext> {
     let mut context = ProjectContext::discover_with_rules_import(cwd, current_date, rules_import)?;
     context.git_status = read_git_status(&context.cwd);
+    context.git_checked = true;
     context.git_diff = read_git_diff(&context.cwd);
     context.git_context = GitContext::detect(&context.cwd);
     Ok(context)
@@ -639,6 +645,11 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             project_context.instruction_files.len()
         ));
     }
+    if project_context.git_checked && project_context.git_status.is_none() {
+        bullets.push(
+            "Not a git repository: git diff, git log and similar commands fail here.".to_string(),
+        );
+    }
     lines.extend(prepend_bullets(bullets));
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
@@ -823,8 +834,10 @@ fn render_config_section(config: &RuntimeConfig) -> String {
             .map(|entry| format!("Loaded {:?}: {}", entry.source, entry.path.display()))
             .collect(),
     ));
-    lines.push(String::new());
-    lines.push(config.as_json().render());
+    // The merged settings themselves are not included: ~1.5k characters of
+    // keys, hooks and permission rules the model has no use for, sent with
+    // every request (a 32k local window felt it). The files are named, so
+    // the model can read them when a task is about the settings.
     lines.join("\n")
 }
 
@@ -863,6 +876,9 @@ fn get_simple_doing_tasks_section() -> String {
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
+        "Do what was asked and stop there. Building and running tests to check your work is fine; installing, deploying, publishing or pushing is not, unless the user asked for it.".to_string(),
+        "Before you name the cause of a bug, quote the exact lines that show it, with file:line. Do not say something is missing, unset or never called without having read the code that proves it.".to_string(),
+        "Before your final summary, look at what you actually changed (the diff, or the edited lines again) and describe only that.".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())
@@ -929,6 +945,26 @@ mod tests {
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
         context.expect("context should load")
+    }
+
+    #[test]
+    fn says_when_the_folder_is_not_a_git_repository() {
+        let render = |git_checked: bool, git_status: Option<String>| {
+            SystemPromptBuilder::new()
+                .with_os("linux", "6.8")
+                .with_project_context(ProjectContext {
+                    cwd: PathBuf::from("/tmp/project"),
+                    current_date: "2026-03-31".to_string(),
+                    git_checked,
+                    git_status,
+                    ..ProjectContext::default()
+                })
+                .render()
+        };
+        assert!(render(true, None).contains("Not a git repository"));
+        assert!(!render(true, Some("## main".to_string())).contains("Not a git repository"));
+        // Git never asked: say nothing rather than guess.
+        assert!(!render(false, None).contains("Not a git repository"));
     }
 
     #[test]
@@ -1534,7 +1570,7 @@ mod tests {
         }
 
         assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        assert!(prompt.contains("# Runtime config") && !prompt.contains("permissionMode"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -1588,7 +1624,7 @@ mod tests {
         }
 
         assert!(!prompt.contains("cursor rule"));
-        assert!(prompt.contains("rulesImport"));
+        assert!(prompt.contains("# Runtime config") && !prompt.contains("rulesImport"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -1663,7 +1699,7 @@ mod tests {
         assert!(prompt.contains("# Project context"));
         assert!(prompt.contains("# Project instructions"));
         assert!(prompt.contains("Project rules"));
-        assert!(prompt.contains("permissionMode"));
+        assert!(prompt.contains("# Runtime config") && !prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

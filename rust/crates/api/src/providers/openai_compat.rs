@@ -602,6 +602,9 @@ impl StreamState {
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage.normalized());
         }
+        if let Some(progress) = chunk.prompt_progress {
+            crate::report_prompt_progress(progress.processed, progress.total);
+        }
 
         for choice in chunk.choices {
             // Handle reasoning/thinking from various provider fields
@@ -923,6 +926,17 @@ struct ChatCompletionChunk {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    /// llama.cpp's prompt-reading progress (`return_progress`).
+    #[serde(default)]
+    prompt_progress: Option<PromptProgress>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptProgress {
+    #[serde(default)]
+    total: u64,
+    #[serde(default)]
+    processed: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1015,6 +1029,29 @@ pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
     canonical.starts_with("deepseek-v4")
+}
+
+/// How much of one step's reasoning goes back to a local model, from its
+/// end (where the conclusion is): `CLAW_REASONING_REPLAY_MAX_CHARS`, `0` for
+/// all of it; 4,000 by default. Local windows are small: Qwen thought 36k
+/// characters in one step, and replaying all of it took ~9k tokens of a 32k
+/// window on every later step of the turn (the original claw-code replayed
+/// none, and Qwen lost its plan between steps). Hosted models get it whole.
+fn replayed_reasoning(model: &str, thinking: String) -> String {
+    const LOCAL_DEFAULT: usize = 4_000;
+    if !model.starts_with("local/") {
+        return thinking;
+    }
+    let max = std::env::var("CLAW_REASONING_REPLAY_MAX_CHARS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(LOCAL_DEFAULT);
+    let chars = thinking.chars().count();
+    if max == 0 || chars <= max {
+        return thinking;
+    }
+    let tail = thinking.chars().skip(chars - max).collect::<String>();
+    format!("[…earlier reasoning omitted…] {tail}")
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -1185,8 +1222,53 @@ fn build_chat_completion_request_for_base_url(
     // OpenAI-compatible gateways may require slash-containing slugs intact.
     let wire_model = wire_model_for_base_url(&request.model, config, base_url);
     let wire_model = wire_model.as_ref();
-    for message in &request.messages {
-        messages.extend(translate_message(message, wire_model));
+    // The reasoning of the current turn's earlier steps (assistant messages
+    // after the last user request) goes back to models that build on it:
+    // local servers (Qwen's template keeps it for the running turn) and
+    // models the catalog marks as interleaved. Without it they lose their
+    // plan between tool calls and reason it all out again at every step.
+    // OpenRouter takes it as `reasoning` for any model and passes it on in
+    // the upstream provider's form (as opencode replays its reasoning there).
+    let reasoning_field = if request.model.starts_with("local/")
+        || super::hosted::hosted_replays_reasoning(&request.model)
+    {
+        Some("reasoning_content")
+    } else if base_url.contains("openrouter.ai") {
+        Some("reasoning")
+    } else {
+        None
+    };
+    let turn_start = request.messages.iter().rposition(|message| {
+        message.role == "user"
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, InputContentBlock::Text { .. }))
+    });
+    for (index, message) in request.messages.iter().enumerate() {
+        let mut translated = translate_message(message, wire_model);
+        if let Some(field) = reasoning_field.filter(|_| {
+            message.role == "assistant" && turn_start.is_some_and(|start| index > start)
+        }) {
+            let thinking = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    InputContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let thinking = replayed_reasoning(&request.model, thinking);
+            if let Some(first) = translated
+                .first_mut()
+                .filter(|_| !thinking.trim().is_empty())
+            {
+                if first.get(field).is_none() {
+                    first[field] = json!(thinking);
+                }
+            }
+        }
+        messages.extend(translated);
     }
     messages = images_after_tool_results(messages);
     // Sanitize: drop any `role:"tool"` message that does not have a valid
@@ -1197,6 +1279,9 @@ fn build_chat_completion_request_for_base_url(
     // editing, resume, etc.). We drop rather than error so the request can
     // still proceed with the remaining history intact.
     messages = sanitize_tool_message_pairing(messages);
+    if wants_cache_markers(base_url, wire_model) {
+        add_cache_markers(&mut messages);
+    }
 
     // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
     // We send the correct field based on the wire model name so gpt-5.x requests
@@ -1249,6 +1334,12 @@ fn build_chat_completion_request_for_base_url(
             payload["stop"] = json!(stop);
         }
     }
+    // A local llama.cpp server reports how far it has read the prompt; other
+    // servers ignore the field.
+    if request.stream && request.model.starts_with("local/") {
+        payload["return_progress"] = json!(true);
+    }
+
     // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
     if let Some(effort) = &request.reasoning_effort {
         payload["reasoning_effort"] = json!(effort);
@@ -1269,6 +1360,56 @@ fn build_chat_completion_request_for_base_url(
     }
 
     payload
+}
+
+/// Whether requests need explicit prompt-cache markers: Anthropic and
+/// Gemini models through OpenRouter cache only what is marked (OpenAI,
+/// DeepSeek, Grok and others cache on their own). Without them every step
+/// of a paid session pays full price for the whole conversation again.
+fn wants_cache_markers(base_url: &str, wire_model: &str) -> bool {
+    base_url.contains("openrouter.ai")
+        && (wire_model.starts_with("anthropic/") || wire_model.starts_with("google/gemini"))
+}
+
+/// Marks the system prompt and the two newest user or tool messages with
+/// `cache_control` (Anthropic allows four markers): the prefix up to the
+/// previous message is then read from the cache, and the newest one is
+/// written for the next step. As in opencode.
+fn add_cache_markers(messages: &mut [Value]) {
+    let marker = json!({"type": "ephemeral"});
+    let mark = |message: &mut Value| match message.get_mut("content") {
+        Some(Value::String(text)) => {
+            let text = std::mem::take(text);
+            message["content"] =
+                json!([{"type": "text", "text": text, "cache_control": marker.clone()}]);
+        }
+        Some(Value::Array(parts)) => {
+            if let Some(part) = parts
+                .iter_mut()
+                .rev()
+                .find(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            {
+                part["cache_control"] = marker.clone();
+            }
+        }
+        _ => {}
+    };
+    if let Some(system) = messages
+        .first_mut()
+        .filter(|message| message["role"] == "system")
+    {
+        mark(system);
+    }
+    let mut marked = 0;
+    for message in messages.iter_mut().rev() {
+        if marked == 2 {
+            break;
+        }
+        if matches!(message["role"].as_str(), Some("user" | "tool")) {
+            mark(message);
+            marked += 1;
+        }
+    }
 }
 
 fn is_protected_extra_body_key(key: &str) -> bool {
@@ -1919,11 +2060,151 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, images_after_tool_results,
-        is_reasoning_model, model_requires_reasoning_content_in_history, normalize_finish_reason,
-        normalize_response, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig, StreamState,
+        add_cache_markers, build_chat_completion_request, chat_completions_endpoint,
+        images_after_tool_results, is_reasoning_model, model_requires_reasoning_content_in_history,
+        normalize_finish_reason, normalize_response, openai_tool_choice, parse_tool_arguments,
+        wants_cache_markers, OpenAiCompatClient, OpenAiCompatConfig, StreamState,
     };
+    #[test]
+    fn local_models_get_the_running_turns_reasoning_back() {
+        let thinking = |text: &str| InputContentBlock::Thinking {
+            thinking: text.to_string(),
+            signature: None,
+        };
+        let request = MessageRequest {
+            model: "local/qwen36-35b-a3b".to_string(),
+            max_tokens: 100,
+            messages: vec![
+                InputMessage::user_text("first task"),
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        thinking("old plan"),
+                        InputContentBlock::Text {
+                            text: "done".into(),
+                        },
+                    ],
+                },
+                InputMessage::user_text("second task"),
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![
+                        thinking("plan: read config.cpp then edit"),
+                        InputContentBlock::ToolUse {
+                            id: "t1".into(),
+                            name: "read_file".into(),
+                            input: serde_json::json!({"path": "config.cpp"}),
+                        },
+                    ],
+                },
+                InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "int x;".into(),
+                        }],
+                        is_error: false,
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().expect("messages");
+        let assistants = messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .collect::<Vec<_>>();
+        // The finished turn's reasoning stays out; the running turn's goes back.
+        assert!(assistants[0].get("reasoning_content").is_none());
+        assert_eq!(
+            assistants[1]["reasoning_content"],
+            "plan: read config.cpp then edit"
+        );
+    }
+
+    #[test]
+    fn local_servers_are_asked_for_prompt_progress() {
+        let chunk: super::ChatCompletionChunk = serde_json::from_str(
+            r#"{"id":"x","choices":[],"prompt_progress":{"total":10250,"cache":0,"processed":4096,"time_ms":4000}}"#,
+        )
+        .expect("chunk");
+        let progress = chunk.prompt_progress.expect("progress");
+        assert_eq!((progress.processed, progress.total), (4096, 10250));
+        let request = |model: &str| MessageRequest {
+            model: model.to_string(),
+            max_tokens: 10,
+            messages: vec![InputMessage::user_text("hi")],
+            stream: true,
+            ..Default::default()
+        };
+        let local =
+            build_chat_completion_request(&request("local/qwen"), OpenAiCompatConfig::openai());
+        assert_eq!(local["return_progress"], json!(true));
+        let hosted =
+            build_chat_completion_request(&request("openrouter/a/b"), OpenAiCompatConfig::openai());
+        assert!(hosted.get("return_progress").is_none());
+    }
+
+    #[test]
+    fn long_reasoning_goes_back_to_local_models_as_its_end() {
+        let long = format!("{}conclusion: clear the FBO", "x".repeat(20_000));
+        let replayed = super::replayed_reasoning("local/qwen", long.clone());
+        assert!(replayed.chars().count() < 4_100);
+        assert!(replayed.ends_with("conclusion: clear the FBO"));
+        assert!(replayed.starts_with("[…earlier reasoning omitted…]"));
+        assert_eq!(
+            super::replayed_reasoning("openrouter/a/b", long.clone()),
+            long
+        );
+        assert_eq!(
+            super::replayed_reasoning("local/qwen", "short".into()),
+            "short"
+        );
+    }
+
+    #[test]
+    fn openrouter_anthropic_requests_mark_the_cacheable_prefix() {
+        assert!(wants_cache_markers(
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-sonnet-4"
+        ));
+        assert!(wants_cache_markers(
+            "https://openrouter.ai/api/v1",
+            "google/gemini-2.5-pro"
+        ));
+        assert!(!wants_cache_markers(
+            "https://openrouter.ai/api/v1",
+            "deepseek/deepseek-v4.1-flash"
+        ));
+        assert!(!wants_cache_markers(
+            "https://api.anthropic.com",
+            "anthropic/claude-sonnet-4"
+        ));
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "rules"}),
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({"role": "assistant", "content": "ok"}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "second"}]}),
+            serde_json::json!({"role": "assistant", "content": null, "tool_calls": []}),
+            serde_json::json!({"role": "tool", "tool_call_id": "1", "content": "result"}),
+        ];
+        add_cache_markers(&mut messages);
+        let marked = |index: usize| {
+            messages[index]["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part.get("cache_control").is_some()))
+        };
+        // System prompt plus the two newest user/tool messages: 3 of the 4 allowed.
+        assert!(marked(0));
+        assert!(!marked(1));
+        assert!(!marked(2));
+        assert!(marked(3));
+        assert!(marked(5));
+        assert_eq!(messages[5]["content"][0]["text"], "result");
+    }
+
     use crate::error::ApiError;
     use crate::types::{
         ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -2124,6 +2405,7 @@ mod tests {
                     finish_reason: None,
                 }],
                 usage: None,
+                prompt_progress: None,
             })
             .expect("reasoning chunk");
         events.extend(
@@ -2142,6 +2424,7 @@ mod tests {
                         finish_reason: Some("stop".to_string()),
                     }],
                     usage: None,
+                    prompt_progress: None,
                 })
                 .expect("text chunk"),
         );

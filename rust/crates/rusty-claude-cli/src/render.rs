@@ -657,6 +657,16 @@ pub fn print_with_margins(text: &str) {
 
 /// The running "thinking" animation, if any.
 static THINKING: Mutex<Option<ThinkingAnimation>> = Mutex::new(None);
+/// How far a local server has read the current request's prompt.
+static PROMPT_PROGRESS: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// A local server has read `done` of `total` prompt tokens; the animation
+/// shows it instead of "thinking" until the reply starts.
+pub fn note_prompt_progress(done: u64, total: u64) {
+    *PROMPT_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((done, total));
+}
 
 struct ThinkingAnimation {
     stop: Arc<AtomicBool>,
@@ -676,6 +686,9 @@ pub fn start_thinking(label: &str) {
     if slot.is_some() {
         return;
     }
+    *PROMPT_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let label = label.to_string();
@@ -703,7 +716,16 @@ pub fn start_thinking(label: &str) {
                 } else {
                     String::new()
                 };
-                let line = format!("[{bar}] {label} {}s{queued}", started.elapsed().as_secs());
+                let progress = *PROMPT_PROGRESS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let shown = match progress {
+                    Some((done, total)) if total > 0 && done < total => {
+                        format!("reading the prompt {}%", done * 100 / total)
+                    }
+                    _ => label.clone(),
+                };
+                let line = format!("[{bar}] {shown} {}s{queued}", started.elapsed().as_secs());
                 let mut stdout = io::stdout().lock();
                 let _ = write!(stdout, "\r\x1b[2K{}", line.with(color));
                 let _ = stdout.flush();

@@ -279,21 +279,59 @@ pub fn edit_file(
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    let mut matches = find_edit_matches(&original_file, old_string);
+    // read_file shows each line as "<number>\t<text>"; models sometimes copy
+    // the numbers into old_string (and new_string) with the text.
+    let unnumbered;
+    let (old_string, new_string) = match (
+        matches.is_empty(),
+        strip_line_numbers(old_string),
+        strip_line_numbers(new_string),
+    ) {
+        (true, Some(old), new) => {
+            matches = find_edit_matches(&original_file, &old);
+            unnumbered = (old, new.unwrap_or_else(|| new_string.to_string()));
+            (unnumbered.0.as_str(), unnumbered.1.as_str())
+        }
+        _ => (old_string, new_string),
+    };
+    if matches.is_empty() {
+        // The closest lines, numbered, so the model can correct old_string
+        // from them; without them it re-read the whole file after every miss
+        // (aider shows the near miss the same way).
+        let hint = closest_lines(&original_file, old_string).map_or_else(String::new, |lines| {
+            format!("\n\nThe closest lines in the file are:\n{lines}")
+        });
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            format!(
+                "old_string not found in file. It must match the file's text, including \
+                 indentation; copy the lines exactly, without the line numbers.{hint}"
+            ),
+        ));
+    }
+    if matches.len() > 1 && !replace_all {
+        // Replacing the first of several silently edited whichever came first,
+        // often not the one meant (opencode refuses the same way).
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "found {} matches for old_string; add surrounding lines to make it unique, \
+                 or set replace_all to change every one",
+                matches.len()
+            ),
         ));
     }
     if !replace_all {
-        reject_duplicated_context(&original_file, old_string, new_string)?;
+        let (start, end) = matches[0];
+        reject_duplicated_context(&original_file, &original_file[start..end], new_string)?;
     }
 
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
-    } else {
-        original_file.replacen(old_string, new_string, 1)
-    };
+    let mut updated = original_file.clone();
+    for &(start, end) in matches.iter().rev() {
+        let replacement = reindent(new_string, old_string, &original_file[start..end]);
+        updated.replace_range(start..end, replacement.as_deref().unwrap_or(new_string));
+    }
     fs::write(&absolute_path, &updated)?;
 
     Ok(EditFileOutput {
@@ -306,6 +344,283 @@ pub fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+/// Where `search` occurs in `content`, as byte ranges, trying stricter matches
+/// first (as opencode's edit tool does): exactly; then with typographic
+/// quotes, dashes and odd spaces treated as plain ones; then line by line,
+/// ignoring trailing whitespace and `\r`. Models often copy a line with its
+/// trailing spaces dropped or a curly quote straightened; exact-only
+/// matching failed those edits.
+fn find_edit_matches(content: &str, search: &str) -> Vec<(usize, usize)> {
+    if search.is_empty() {
+        return Vec::new();
+    }
+    let exact = content
+        .match_indices(search)
+        .map(|(at, found)| (at, at + found.len()))
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let normalized = find_normalized(content, search);
+    if !normalized.is_empty() {
+        return normalized;
+    }
+    let lines = find_lines(content, search, |line| {
+        line.trim_end().chars().map(plain_char).collect()
+    });
+    if !lines.is_empty() {
+        return lines;
+    }
+    // Last, opencode's line-trimmed match: indentation ignored too, but only
+    // when that finds exactly one place, so a loose match never edits the
+    // wrong one of several.
+    let trimmed = find_lines(content, search, |line| {
+        line.trim().chars().map(plain_char).collect()
+    });
+    if trimmed.len() == 1 {
+        trimmed
+    } else {
+        Vec::new()
+    }
+}
+
+/// `new_string` re-indented to the file, when `old_string` matched lines
+/// whose indentation it got wrong (the indentation-ignoring match). Each
+/// line moves by as much as the old line in the same place had to; lines
+/// past the end of `old_string` by the most common shift. Pasting the
+/// model's indentation as it was left code misindented: Nemotron started
+/// `old_string` mid-line at a 0 indent and the rest 4 short, and the edit
+/// moved all seven lines. `None` when nothing needs to move.
+fn reindent(new_string: &str, old_string: &str, matched: &str) -> Option<String> {
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+    let old_lines = old_string.split('\n').collect::<Vec<_>>();
+    let file_lines = matched.split('\n').collect::<Vec<_>>();
+    if old_lines.len() != file_lines.len() {
+        return None;
+    }
+    let shifts = old_lines
+        .iter()
+        .zip(&file_lines)
+        .map(|(old, file)| {
+            (!old.trim().is_empty()).then(|| {
+                i64::try_from(indent(file)).unwrap_or(0) - i64::try_from(indent(old)).unwrap_or(0)
+            })
+        })
+        .collect::<Vec<_>>();
+    if shifts.iter().flatten().all(|shift| *shift == 0) {
+        return None;
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for shift in shifts.iter().flatten() {
+        *counts.entry(*shift).or_insert(0) += 1;
+    }
+    let common = counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map_or(0, |(shift, _)| shift);
+    let fill = file_lines
+        .iter()
+        .find_map(|line| line.chars().next().filter(|c| *c == '\t' || *c == ' '))
+        .unwrap_or(' ');
+    let lines = new_string
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            if line.trim().is_empty() {
+                return line.to_string();
+            }
+            let shift = shifts.get(index).copied().flatten().unwrap_or(common);
+            let width = (i64::try_from(indent(line)).unwrap_or(0) + shift).max(0);
+            let width = usize::try_from(width).unwrap_or(0);
+            format!("{}{}", fill.to_string().repeat(width), line.trim_start())
+        })
+        .collect::<Vec<_>>();
+    Some(lines.join("\n"))
+}
+
+/// `text` without the "<number>\t" read_file puts before each line, when
+/// every non-blank line has one.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    fn numbered(line: &str) -> Option<&str> {
+        let line = line.trim_start();
+        let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        (digits > 0 && line[digits..].starts_with('\t')).then(|| &line[digits + 1..])
+    }
+    let mut any = false;
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            out.push(line);
+            continue;
+        }
+        out.push(numbered(line)?);
+        any = true;
+    }
+    any.then(|| out.join("\n"))
+}
+
+/// The run of lines in `content` most like `search` (scored line by line on
+/// shared character pairs), numbered as read_file numbers them, with a line
+/// of context on each side. `None` when nothing is even half alike.
+fn closest_lines(content: &str, search: &str) -> Option<String> {
+    const MAX_SHOWN: usize = 40;
+    fn pairs(line: &str) -> Vec<(char, char)> {
+        let chars = line
+            .split_whitespace()
+            .collect::<String>()
+            .chars()
+            .collect::<Vec<_>>();
+        let mut pairs = chars.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs
+    }
+    fn similarity(a: &[(char, char)], b: &[(char, char)]) -> f64 {
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
+        }
+        let (mut i, mut j, mut shared) = (0, 0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    shared += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        2.0 * f64::from(shared) / (a.len() + b.len()) as f64
+    }
+    let file_lines = content.lines().collect::<Vec<_>>();
+    let wanted = search
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(pairs)
+        .collect::<Vec<_>>();
+    if wanted.is_empty() || file_lines.is_empty() {
+        return None;
+    }
+    // Bounded work on a huge file or old_string (a few million line pairs).
+    if file_lines.len().saturating_mul(wanted.len()) > 2_000_000 {
+        return None;
+    }
+    let have = file_lines
+        .iter()
+        .map(|line| pairs(line))
+        .collect::<Vec<_>>();
+    let span = wanted.len().min(file_lines.len());
+    // (score, first and last line matched)
+    let mut best = (0.0, 0, 0);
+    for start in 0..=file_lines.len() - span {
+        // Each wanted line against the best of the next few file lines, so a
+        // blank line or one extra line in between does not sink the score.
+        let mut score = 0.0;
+        let mut at = start;
+        let mut matched = Vec::with_capacity(wanted.len());
+        for want in &wanted {
+            let (line_score, found) = (at..(at + 3).min(file_lines.len()))
+                .map(|index| (similarity(want, &have[index]), index))
+                .fold((0.0, at), |a, b| if b.0 > a.0 { b } else { a });
+            score += line_score;
+            matched.push(found);
+            at = (found + 1).min(file_lines.len().saturating_sub(1));
+        }
+        if score > best.0 {
+            best = (score, matched[0], matched[matched.len() - 1]);
+        }
+    }
+    if best.0 / (wanted.len() as f64) < 0.5 {
+        return None;
+    }
+    let first = best.1.saturating_sub(1);
+    let last = (best.2 + 2).min(file_lines.len()).min(first + MAX_SHOWN);
+    Some(
+        (first..last)
+            .map(|index| format!("{}\t{}", index + 1, file_lines[index]))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Typographic characters as the plain ones a model types.
+fn plain_char(ch: char) -> char {
+    match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+        '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
+fn find_normalized(content: &str, search: &str) -> Vec<(usize, usize)> {
+    let chars = content.char_indices().collect::<Vec<_>>();
+    let wanted = search.chars().map(plain_char).collect::<Vec<_>>();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index + wanted.len() <= chars.len() {
+        let hit = wanted
+            .iter()
+            .zip(&chars[index..])
+            .all(|(want, (_, have))| plain_char(*have) == *want);
+        if hit {
+            let start = chars[index].0;
+            let end = chars
+                .get(index + wanted.len())
+                .map_or(content.len(), |(at, _)| *at);
+            found.push((start, end));
+            index += wanted.len();
+        } else {
+            index += 1;
+        }
+    }
+    found
+}
+
+/// Where `search` occurs as whole lines, comparing lines by `key` (which
+/// drops the whitespace a model gets wrong).
+fn find_lines(content: &str, search: &str, key: impl Fn(&str) -> String) -> Vec<(usize, usize)> {
+    let trailing_newline = search.ends_with('\n');
+    let mut wanted = search.split('\n').map(&key).collect::<Vec<_>>();
+    if trailing_newline {
+        wanted.pop();
+    }
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    // (start, end of text, end with newline, has newline) for each line.
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for piece in content.split_inclusive('\n') {
+        let has_newline = piece.ends_with('\n');
+        let text = piece.trim_end_matches('\n').trim_end_matches('\r');
+        lines.push((start, start + text.len(), start + piece.len(), has_newline));
+        start += piece.len();
+    }
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for first in 0..lines.len() {
+        let Some(window) = lines.get(first..first + wanted.len()) else {
+            break;
+        };
+        let same = window
+            .iter()
+            .zip(&wanted)
+            .all(|((start, text_end, _, _), want)| key(&content[*start..*text_end]) == *want);
+        let last = window[window.len() - 1];
+        if !same || (trailing_newline && !last.3) {
+            continue;
+        }
+        let range = (window[0].0, if trailing_newline { last.2 } else { last.1 });
+        if found.last().is_none_or(|previous| previous.1 <= range.0) {
+            found.push(range);
+        }
+    }
+    found
 }
 
 /// Refuses an edit whose `new_string` repeats all of the file's text before
@@ -841,6 +1156,122 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    #[test]
+    fn edits_match_past_trailing_spaces_curly_quotes_and_crlf() {
+        let path = temp_path("edit-tiers.txt");
+        let path_str = path.to_string_lossy().into_owned();
+        // Trailing spaces in the file, none in old_string.
+        std::fs::write(&path, "fn main() {   \n    let x = 1;\n}\n").expect("write");
+        edit_file(
+            &path_str,
+            "fn main() {\n    let x = 1;",
+            "fn main() {\n    let x = 2;",
+            false,
+        )
+        .expect("trailing spaces ignored");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main() {\n    let x = 2;\n}\n"
+        );
+        // A curly quote in the file, a plain one in old_string.
+        std::fs::write(&path, "say(\u{201C}hi\u{201D});\n").expect("write");
+        edit_file(&path_str, "say(\"hi\");", "say(\"bye\");", false).expect("quotes");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "say(\"bye\");\n");
+        // CRLF file, LF old_string.
+        std::fs::write(&path, "a\r\nb\r\nc\r\n").expect("write");
+        edit_file(&path_str, "a\nb", "a\nB", false).expect("crlf");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nB\r\nc\r\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edits_match_past_line_numbers_and_indentation() {
+        let path = temp_path("edit-numbered.txt");
+        let path_str = path.to_string_lossy().into_owned();
+        std::fs::write(&path, "int f() {\n    return 1;\n}\n").expect("write");
+        // Copied from read_file output, numbers and all.
+        edit_file(&path_str, "2\t    return 1;", "2\t    return 2;", false)
+            .expect("line numbers stripped");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "int f() {\n    return 2;\n}\n"
+        );
+        // Indentation wrong, but only one place it can mean: the new text
+        // is moved to the file's indentation.
+        edit_file(&path_str, "        return 2;", "        return 3;", false).expect("indentation");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "int f() {\n    return 3;\n}\n"
+        );
+        // Started mid-line at no indent, the rest 4 short (Nemotron's edit).
+        std::fs::write(
+            &path,
+            "    if (ok) {\n            int inv = 0;\n            get(&inv);\n            flag = inv != 0;\n    }\n",
+        )
+        .expect("write");
+        edit_file(
+            &path_str,
+            "int inv = 0;\n        get(&inv);\n        flag = inv != 0;",
+            "int inv = 0;\n        get(&inv);\n        // why\n        flag = inv == 0;",
+            false,
+        )
+        .expect("reindented");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "    if (ok) {\n            int inv = 0;\n            get(&inv);\n            // why\n            flag = inv == 0;\n    }\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missed_edit_shows_the_closest_lines() {
+        let path = temp_path("edit-closest.txt");
+        let path_str = path.to_string_lossy().into_owned();
+        let mut text = (0..50)
+            .map(|n| format!("int filler{n} = {n};\n"))
+            .collect::<String>();
+        text.push_str("void paint() {\n    gl->draw(w->tex, w->x, w->y);\n    if (w->blur > 0)\n        gl->blur(w->tex);\n}\n");
+        std::fs::write(&path, &text).expect("write");
+        let error = edit_file(
+            &path_str,
+            "    gl_->draw(w->tex, w->x, w->y);\n    if (w->blur)\n        gl_->blur(w->tex);",
+            "x",
+            false,
+        )
+        .expect_err("not in the file");
+        let message = error.to_string();
+        assert!(message.contains("The closest lines"), "{message}");
+        assert!(
+            message.contains("52\t    gl->draw(w->tex, w->x, w->y);"),
+            "{message}"
+        );
+        assert!(
+            message.contains("54\t        gl->blur(w->tex);"),
+            "{message}"
+        );
+        assert!(!message.contains("filler10"), "{message}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edits_refuse_ambiguous_old_strings() {
+        let path = temp_path("edit-ambiguous.txt");
+        let path_str = path.to_string_lossy().into_owned();
+        std::fs::write(&path, "x = 1\ny = 2\nx = 1\n").expect("write");
+        let error = edit_file(&path_str, "x = 1", "x = 3", false).expect_err("two matches");
+        assert!(error.to_string().contains("found 2 matches"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "x = 1\ny = 2\nx = 1\n"
+        );
+        edit_file(&path_str, "x = 1", "x = 3", true).expect("replace all");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "x = 3\ny = 2\nx = 3\n"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -25,6 +25,7 @@ mod diff_view;
 mod init;
 mod input;
 mod keybindings;
+mod learning;
 mod render;
 mod repl_commands;
 mod setup_wizard;
@@ -273,24 +274,26 @@ fn max_tokens_for_model(model: &str) -> u32 {
     api::max_tokens_for_model(model)
 }
 
-/// The auto-compaction threshold for a `local/` model whose window is
-/// known, unless the user set one (`/autocompact`, the environment). The
-/// default (100k) is far past a local server's window, so sessions ran
-/// until the server refused a request. Compacting at 60% leaves room for
-/// the reply (a quarter of the window) and the next tool result.
+/// The auto-compaction threshold for a model whose window is known (a
+/// local server's `-c`, a hosted model's catalog entry), unless the user set
+/// one (`/autocompact`, the environment). The fixed default (100k) is far
+/// past a local server's window, so sessions ran until the server refused a
+/// request, and it compacted a 1M-token model at a tenth of its window.
 fn window_auto_compaction_threshold(model: &str) -> Option<u32> {
-    if !model.starts_with("local/") || runtime::configured_auto_compaction_threshold().is_some() {
+    if runtime::configured_auto_compaction_threshold().is_some() {
         return None;
     }
-    known_context_window(model).map(auto_compaction_threshold_for_window)
+    known_context_window(model)
+        .map(|window| auto_compaction_threshold_for_window(window, max_tokens_for_model(model)))
 }
 
-/// What is left of the window once the reply budget (a quarter) and a
-/// small margin are set aside. A flat 3/5 left a 32k window with ~6k tokens
-/// of history after a ~13k system prompt, so it compacted nearly every step.
-fn auto_compaction_threshold_for_window(window: u32) -> u32 {
+/// What is left of the window once the reply budget (at most a quarter of
+/// it) and a small margin are set aside. A flat 3/5 left a 32k window with
+/// ~6k tokens of history after a ~13k system prompt, so it compacted nearly
+/// every step.
+fn auto_compaction_threshold_for_window(window: u32, reply_budget: u32) -> u32 {
     window
-        .saturating_sub(api::local_max_output_tokens_for_window(window))
+        .saturating_sub(reply_budget.min(api::local_max_output_tokens_for_window(window)))
         .saturating_sub(window / 16)
 }
 
@@ -316,11 +319,16 @@ const GIT_COMMIT_DATE: Option<&str> = option_env!("GIT_COMMIT_DATE");
 const GIT_COMMIT_TIMESTAMP: Option<&str> = option_env!("GIT_COMMIT_TIMESTAMP");
 const RUSTC_VERSION: Option<&str> = option_env!("RUSTC_VERSION");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// A local server sends nothing until it has read the whole prompt, which on
-/// a small GPU takes well over 10 seconds once the context is a few thousand
-/// tokens long; the short timeout cancelled that work and started it again.
-const LOCAL_POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a hosted model may stay silent after a tool result before the
+/// request is dropped and sent again. 10s cut off large-context requests
+/// (the provider reads hundreds of thousands of tokens before the first
+/// byte) and queued free models, restarting their work and, on paid
+/// models, paying for the prompt twice.
+const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A local server sends nothing until it has read the whole prompt: a full
+/// 32k context takes over five minutes at ~100 tokens/s on a small GPU, and
+/// 120s cut such requests off (ending the turn) before the first token.
+const LOCAL_POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(900);
 /// Error text for a reply stopped with Esc or Ctrl+C.
 const INTERRUPTED_BY_USER: &str = "reply stopped by user";
 /// How often an in-flight model request checks whether Esc was pressed.
@@ -373,6 +381,14 @@ type RuntimePluginStateBuildOutput = (
     Vec<RuntimeToolDefinition>,
 );
 
+/// Shows how far a local server has read the prompt: on the REPL's
+/// activity row, the one-shot spinner, and in the desktop app.
+fn show_prompt_progress(done: u64, total: u64) {
+    runtime::turn_keys::note_prompt_progress(done, total);
+    render::note_prompt_progress(done, total);
+    desktop_agent::emit_prompt_progress(done, total);
+}
+
 fn main() {
     // `ssh` runs `claw __askpass PROMPT` (via SSH_ASKPASS) when a command
     // claw started needs a key passphrase; see `runtime::askpass`.
@@ -380,10 +396,17 @@ fn main() {
     if argv.get(1).map(String::as_str) == Some(runtime::askpass::ASKPASS_ARG) {
         std::process::exit(runtime::askpass::run_helper(&argv[2..]));
     }
+    api::set_prompt_progress_hook(show_prompt_progress);
     // Stops a model server claw started once no claw uses it.
     if argv.get(1).map(String::as_str) == Some(runtime::model_server::WATCH_ARG) {
         let provider = argv.get(2).map_or("local", String::as_str);
         std::process::exit(runtime::model_server::run_watcher(provider));
+    }
+    // claw desktop's model list: the same rows as `/model`, one JSON object
+    // per line. Anywhere in argv, since the launcher adds its own flags.
+    if argv.iter().any(|arg| arg == LIST_MODELS_ARG) {
+        print_model_list();
+        std::process::exit(0);
     }
     // Memory anchors are fingerprinted with the tools crate's symbol parser.
     runtime::set_anchor_hasher(tools::memory_anchor_hash);
@@ -6361,6 +6384,263 @@ fn format_unknown_slash_command_message(name: &str) -> String {
     message
 }
 
+/// The last request a REPL turn sent to the model, and the client that sent
+/// it: what a `/btw` asked during the turn is answered from.
+static SIDE_CONTEXT: Mutex<Option<(ApiProviderClient, MessageRequest)>> = Mutex::new(None);
+
+fn remember_for_side_questions(client: &ApiProviderClient, request: &MessageRequest) {
+    *SIDE_CONTEXT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((client.clone(), request.clone()));
+}
+
+/// `/btw` typed while a turn runs: answered at once on its own thread from
+/// the conversation as last sent to the model, without tools, while the
+/// task goes on (as in Claude Code). The answer is printed between steps.
+fn answer_side_question_now(question: String) {
+    std::thread::spawn(move || {
+        let answer = side_answer_from_last_request(&question)
+            .unwrap_or_else(|error| format!("(could not answer the side question: {error})"));
+        runtime::turn_keys::push_side_answer(question, answer);
+    });
+}
+
+pub(crate) fn side_answer_from_last_request(question: &str) -> Result<String, String> {
+    let (client, mut request) = SIDE_CONTEXT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or("nothing has been sent to the model yet")?;
+    request.tools = None;
+    request.tool_choice = None;
+    request.stream = false;
+    request.max_tokens = request.max_tokens.min(8_192);
+    let prompt = InputContentBlock::Text {
+        text: claude_commands::btw_prompt(question),
+    };
+    match request.messages.last_mut() {
+        Some(last) if last.role == "user" => last.content.push(prompt),
+        _ => request.messages.push(InputMessage {
+            role: "user".to_string(),
+            content: vec![prompt],
+        }),
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let model = request.model.clone();
+    side_task_text(&runtime, request, Some((&model, &client)))
+}
+
+/// Hidden argument for [`print_model_list`].
+const LIST_MODELS_ARG: &str = "__list-models";
+
+/// Prints the `/model` rows for claw desktop as JSON lines
+/// (`{"model": …, "notes": …}`), starting from the configured default.
+fn print_model_list() {
+    let current = config_model_for_current_dir()
+        .map(|model| resolve_model_alias_with_config(&model))
+        .unwrap_or_default();
+    let aliases = env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .map(|config| config.aliases().clone())
+        .unwrap_or_default();
+    let providers = cached_available_models();
+    for (model, notes) in model_picker_options(&current, &aliases, &providers) {
+        if model.is_empty() {
+            continue;
+        }
+        println!(
+            "{}",
+            serde_json::json!({"model": model, "notes": notes.join(" · ")})
+        );
+    }
+}
+
+/// Saves `choice` (a model or alias, or "off") as the fallback model and
+/// returns the report. Shared by the terminal and claw desktop.
+fn apply_fallback_setting(choice: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let current = fallback_models_for("").into_iter().next();
+    let choice = choice.trim();
+    let off = matches!(choice, "off" | "none" | "");
+    let fallback = (!off).then(|| resolve_model_alias_with_config(choice));
+    if let Some(model) = &fallback {
+        // A name that is neither provider/model, a Claude model nor an alias
+        // (e.g. a removed alias) would only fail later, when it is needed.
+        if !(model.contains('/') || model.starts_with("claude") || is_bare_provider_model(model)) {
+            return Err(format!(
+                "unknown model '{model}': use provider/model (e.g. local/qwen36-35b-a3b) or an alias from settings"
+            )
+            .into());
+        }
+    }
+    let mut config = runtime::read_user_setting_value("providerFallbacks")
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    config["fallbacks"] = serde_json::json!(fallback.iter().collect::<Vec<_>>());
+    setup_wizard::save_settings_value("providerFallbacks", config)?;
+    // A switch made for the old setting no longer applies.
+    *FALLBACK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    Ok(match fallback {
+        Some(model) => {
+            let note = if model.starts_with("local/") {
+                " (its model server starts when it is needed)"
+            } else {
+                ""
+            };
+            format!(
+                "Fallback\n  Previous         {}\n  Current          {model}{note}\n  Saved to         ~/.claw/settings.json",
+                current.as_deref().unwrap_or("off")
+            )
+        }
+        None => "Fallback\n  Current          off (failures are reported, no switch)".to_string(),
+    })
+}
+
+/// `/fallback` without a model: "off" and every model `/model` offers, the
+/// current fallback first. `None` when dismissed.
+fn pick_fallback_model(
+    current: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let _ = runtime::turn_keys::screen::write_pane(b"\r  Fetching models \xe2\x80\xa6");
+    let providers = cached_available_models();
+    let _ = runtime::turn_keys::screen::write_pane(b"\r\x1b[2K");
+    let aliases = env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .map(|config| config.aliases().clone())
+        .unwrap_or_default();
+    let mut rows = model_picker_options(current.unwrap_or(""), &aliases, &providers)
+        .into_iter()
+        .filter(|(model, _)| !model.is_empty())
+        .map(|(model, notes)| {
+            let notes = notes
+                .into_iter()
+                .map(|note| {
+                    if note == "current" {
+                        "current fallback".to_string()
+                    } else {
+                        note
+                    }
+                })
+                .collect::<Vec<_>>();
+            (model, Some(notes.join(" · ")))
+        })
+        .collect::<Vec<_>>();
+    rows.insert(
+        usize::from(current.is_some()),
+        (
+            "off".to_string(),
+            Some("no fallback: failures are reported".to_string()),
+        ),
+    );
+    Ok(
+        match ask::pick_filtered("Fallback model (type to filter)", &rows, 0)? {
+            ask::Pick::Index(index) => Some(rows[index].0.clone()),
+            ask::Pick::Typed(text) => Some(text),
+            ask::Pick::Cancelled => None,
+        },
+    )
+}
+
+/// `/model` without a name: a filterable list of the current model, the
+/// configured aliases and the models of every provider claw can reach
+/// ([`setup_wizard::available_models`]). `None` when cancelled.
+fn pick_model(current: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    // Shown in the input pane (not the conversation) while the lists load.
+    let _ = runtime::turn_keys::screen::write_pane(b"\r  Fetching models \xe2\x80\xa6");
+    let providers = cached_available_models();
+    let _ = runtime::turn_keys::screen::write_pane(b"\r\x1b[2K");
+    let aliases = env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .map(|config| config.aliases().clone())
+        .unwrap_or_default();
+    let options = model_picker_options(current, &aliases, &providers);
+    let labels = options
+        .iter()
+        .map(|(label, notes)| (label.clone(), Some(notes.join(" · "))))
+        .collect::<Vec<_>>();
+    Ok(
+        match ask::pick_filtered("Switch model (type to filter)", &labels, 0)? {
+            ask::Pick::Index(index) => Some(labels[index].0.clone()),
+            ask::Pick::Typed(text) => Some(text),
+            ask::Pick::Cancelled => None,
+        },
+    )
+}
+
+/// The provider model lists, fetched once per 10 minutes.
+fn cached_available_models() -> Vec<(&'static str, Vec<String>)> {
+    type Cached = Option<(Instant, Vec<(&'static str, Vec<String>)>)>;
+    static CACHE: Mutex<Cached> = Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, models)) = cache.as_ref() {
+        if at.elapsed() < Duration::from_secs(600) {
+            return models.clone();
+        }
+    }
+    let models = setup_wizard::available_models();
+    *cache = Some((Instant::now(), models.clone()));
+    models
+}
+
+/// The `/model` picker's rows, as (model, notes): the current model first,
+/// then the aliases' models, then every provider's; each model once, with
+/// what is known about it (alias names, provider, context size, free).
+fn model_picker_options(
+    current: &str,
+    aliases: &std::collections::BTreeMap<String, String>,
+    providers: &[(&str, Vec<String>)],
+) -> Vec<(String, Vec<String>)> {
+    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    let mut add = |model: &str, note: Option<String>| {
+        let index = rows
+            .iter()
+            .position(|(known, _)| known == model)
+            .unwrap_or_else(|| {
+                rows.push((model.to_string(), Vec::new()));
+                rows.len() - 1
+            });
+        if let Some(note) = note {
+            rows[index].1.push(note);
+        }
+    };
+    add(current, Some("current".to_string()));
+    for (alias, model) in aliases {
+        add(resolve_model_alias(model), Some(format!("alias {alias}")));
+    }
+    for (label, models) in providers {
+        for model in models {
+            add(model, Some((*label).to_string()));
+        }
+    }
+    for (model, notes) in &mut rows {
+        if model.starts_with("local/") {
+            continue;
+        }
+        if let Some(window) = known_context_window(model) {
+            notes.push(format!("{}k context", window / 1000));
+        }
+        match api::hosted_model_cost(model) {
+            _ if model.ends_with(":free") => notes.push("free".to_string()),
+            Some((input, output)) if input == 0.0 && output == 0.0 => {
+                notes.push("free".to_string());
+            }
+            Some((input, output)) => notes.push(format!("paid ${input}/${output} per M tokens")),
+            None => {}
+        }
+    }
+    rows
+}
+
 fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Model
@@ -6494,6 +6774,19 @@ fn format_compact_report(removed: usize, resulting_messages: usize, skipped: boo
 
 fn format_auto_compaction_notice(removed: usize) -> String {
     format!("[auto-compacted: removed {removed} messages]")
+}
+
+/// The notice for an automatic compaction: messages summarized away, or
+/// only old tool output cleared.
+fn auto_compaction_notice(event: &runtime::AutoCompactionEvent) -> String {
+    if event.removed_message_count == 0 {
+        format!(
+            "[auto-compacted: cleared {} old tool results, no messages removed]",
+            event.pruned_tool_results
+        )
+    } else {
+        format_auto_compaction_notice(event.removed_message_count)
+    }
 }
 
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
@@ -7180,6 +7473,7 @@ fn run_resume_command(
         | SlashCommand::Ultraplan { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::Btw { .. }
+        | SlashCommand::Fallback { .. }
         | SlashCommand::Recap
         | SlashCommand::Color { .. }
         | SlashCommand::Advisor { .. }
@@ -7355,6 +7649,170 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 /// How many times LeanGate sends type errors back before letting a turn end.
 const LEAN_GATE_ROUNDS: usize = 2;
 
+/// Most images in one reply that are checked.
+const MAX_CHECKED_IMAGES: usize = 8;
+
+/// After a turn: the reply's Markdown images that do not load (a web
+/// address that fails or is not an image, a missing file), as a request to
+/// the model to replace them; `None` when they all load. Models guessed
+/// image addresses (a Wikimedia path with the wrong hash directory), and
+/// the app showed nothing where the picture should be.
+fn image_check(session: &runtime::Session) -> Option<String> {
+    let reply = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == runtime::MessageRole::Assistant)?
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            runtime::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let targets = reply_image_targets(&reply)
+        .into_iter()
+        .take(MAX_CHECKED_IMAGES)
+        .collect::<Vec<_>>();
+    // All at once: one at a time took up to 15s per image.
+    let problems = std::thread::scope(|scope| {
+        targets
+            .iter()
+            .map(|target| scope.spawn(move || image_problem(target)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|check| check.join().ok().flatten())
+            .collect::<Vec<_>>()
+    });
+    let broken = targets
+        .iter()
+        .zip(problems)
+        .filter_map(|(target, problem)| problem.map(|problem| format!("- {target}: {problem}")))
+        .collect::<Vec<_>>();
+    if broken.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<system-reminder>\nThese images in your last reply do not load, so the user sees \
+         nothing there:\n{}\nDo not guess image addresses. Use an image URL that appears in a \
+         page you fetched (WebFetch, or Browser `read`/`eval`), or save the image with Download \
+         and show its local path. Then give the reply again with images that load; leave out \
+         any you cannot find.\n</system-reminder>",
+        broken.join("\n")
+    ))
+}
+
+/// The targets of the Markdown images (`![alt](target)`) in `text`.
+fn reply_image_targets(text: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        rest = &rest[start + 2..];
+        let Some(close) = rest.find("](") else {
+            break;
+        };
+        rest = &rest[close + 2..];
+        // Addresses may hold balanced parentheses (Wikimedia's
+        // `ZHAO_LUSI_(…)_P2.jpg`), as Markdown allows.
+        let mut depth = 0_usize;
+        let Some(end) = rest.char_indices().find_map(|(at, ch)| match ch {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 0 => Some(at),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        }) else {
+            break;
+        };
+        // `![alt](url "title")`: the address is the first word.
+        let target = rest[..end]
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(['<', '>']);
+        if !target.is_empty() && !targets.iter().any(|known| known == target) {
+            targets.push(target.to_string());
+        }
+        rest = &rest[end..];
+    }
+    targets
+}
+
+/// Web images that loaded when checked, so a reply showing them again is
+/// not fetched again.
+static LOADED_IMAGES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Why the image at `target` would not show, or `None` when it loads or
+/// cannot be told: the same address and agent the app uses, headers only
+/// (HEAD, else a one-byte GET). Only a definite failure counts: a missing
+/// page (400/403/404/410) or content that is not an image. A rate limit
+/// (429), a server error or a timeout says nothing about the address:
+/// Wikimedia answered 429 right after the app loaded five good images, and
+/// the model was sent to "fix" a picture the user could see.
+fn image_problem(target: &str) -> Option<String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        if LOADED_IMAGES
+            .lock()
+            .is_ok_and(|loaded| loaded.contains(target))
+        {
+            return None;
+        }
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) claw-desktop")
+            .timeout(Duration::from_secs(15))
+            .build()
+            .ok()?;
+        let mut response = client.head(target).send().ok()?;
+        if matches!(response.status().as_u16(), 405 | 501) {
+            response = client
+                .get(target)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send()
+                .ok()?;
+        }
+        let status = response.status().as_u16();
+        if matches!(status, 400 | 403 | 404 | 410) {
+            return Some(format!("HTTP {status}"));
+        }
+        if !response.status().is_success() {
+            return None;
+        }
+        let kind = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !kind.is_empty() && !kind.starts_with("image/") {
+            return Some(format!("not an image (the address returns {kind})"));
+        }
+        if let Ok(mut loaded) = LOADED_IMAGES.lock() {
+            loaded.insert(target.to_string());
+        }
+        return None;
+    }
+    if target.starts_with("data:") {
+        return None;
+    }
+    let path = crate::repl_commands::expand_home(target.strip_prefix("file://").unwrap_or(target));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Some("no such file".to_string());
+    };
+    let head = &bytes[..bytes.len().min(512)];
+    let image = head.starts_with(b"\x89PNG")
+        || head.starts_with(&[0xFF, 0xD8, 0xFF])
+        || head.starts_with(b"GIF8")
+        || (head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP"))
+        || String::from_utf8_lossy(head).contains("<svg");
+    (!image).then(|| "the file is not an image".to_string())
+}
+
 /// Sessions shorter than this many turns are not reflected on at exit.
 const REFLECT_MIN_TURNS: u32 = 5;
 
@@ -7379,6 +7837,10 @@ fn run_repl(
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     cli.checkpoints_enabled = true;
+    // Fetch the providers' model lists now, so `/model` opens at once.
+    std::thread::spawn(cached_available_models);
+    // Tidy the skills claw learned, at most once a week, in the background.
+    learning::curate_in_background(cli.model.clone());
     ignore_ctrl_c_in_repl();
     // Lets the footer shown during a turn follow terminal resizes.
     runtime::turn_keys::set_terminal_size_probe(|| {
@@ -7397,6 +7859,7 @@ fn run_repl(
     runtime::turn_keys::screen::set_copy_handler(repl_commands::copy_selection);
     tools::local_tools::set_mcp_waiter(mcp_wait_report);
     tools::local_tools::set_background_sessions_provider(background_session_rows);
+    runtime::turn_keys::set_side_question_handler(answer_side_question_now);
     let mut editor =
         input::LineEditor::new("❯ ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -7418,6 +7881,11 @@ fn run_repl(
         }
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         claude_commands::announce_finished_background();
+        learning::announce_learned();
+        // `/btw` asked during the last turn: wait (briefly) for answers still
+        // on their way, then show them.
+        runtime::turn_keys::wait_for_side_answers(Duration::from_secs(60));
+        runtime::turn_keys::print_side_answers();
         cli.refresh_footer_status();
         // Prompts queued with Enter while the last reply ran go first.
         let outcome = match runtime::turn_keys::take_queued() {
@@ -7677,6 +8145,9 @@ fn report_repl_turn_error(result: Result<(), Box<dyn std::error::Error>>) {
         if let Some(hint) = timeout_hint(&error.to_string()) {
             eprintln!("{hint}");
         }
+        if let Some(hint) = credits_hint(&error.to_string()) {
+            eprintln!("{hint}");
+        }
         eprintln!("The request failed. /retry sends it again.");
     }
 }
@@ -7689,6 +8160,16 @@ fn timeout_hint(error: &str) -> Option<&'static str> {
         "The model sent nothing for longer than the API timeout. Local models do this \
          while generating a long tool call, such as writing a big file. Raise \
          CLAW_API_REQUEST_TIMEOUT (seconds), or ask for the file in smaller parts.",
+    )
+}
+
+/// A 402 from the provider: the model costs money and the account cannot pay
+/// for the request (OpenRouter with no credits bought, or a spent limit).
+fn credits_hint(error: &str) -> Option<&'static str> {
+    (error.contains("402") && (error.contains("credits") || error.contains("Payment"))).then_some(
+        "This model is paid and the provider account has no credits left for it. \
+         Pick a free model with /model (the list marks them; OpenRouter's end in \
+         :free), or add credits at the provider.",
     )
 }
 
@@ -8507,6 +8988,14 @@ impl LiveCli {
         if result.is_ok() {
             result = self.lean_gate_rounds();
         }
+        if result.is_ok() && !self.last_turn_was_stopped() {
+            if let Some(report) = image_check(self.runtime.session()) {
+                println!(
+                    "  {TOOL_DIM_STYLE}⎿ Some images in the reply do not load; claw asks for working ones{STYLE_RESET}"
+                );
+                result = self.run_turn_inner(&report);
+            }
+        }
         self.finish_checkpoint();
         // Shell commands and sub-agents change files too.
         diff_panel::refresh();
@@ -8662,6 +9151,14 @@ impl LiveCli {
                     .is_some_and(|rt| rt.api_client_mut().streamed_text());
                 self.pending_attachments.clear();
                 self.replace_runtime(runtime)?;
+                // Decide in the background whether this turn taught
+                // anything worth keeping (memories, skills).
+                let added = 1 + summary.assistant_messages.len() + summary.tool_results.len();
+                let messages = &self.runtime.session().messages;
+                learning::review_turn_in_background(
+                    self.model.clone(),
+                    messages[messages.len().saturating_sub(added)..].to_vec(),
+                );
                 spinner.finish(
                     &format!("done in {:.1}s", turn_started.elapsed().as_secs_f64()),
                     TerminalRenderer::new().color_theme(),
@@ -8679,10 +9176,7 @@ impl LiveCli {
                 }
                 println!();
                 if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
+                    println!("{}", auto_compaction_notice(&event));
                 }
                 self.persist_session()?;
                 Ok(())
@@ -8748,7 +9242,10 @@ impl LiveCli {
                     // auto-compaction threshold so future auto-compact-trigger checks are accurate.
                     if let Some(window) = extract_context_window_tokens_from_error(&error_str) {
                         // Same share of the window as a known window gets up front.
-                        let threshold = auto_compaction_threshold_for_window(window);
+                        let threshold = auto_compaction_threshold_for_window(
+                            window,
+                            max_tokens_for_model(&self.model),
+                        );
                         println!(
                             "  Server context window: {} tokens — setting auto-compaction threshold to {}",
                             window, threshold
@@ -8870,10 +9367,7 @@ impl LiveCli {
                                 )?;
                                 println!();
                                 if let Some(event) = summary.auto_compaction {
-                                    println!(
-                                        "{}",
-                                        format_auto_compaction_notice(event.removed_message_count)
-                                    );
+                                    println!("{}", auto_compaction_notice(&event));
                                 }
                                 self.persist_session()?;
                                 return Ok(());
@@ -9005,7 +9499,7 @@ impl LiveCli {
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| json!({
                     "removed_messages": event.removed_message_count,
-                    "notice": format_auto_compaction_notice(event.removed_message_count),
+                    "notice": auto_compaction_notice(&event),
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
@@ -9066,6 +9560,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Btw { question } => self.run_btw(question.as_deref())?,
+            SlashCommand::Fallback { model } => self.set_fallback(model)?,
             SlashCommand::Recap => self.run_recap()?,
             SlashCommand::Color { color } => Self::run_color(color.as_deref())?,
             SlashCommand::Advisor { model } => self.run_advisor(model.as_deref())?,
@@ -9408,6 +9903,12 @@ impl LiveCli {
     }
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
+        let model = match model {
+            None if io::stdin().is_terminal() && runtime::turn_keys::stdout_is_terminal() => {
+                pick_model(&self.model)?
+            }
+            model => model,
+        };
         let Some(model) = model else {
             println!(
                 "{}",
@@ -9455,7 +9956,38 @@ impl LiveCli {
             "{}",
             format_model_switch_report(&previous, &model, message_count)
         );
+        // The model picked last is the one claw starts with next time.
+        match setup_wizard::save_settings_field("model", &model) {
+            Ok(()) => println!("  Default          saved to ~/.claw/settings.json"),
+            Err(error) => eprintln!("warning: could not save the default model: {error}"),
+        }
         Ok(true)
+    }
+
+    /// `/fallback [model|off]`: the model the session switches to when the
+    /// current one fails (`providerFallbacks.fallbacks` in settings). Without
+    /// an argument, a list to pick from (like `/model`), or the current
+    /// setting when there is no terminal.
+    fn set_fallback(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
+        let current = fallback_models_for("").into_iter().next();
+        let choice = match model {
+            None if io::stdin().is_terminal() && runtime::turn_keys::stdout_is_terminal() => {
+                pick_fallback_model(current.as_deref())?
+            }
+            None => {
+                println!(
+                    "Fallback\n  Current          {}\n\nUsage\n  /fallback <model>   use it when the current model fails\n  /fallback off       no fallback",
+                    current.as_deref().unwrap_or("off")
+                );
+                return Ok(false);
+            }
+            Some(model) => Some(model.trim().to_string()),
+        };
+        let Some(choice) = choice else {
+            return Ok(false);
+        };
+        println!("{}", apply_fallback_setting(&choice)?);
+        Ok(false)
     }
 
     fn set_permissions(
@@ -9705,6 +10237,12 @@ impl LiveCli {
         &mut self,
         session_path: Option<String>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        let session_path = match session_path {
+            None if io::stdin().is_terminal() && runtime::turn_keys::stdout_is_terminal() => {
+                pick_session_to_resume(&self.session.id)?
+            }
+            path => path,
+        };
         let Some(session_ref) = session_path else {
             println!("{}", render_resume_usage());
             return Ok(false);
@@ -10212,7 +10750,9 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+        let result = self
+            .runtime
+            .compact_with_model_summary(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
@@ -10371,6 +10911,97 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
     current_session_store()?
         .resolve_managed_path(session_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// `/resume` without a session: a filterable list of this folder's earlier
+/// sessions, newest first, each shown by its first request with its age
+/// and size. `None` when there are none or the list is dismissed.
+fn pick_session_to_resume(current_id: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut sessions = list_managed_sessions()?
+        .into_iter()
+        .filter(|session| session.id != current_id && session.message_count > 0)
+        .collect::<Vec<_>>();
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.modified_epoch_millis));
+    // Rotated backups of a session carry its id too: list each session once.
+    let mut seen = std::collections::BTreeSet::new();
+    sessions.retain(|session| seen.insert(session.id.clone()));
+    if sessions.is_empty() {
+        println!("No earlier sessions in this folder.");
+        return Ok(None);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    let options = sessions
+        .iter()
+        .map(|session| {
+            let age_secs =
+                u64::try_from(now_ms.saturating_sub(session.modified_epoch_millis) / 1000)
+                    .unwrap_or(u64::MAX);
+            let age = match age_secs {
+                s if s < 3_600 => format!("{} min ago", s / 60),
+                s if s < 86_400 => format!("{} h ago", s / 3_600),
+                s => format!("{} days ago", s / 86_400),
+            };
+            (
+                session_first_request(&session.path).unwrap_or_else(|| session.id.clone()),
+                Some(format!(
+                    "{age} · {} messages · {}",
+                    session.message_count, session.id
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Labels must be unique for the picker to tell rows apart.
+    let mut used = std::collections::BTreeSet::new();
+    let options = options
+        .into_iter()
+        .map(|(label, notes)| {
+            let mut unique = label.clone();
+            let mut n = 2;
+            while !used.insert(unique.clone()) {
+                unique = format!("{label} ({n})");
+                n += 1;
+            }
+            (unique, notes)
+        })
+        .collect::<Vec<_>>();
+    Ok(
+        match ask::pick_filtered("Resume a session (type to filter)", &options, 0)? {
+            ask::Pick::Index(index) => Some(sessions[index].path.display().to_string()),
+            ask::Pick::Typed(text) => Some(text),
+            ask::Pick::Cancelled => None,
+        },
+    )
+}
+
+/// The first real request in a session file (a greeting such as "hello"
+/// is skipped when something longer follows), on one line.
+fn session_first_request(path: &Path) -> Option<String> {
+    let mut first = None;
+    let file = fs::File::open(path).ok()?;
+    for line in io::BufRead::lines(io::BufReader::new(file)).take(400) {
+        let Ok(line) = line else { continue };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let text = match record["type"].as_str() {
+            Some("prompt_history") => record["text"].as_str(),
+            Some("message") if record["message"]["role"] == "user" => {
+                record["message"]["blocks"][0]["text"].as_str()
+            }
+            _ => None,
+        };
+        if let Some(text) = text.filter(|text| !text.trim().is_empty() && !text.starts_with('<')) {
+            let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let line: String = line.chars().take(90).collect();
+            if line.split_whitespace().count() >= 3 {
+                return Some(line);
+            }
+            first.get_or_insert(line);
+        }
+    }
+    first
 }
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
@@ -13192,14 +13823,36 @@ fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::E
         "unknown",
         model_family_identity_for(model),
     )?;
-    if term_image::enabled() {
-        prompt.push(TERMINAL_IMAGES_PROMPT.to_string());
-    }
+    prompt.push(capabilities_prompt(term_image::enabled()));
     Ok(prompt)
 }
 
-/// Told to the model when the terminal draws images in replies.
-const TERMINAL_IMAGES_PROMPT: &str = "# Images\nThis terminal shows images in your replies: to show a picture, put it in the reply as Markdown, `![description](https://...)` for a web image or `![description](/absolute/path.png)` for a local file (PNG, JPEG, GIF, WebP or SVG). When the user wants a file saved (an image you showed, a document you found), use the Download tool; it saves into ~/Downloads unless told otherwise.";
+/// What claw can do beyond reading and editing code, in the system prompt
+/// of the terminal and the desktop app alike (the app adds a few lines about
+/// itself). Built into claw rather than left to AGENTS.md, so it always
+/// matches the tools this build has. Models that were not told claimed they
+/// could not show pictures, opened a browser or `chafa` to show them, or
+/// guessed image addresses. `shows_images`: the reply's Markdown images are
+/// drawn (the app, kitty, Ghostty).
+pub(crate) fn capabilities_prompt(shows_images: bool) -> String {
+    let pictures = if shows_images {
+        "- Show a picture by putting it in the reply as Markdown: `![description](https://…)` for a web image, `![description](/absolute/path.png)` for a local file (PNG, JPEG, GIF, WebP, SVG). It is drawn in place; no browser, `chafa` or other viewer is needed. Images that do not load are reported back to you after the reply."
+    } else {
+        "- Pictures in replies as Markdown (`![description](https://…)` or a local path) reach the user as links here; this terminal does not draw them."
+    };
+    format!(
+        "# What you can do\n{pictures}\n\
+         - Instagram, Facebook or Pinterest post, reel or pin link: the SocialMedia tool saves its images and videos and returns `show` lines to put in your reply.\n\
+         - Other pictures on the web: WebSearch, then WebFetch on a result page (it lists the page's images) and show those addresses. Never guess an image address.\n\
+         - Pages that need clicks, scrolling or a login: Browser (a real Chrome window); its screenshots come back as images you can see.\n\
+         - Save a file the user wants kept: Download (into ~/Downloads unless told otherwise).\n\
+         - You can see images: ones the user attaches, tool screenshots, and any image file through vision_analyze.\n\
+         - The user's desktop: X11 (screenshots, windows, clicks, typing).\n\
+         - Long-running commands: bash with run_in_background, then BashOutput; Monitor watches a command's output. Commands have no terminal, so use non-interactive flags (no `emerge --ask`; add `-y`/`--noconfirm`).\n\
+         - More tools are listed by name in ToolSearch's description; load one with `select:<Name>`.\n\
+         - The user can type /undo to revert the files your last request changed, and /rewind to go further back."
+    )
+}
 
 struct PluginsCommandPayload {
     message: String,
@@ -14149,6 +14802,14 @@ impl AnthropicRuntimeClient {
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
+        // With a fallback model, a failing provider is not retried for
+        // minutes (8 tries, up to 128s apart): two quick tries, then the
+        // fallback takes over.
+        let client = if fallback_models_for(&resolved_model).is_empty() {
+            client
+        } else {
+            client.with_retry_policy(2, Duration::from_secs(1), Duration::from_secs(4))
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -14189,6 +14850,591 @@ async fn wait_for_abort(abort_signal: Option<runtime::HookAbortSignal>) {
     }
 }
 
+/// The model for side tasks (compaction summaries, `/btw`): setting
+/// `auxiliaryModel`, aliases resolved, so they do not spend the main
+/// model's quota and keep working while it is rate-limited (hermes calls it
+/// the auxiliary client). `None` when unset: the main model does them.
+fn auxiliary_model() -> Option<(String, ApiProviderClient)> {
+    let model = runtime::read_user_setting("auxiliaryModel")
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())?;
+    let model = resolve_model_alias_with_config(&model);
+    runtime::model_server::ensure_for_model(&model);
+    let client = ApiProviderClient::from_model_with_anthropic_auth(&model, None).ok()?;
+    Some((model, client))
+}
+
+/// Sends a side-task `request` (no tools, not shown) to the auxiliary model
+/// when one is set, else, or when that fails, to `fallback` with its model.
+/// The reply's text, trimmed.
+fn side_task_text(
+    runtime: &tokio::runtime::Runtime,
+    mut request: MessageRequest,
+    fallback: Option<(&str, &ApiProviderClient)>,
+) -> Result<String, String> {
+    let send = |request: &MessageRequest, client: &ApiProviderClient| {
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(180), client.send_message(request)).await
+            })
+            .map_err(|_| "timed out".to_string())?
+            .map_err(|error| error.to_string())
+            .map(|response| {
+                response
+                    .content
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        OutputContentBlock::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+    };
+    let budget = request.max_tokens;
+    let mut last_error = "no model for the side task".to_string();
+    if let Some((model, client)) = auxiliary_model() {
+        request.model.clone_from(&model);
+        request.max_tokens = budget.min(max_tokens_for_model(&model));
+        match send(&request, &client) {
+            Ok(text) if !text.is_empty() => return Ok(text),
+            Ok(_) => last_error = "the side-task model replied with nothing".to_string(),
+            Err(error) => last_error = error,
+        }
+    }
+    if let Some((model, client)) = fallback {
+        request.model = model.to_string();
+        request.max_tokens = budget.min(max_tokens_for_model(model));
+        return send(&request, client);
+    }
+    Err(last_error)
+}
+
+/// A side question (`/btw`, `/recap`) about `session`, answered by the
+/// auxiliary model without tools. `None` when no auxiliary model is set or
+/// it fails, so the caller asks the main model instead.
+fn auxiliary_side_answer(
+    session: &runtime::Session,
+    system_prompt: &[String],
+    prompt: &str,
+) -> Option<String> {
+    runtime::read_user_setting("auxiliaryModel")?;
+    let mut messages = convert_messages(&session.messages);
+    let question = InputContentBlock::Text {
+        text: prompt.to_string(),
+    };
+    match messages.last_mut() {
+        Some(last) if last.role == "user" => last.content.push(question),
+        _ => messages.push(InputMessage {
+            role: "user".to_string(),
+            content: vec![question],
+        }),
+    }
+    let request = MessageRequest {
+        model: String::new(),
+        max_tokens: 8_192,
+        messages,
+        system: (!system_prompt.is_empty()).then(|| system_prompt.join("\n\n")),
+        stream: false,
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    side_task_text(&runtime, request, None)
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+/// The launcher's short tool list for local models (`CLAW_LOCAL_CORE_TOOLS`),
+/// used when a session that started on a hosted model (with every tool)
+/// falls back to a local one: a local model reads all ~60 tool descriptions
+/// about five times slower. `None` for hosted models or without the list.
+fn local_core_tools(model: &str, registry: &GlobalToolRegistry) -> Option<AllowedToolSet> {
+    if !model.starts_with("local/") {
+        return None;
+    }
+    let list = env::var("CLAW_LOCAL_CORE_TOOLS").ok()?;
+    let names = list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    registry.normalize_allowed_tools(&names).ok().flatten()
+}
+
+/// Context windows up to this size get the specialised tools deferred: on
+/// a 32k local window the full descriptions of every tool took ~7k tokens of
+/// each request, leaving so little room that every file read forced a
+/// compaction and the model read the file again.
+const DEFER_TOOLS_WINDOW: u32 = 65_536;
+
+/// Tools always sent with their full description; the rest of the enabled
+/// tools are listed by name in `ToolSearch` until it loads them.
+const ALWAYS_LOADED_TOOLS: &[&str] = &[
+    "bash",
+    "bash_output",
+    "kill_shell",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob_search",
+    "grep_search",
+    "todo_write",
+    "ask_user_question",
+    "skill",
+    "agent",
+    "web_search",
+    "web_fetch",
+    "tool_search",
+    // Seeing and acting on the web and the desktop: a model that saw these
+    // only by name told the user it had no way to fetch images.
+    "browser",
+    "download",
+    "social_media",
+    "x11",
+    "vision_analyze",
+    "monitor",
+    "code_search",
+    "notebook_edit",
+];
+
+/// Tools never sent to a model (they exist for claw's own tests).
+const NEVER_SENT_TOOLS: &[&str] = &["TestingPermission"];
+
+/// Models that refused an image in this process (the catalog did not say,
+/// or was wrong); later requests send them images as text.
+static NO_IMAGE_MODELS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// What `visionModel` said about each image (by a hash of its data), so an
+/// image that stays in the conversation is described once, not per request.
+static IMAGE_DESCRIPTIONS: Mutex<std::collections::BTreeMap<u64, String>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether requests to `model` carry images: not when the catalog lists it
+/// as text only, or it refused one before. A screenshot sent to Nemotron 3
+/// Ultra (text only) got "404 No endpoints found that support image input",
+/// and the turn stopped there.
+fn sends_images(model: &str) -> bool {
+    if NO_IMAGE_MODELS
+        .lock()
+        .is_ok_and(|models| models.contains(model))
+    {
+        return false;
+    }
+    api::hosted_accepts_images(model) != Some(false)
+}
+
+fn note_no_images(model: &str) {
+    if let Ok(mut models) = NO_IMAGE_MODELS.lock() {
+        models.insert(model.to_string());
+    }
+}
+
+/// An error saying the model or server takes no images (OpenRouter's 404,
+/// llama-server without a vision projector, OpenAI-style 400s).
+fn is_image_refusal(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "support image input",
+        "image input is not supported",
+        "does not support image",
+        "images are not supported",
+        "image_url is not supported",
+        "mmproj",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Replaces the images in `messages` with text for a model that takes none:
+/// what `visionModel` (a model that reads images, set in settings) says each
+/// shows, or a note that the image was left out.
+fn images_as_text(runtime: &tokio::runtime::Runtime, messages: &mut [InputMessage], model: &str) {
+    for message in messages.iter_mut() {
+        for block in &mut message.content {
+            let InputContentBlock::Image { source } = block else {
+                continue;
+            };
+            let text = describe_image(runtime, source).map_or_else(
+                || {
+                    format!(
+                        "[An image was attached here, but {model} takes no images, so it was \
+                         left out. Work from the text of the tool result; claw can describe \
+                         images when `visionModel` is set in settings to a model that reads them.]"
+                    )
+                },
+                |description| {
+                    format!(
+                        "[An image was attached here; {model} takes no images, so this is \
+                             a description of it by another model:]\n{description}"
+                    )
+                },
+            );
+            *block = InputContentBlock::Text { text };
+        }
+    }
+}
+
+/// What the `visionModel` setting's model says the image shows; `None`
+/// when no vision model is set or it fails.
+fn describe_image(runtime: &tokio::runtime::Runtime, source: &ImageSource) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.data.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Some(known) = IMAGE_DESCRIPTIONS
+        .lock()
+        .ok()
+        .and_then(|known| known.get(&key).cloned())
+    {
+        return Some(known);
+    }
+    let vision_model = runtime::read_user_setting("visionModel")
+        .map(|model| resolve_model_alias_with_config(model.trim()))
+        .filter(|model| !model.is_empty())?;
+    runtime::model_server::ensure_for_model(&vision_model);
+    let client = ApiProviderClient::from_model_with_anthropic_auth(&vision_model, None).ok()?;
+    let request = MessageRequest {
+        model: vision_model.clone(),
+        max_tokens: max_tokens_for_model(&vision_model).min(2_000),
+        messages: vec![InputMessage {
+            role: "user".to_string(),
+            content: vec![
+                InputContentBlock::Text {
+                    text: "Describe this image for an assistant that cannot see it: what it \
+                           shows, any text in it word for word, and the layout (what is where). \
+                           Be concrete and complete; no preamble."
+                        .to_string(),
+                },
+                InputContentBlock::Image {
+                    source: source.clone(),
+                },
+            ],
+        }],
+        stream: false,
+        ..Default::default()
+    };
+    let response = runtime
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(120), client.send_message(&request)).await
+        })
+        .ok()?
+        .ok()?;
+    let text = response
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(mut known) = IMAGE_DESCRIPTIONS.lock() {
+        known.insert(key, text.clone());
+    }
+    Some(text)
+}
+
+/// Reply budgets lowered to what the account can pay for (OpenRouter's 402
+/// "can only afford N"), by model, for the rest of the process.
+static AFFORDABLE_REPLY_BUDGETS: Mutex<std::collections::BTreeMap<String, u32>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// The `max_tokens` a request to `model` asks for: the model's budget, or
+/// less when the account could not pay for that much.
+fn reply_budget(model: &str) -> u32 {
+    let budget = max_tokens_for_model(model);
+    AFFORDABLE_REPLY_BUDGETS
+        .lock()
+        .ok()
+        .and_then(|budgets| budgets.get(model).copied())
+        .map_or(budget, |affordable| budget.min(affordable))
+}
+
+/// Records the reply budget a 402 says the account can afford, so the
+/// request can be sent again within it. A 64k budget on an OpenRouter key
+/// with little credit failed outright, and the turn went to the fallback
+/// model for ten minutes. `false` when `error` is not such a 402 or the
+/// amount is too small to be worth a reply.
+fn note_affordable_reply_budget(model: &str, error: &str) -> bool {
+    const MIN_USEFUL: u32 = 2_048;
+    let Some((_, rest)) = error.split_once("can only afford") else {
+        return false;
+    };
+    let digits = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    let Ok(affordable) = digits.parse::<u32>() else {
+        return false;
+    };
+    // A little under, as the price of the prompt moves with every step.
+    let affordable = affordable.saturating_mul(9) / 10;
+    if affordable < MIN_USEFUL || affordable >= reply_budget(model) {
+        return false;
+    }
+    AFFORDABLE_REPLY_BUDGETS
+        .lock()
+        .map(|mut budgets| {
+            budgets.insert(model.to_string(), affordable);
+        })
+        .is_ok()
+}
+
+/// The request after a reply cut off mid-thought goes to a local model with
+/// thinking off (the chat template's `enable_thinking`): asked to think only
+/// briefly, Qwen still thought up to the 8k reply limit again, four times in
+/// one run, and the turn ended with nothing done.
+fn thinking_off_after_cut_off(
+    model: &str,
+    request: &ApiRequest,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut extra_body = std::collections::BTreeMap::new();
+    if model.starts_with("local/") && request.follows_thinking_cut_off() {
+        extra_body.insert(
+            "chat_template_kwargs".to_string(),
+            serde_json::json!({ "enable_thinking": false }),
+        );
+    }
+    extra_body
+}
+
+/// Deferred tools `ToolSearch` has loaded in this process (canonical names).
+static LOADED_TOOLS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Whether the specialised tools go by name only (in `ToolSearch`) for
+/// every model, as Claude Code does, unless `CLAW_DEFER_TOOLS=0`. Hosted
+/// models used to get all 87 in full (~15k tokens a request): Nemotron
+/// picked from them poorly and told the user it had no tool for the web.
+fn defers_tools(_model: &str) -> bool {
+    env::var("CLAW_DEFER_TOOLS").map_or(true, |value| {
+        !matches!(value.trim(), "0" | "false" | "off" | "no")
+    })
+}
+
+/// For a small window: the always-loaded and already loaded tools in full,
+/// plus `ToolSearch` naming the others. Unchanged when nothing is deferred.
+fn defer_tool_definitions(definitions: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    let loaded = LOADED_TOOLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let (mut sent, deferred): (Vec<_>, Vec<_>) = definitions.into_iter().partition(|tool| {
+        let name = canonical_allowed_tool_name(&tool.name);
+        ALWAYS_LOADED_TOOLS.contains(&name.as_str()) || loaded.contains(&name)
+    });
+    if deferred.is_empty() {
+        return sent;
+    }
+    let listed = deferred
+        .iter()
+        .map(|tool| {
+            let summary = tool
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .split(['.', ':', '('])
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(70)
+                .collect::<String>();
+            format!("- {}: {summary}", tool.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sent.retain(|tool| tool.name != "ToolSearch");
+    sent.push(ToolDefinition {
+        name: "ToolSearch".to_string(),
+        description: Some(format!(
+            "Load more tools. These are available but not yet loaded:\n{listed}\n\
+             Call ToolSearch with query \"select:<name>[,<name>]\" (or keywords) to load \
+             them; their full description comes back and they can be called from then on."
+        )),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "max_results": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+    });
+    sent
+}
+
+/// How long the main session stays on its fallback model before trying the
+/// configured one again.
+const FALLBACK_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// The main session's switch to a fallback model: from which model, to which,
+/// until when, and the client for it. Global so it outlives the runtime,
+/// which is rebuilt for every turn and model change.
+struct FallbackSwitch {
+    primary: String,
+    fallback: String,
+    until: Instant,
+    client: ApiProviderClient,
+}
+
+static FALLBACK: Mutex<Option<FallbackSwitch>> = Mutex::new(None);
+
+/// The fallback models for `model`: `providerFallbacks.fallbacks` in
+/// settings, aliases resolved, without `model` itself.
+fn fallback_models_for(model: &str) -> Vec<String> {
+    let Some(config) = env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+    else {
+        return Vec::new();
+    };
+    config
+        .provider_fallbacks()
+        .fallbacks()
+        .iter()
+        .map(|fallback| resolve_model_alias_with_config(fallback))
+        .filter(|fallback| fallback != model)
+        .collect()
+}
+
+/// The model that answers for `configured` right now: its fallback while a
+/// switch is active, else itself. Tool results are sized for this one: a
+/// 1M-token model's 100k-character reads overflow its 32k local fallback.
+fn answering_model(configured: Option<&str>) -> Option<String> {
+    let configured = configured?;
+    let state = FALLBACK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(
+        state
+            .as_ref()
+            .filter(|switch| switch.primary == configured && Instant::now() < switch.until)
+            .map_or_else(|| configured.to_string(), |switch| switch.fallback.clone()),
+    )
+}
+
+/// The fallback in use for `primary`, if its cooldown is still running.
+/// Once it ends, says so and returns `None` so the configured model is
+/// tried again.
+fn active_fallback(primary: &str, announce: bool) -> Option<(String, ApiProviderClient)> {
+    let mut state = FALLBACK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let switch = state.as_ref().filter(|switch| switch.primary == primary)?;
+    if Instant::now() < switch.until {
+        return Some((switch.fallback.clone(), switch.client.clone()));
+    }
+    if announce {
+        eprintln!("\x1b[2m  Trying {primary} again (the fallback cooldown ended).\x1b[0m");
+    }
+    *state = None;
+    None
+}
+
+/// Switches the main session from `primary` to its first fallback model
+/// that can be reached, starting its model server (llama-gpu for `local/`
+/// models) when needed. `None` when no fallback is configured or none works.
+fn switch_to_fallback(
+    primary: &str,
+    reason: &str,
+    skip: &[String],
+    announce: bool,
+) -> Option<(String, ApiProviderClient)> {
+    for fallback in fallback_models_for(primary)
+        .into_iter()
+        .filter(|fallback| !skip.contains(fallback))
+    {
+        runtime::model_server::ensure_for_model(&fallback);
+        let Ok(client) = ApiProviderClient::from_model_with_anthropic_auth(&fallback, None) else {
+            continue;
+        };
+        if announce {
+            let reason: String = reason
+                .lines()
+                .next()
+                .unwrap_or(reason)
+                .chars()
+                .take(160)
+                .collect();
+            eprintln!(
+                "\x1b[33m  {primary} failed ({reason}); using {fallback} for the next {} minutes.\x1b[0m",
+                FALLBACK_COOLDOWN.as_secs() / 60
+            );
+        }
+        *FALLBACK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FallbackSwitch {
+            primary: primary.to_string(),
+            fallback: fallback.clone(),
+            until: Instant::now() + FALLBACK_COOLDOWN,
+            client: client.clone(),
+        });
+        return Some((fallback, client));
+    }
+    None
+}
+
+/// Failures another model can get past: rate limits, no credit, server
+/// errors, timeouts and stalls, dropped connections. Not a stop by the
+/// user, and not a full context window (compaction handles that).
+fn is_fallback_worthy(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if error.contains(INTERRUPTED_BY_USER)
+        || lower.contains("context_window")
+        || lower.contains("context window")
+        || lower.contains("context size")
+        || lower.contains("exceed_context_size")
+    {
+        return false;
+    }
+    [
+        "returned 429",
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "returned 402",
+        "payment required",
+        "more credits",
+        "returned 500",
+        "returned 502",
+        "returned 503",
+        "returned 504",
+        "returned 529",
+        "overloaded",
+        "timed out",
+        "timeout",
+        "stall",
+        "retries exhausted",
+        "retry_exhausted",
+        "error sending request",
+        "connection",
+        "no content",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// A reply with nothing in it: no text, no thinking, no tool call, and not
+/// cut off at the output limit (that one is continued instead).
+fn is_empty_reply(events: &[AssistantEvent]) -> bool {
+    !events.iter().any(|event| match event {
+        AssistantEvent::TextDelta(text) => !text.trim().is_empty(),
+        AssistantEvent::Thinking { thinking, .. } => !thinking.trim().is_empty(),
+        AssistantEvent::ToolUse { .. } | AssistantEvent::OutputLimitReached => true,
+        _ => false,
+    })
+}
+
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
@@ -14199,25 +15445,191 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 }
 
 impl ApiClient for AnthropicRuntimeClient {
-    #[allow(clippy::too_many_lines)]
+    /// A compaction summary written by the model (hosted models only: a
+    /// local model's small window is refilled quickly and slowly, and the
+    /// summary built from the messages costs it nothing).
+    fn summarize(&mut self, system: &str, transcript: &str) -> Option<String> {
+        // Without an auxiliary model, a local main model keeps the free
+        // summary built from the messages.
+        let main_local = self.model.starts_with("local/");
+        if main_local && runtime::read_user_setting("auxiliaryModel").is_none() {
+            return None;
+        }
+        let request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: max_tokens_for_model(&self.model).min(16_000),
+            messages: vec![InputMessage::user_text(transcript)],
+            system: Some(system.to_string()),
+            stream: false,
+            ..Default::default()
+        };
+        if self.emit_output {
+            render::start_thinking("summarizing the conversation");
+        }
+        let fallback = (!main_local).then_some((self.model.as_str(), &self.client));
+        let text = side_task_text(&self.runtime, request, fallback);
+        if self.emit_output {
+            render::stop_thinking();
+        }
+        text.ok().filter(|text| !text.is_empty())
+    }
+
+    /// One model request, falling back to another model (settings
+    /// `providerFallbacks.fallbacks`, e.g. the local server) when this one is
+    /// rate-limited, out of credit, failing, silent, or replies with nothing
+    /// twice. The switch lasts [`FALLBACK_COOLDOWN`], then the next request
+    /// tries the configured model again.
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        if let Some((model, client)) = active_fallback(&self.model, self.emit_output) {
+            return self.stream_through_fallbacks(model, client, &request);
+        }
+        let mut empty_replies = 0;
+        let mut lowered_reply_budget = false;
+        loop {
+            let error = match self.stream_once(request.clone()) {
+                Ok(events) if is_empty_reply(&events) => {
+                    empty_replies += 1;
+                    if empty_replies < 2 {
+                        continue;
+                    }
+                    "the model replied with nothing twice".to_string()
+                }
+                Ok(events) => return Ok(events),
+                // "requires more credits, or fewer max_tokens … can only
+                // afford N": the same request with a reply budget of N goes
+                // through, instead of the turn moving to the fallback model.
+                Err(error)
+                    if !lowered_reply_budget
+                        && note_affordable_reply_budget(&self.model, &error.to_string()) =>
+                {
+                    lowered_reply_budget = true;
+                    continue;
+                }
+                // The model refused the attached image: send it again with
+                // the images as text, and from now on.
+                Err(error) if sends_images(&self.model) && is_image_refusal(&error.to_string()) => {
+                    note_no_images(&self.model);
+                    continue;
+                }
+                Err(error) if is_fallback_worthy(&error.to_string()) => error.to_string(),
+                Err(error) => return Err(error),
+            };
+            let Some((model, client)) =
+                switch_to_fallback(&self.model, &error, &[], self.emit_output)
+            else {
+                return if empty_replies >= 2 {
+                    Err(RuntimeError::new("assistant stream produced no content"))
+                } else {
+                    Err(RuntimeError::new(error))
+                };
+            };
+            return self.stream_through_fallbacks(model, client, &request);
+        }
+    }
+}
+
+impl AnthropicRuntimeClient {
+    /// Sends the request to fallback `model`; when that one fails the same
+    /// way (rate limit, error, stall, empty reply), moves on to the next
+    /// fallback in the list instead of ending the turn (as hermes walks its
+    /// chain). Fails only once every fallback has.
+    fn stream_through_fallbacks(
+        &mut self,
+        mut model: String,
+        mut client: ApiProviderClient,
+        request: &ApiRequest,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let mut failed = Vec::new();
+        loop {
+            let error = match self.stream_as(&model, client, request) {
+                Ok(events) if is_empty_reply(&events) => {
+                    "the model replied with nothing".to_string()
+                }
+                Ok(events) => return Ok(events),
+                Err(error) if sends_images(&model) && is_image_refusal(&error.to_string()) => {
+                    note_no_images(&model);
+                    // The client went with the request; the same model again.
+                    client = ApiProviderClient::from_model_with_anthropic_auth(&model, None)
+                        .map_err(|_| error)?;
+                    continue;
+                }
+                Err(error) if is_fallback_worthy(&error.to_string()) => error.to_string(),
+                Err(error) => return Err(error),
+            };
+            failed.push(model.clone());
+            let primary = self.model.clone();
+            let Some(next) = switch_to_fallback(
+                &primary,
+                &format!("{model}: {error}"),
+                &failed,
+                self.emit_output,
+            ) else {
+                return Err(RuntimeError::new(error));
+            };
+            (model, client) = next;
+        }
+    }
+
+    /// [`Self::stream_once`] with another model and client in place of this
+    /// one's for the request.
+    fn stream_as(
+        &mut self,
+        model: &str,
+        client: ApiProviderClient,
+        request: &ApiRequest,
+    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let saved_client = std::mem::replace(&mut self.client, client);
+        let saved_model = std::mem::replace(&mut self.model, model.to_string());
+        let result = self.stream_once(request.clone());
+        self.client = saved_client;
+        self.model = saved_model;
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn stream_once(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
-        let is_post_tool = request_ends_with_tool_result(&request);
+        // With a fallback model a silent provider is given up on quickly, so
+        // the first reply is timed too, not only the one after a tool.
+        let is_post_tool =
+            request_ends_with_tool_result(&request) || !fallback_models_for(&self.model).is_empty();
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: reply_budget(&self.model),
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: self
-                .enable_tools
-                .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
+            tools: self.enable_tools.then(|| {
+                let definitions = filter_tool_specs(
+                    &self.tool_registry,
+                    local_core_tools(&self.model, &self.tool_registry)
+                        .as_ref()
+                        .or(self.allowed_tools.as_ref()),
+                );
+                let definitions = definitions
+                    .into_iter()
+                    .filter(|tool| !NEVER_SENT_TOOLS.contains(&tool.name.as_str()))
+                    .collect();
+                if defers_tools(&self.model) {
+                    defer_tool_definitions(definitions)
+                } else {
+                    definitions
+                }
+            }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            extra_body: thinking_off_after_cut_off(&self.model, &request),
             ..Default::default()
         };
+        let mut message_request = message_request;
+        if !sends_images(&self.model) {
+            images_as_text(&self.runtime, &mut message_request.messages, &self.model);
+        }
+        if self.emit_output || desktop_agent::is_active() {
+            remember_for_side_questions(&self.client, &message_request);
+        }
 
         let abort_signal = self.abort_signal.clone();
         if self.emit_output {
@@ -14229,7 +15641,13 @@ impl ApiClient for AnthropicRuntimeClient {
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            // With a fallback model a stall is not re-sent: the fallback takes over.
+            let max_attempts: usize = if is_post_tool && fallback_models_for(&self.model).is_empty()
+            {
+                2
+            } else {
+                1
+            };
 
             for attempt in 1..=max_attempts {
                 let result = self
@@ -14345,16 +15763,23 @@ impl AnthropicRuntimeClient {
                         signature,
                     } = &start.content_block
                     {
+                        // The block is recorded once, whole, when it stops;
+                        // recording its (empty) start as well saved an empty
+                        // thinking block before every real one, sent back
+                        // with the turn's later steps.
                         pending_thinking = Some((thinking.clone(), signature.clone()));
+                        render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+                        block_has_thinking_summary = true;
+                    } else {
+                        push_output_block(
+                            start.content_block,
+                            out,
+                            &mut events,
+                            &mut pending_tool,
+                            true,
+                            &mut block_has_thinking_summary,
+                        )?;
                     }
-                    push_output_block(
-                        start.content_block,
-                        out,
-                        &mut events,
-                        &mut pending_tool,
-                        true,
-                        &mut block_has_thinking_summary,
-                    )?;
                     if let Some((_, name, _)) = &pending_tool {
                         runtime::turn_keys::begin_tool(&format!("Preparing {name}"));
                     }
@@ -14550,12 +15975,15 @@ fn overflow_tool_result_limit(
 
 /// The model's context window in tokens: for a `local/` model, what the
 /// server reports at `/props` (llama.cpp's `-c`), else `CLAW_CONTEXT_WINDOW`;
-/// otherwise the model's known limit.
+/// otherwise the model's known limit, else what its hosted provider's
+/// `/models` list says (e.g. OpenRouter's `context_length`).
 fn known_context_window(model: &str) -> Option<u32> {
     if model.starts_with("local/") {
         api::local_context_window(model)
     } else {
-        api::model_token_limit(model).map(|limit| limit.context_window_tokens)
+        api::model_token_limit(model)
+            .map(|limit| limit.context_window_tokens)
+            .or_else(|| api::hosted_context_window(model))
     }
 }
 
@@ -15284,6 +16712,29 @@ fn format_read_result(parsed: &serde_json::Value) -> String {
     )
 }
 
+/// A `read_file` result as the model got it ("[path: lines a-b of n]" or an
+/// outline): its first line as the header, then a short preview.
+fn format_read_text_result(text: &str) -> String {
+    let (header, body) = text.split_once('\n').unwrap_or((text, ""));
+    let header = header.trim_start_matches('[').trim_end_matches(']');
+    // An outline's header carries instructions for the model; show its
+    // first part ("path: N lines, C characters") and say what it is.
+    let outline;
+    let header = match header.split_once(": more than one read_file page") {
+        Some((head, _)) => {
+            outline = format!("{head} (outline)");
+            outline.as_str()
+        }
+        None => header,
+    };
+    let preview = truncate_output_for_display(body, READ_DISPLAY_MAX_LINES, READ_DISPLAY_MAX_CHARS);
+    format!(
+        "{}\n{}",
+        result_block(&format!("read {header}"), TOOL_DIM_STYLE),
+        result_block(&preview, "")
+    )
+}
+
 fn format_write_result(parsed: &serde_json::Value) -> String {
     let path = extract_tool_path(parsed);
     let kind = parsed
@@ -15816,6 +17267,45 @@ impl CliToolExecutor {
         self
     }
 
+    /// A `read_file` of a file with no `offset`, right after a read of the
+    /// same file whose page was cut: the offset of the next page and the
+    /// input asking for it. Qwen re-sent the same call six times in a row,
+    /// thinking "it always returns lines 1-465, let me read from 465" but
+    /// never adding the offset.
+    fn next_page_instead(&self, tool_name: &str, input: &str) -> Option<(usize, String)> {
+        if tool_name != "read_file" {
+            return None;
+        }
+        let mut value = serde_json::from_str::<serde_json::Value>(input).ok()?;
+        let object = value.as_object_mut()?;
+        if ["offset", "limit"]
+            .iter()
+            .any(|key| object.contains_key(*key))
+        {
+            return None;
+        }
+        let path = object.get("path")?.as_str()?.to_string();
+        let last = self.last_call.lock().ok()?;
+        let (last_name, last_input, last_output, _) = last.as_ref()?;
+        let last_path = serde_json::from_str::<serde_json::Value>(last_input)
+            .ok()?
+            .get("path")?
+            .as_str()?
+            .to_string();
+        if last_name != "read_file" || last_path != path {
+            return None;
+        }
+        let offset = last_output
+            .rsplit_once("Continue with read_file offset=")?
+            .1
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse::<usize>()
+            .ok()?;
+        object.insert("offset".to_string(), json!(offset));
+        Some((offset, value.to_string()))
+    }
+
     /// Appends a note when this exact call returned this exact result last
     /// time too. Small local models otherwise re-issue a call whose output
     /// they misread (e.g. a truncated file) until the turn runs out.
@@ -15840,12 +17330,39 @@ impl CliToolExecutor {
         if repeats == 0 {
             return output;
         }
+        // The identical output is already in the conversation, right above:
+        // sending it again (a 16k-character file page, six times over) only
+        // filled a small window until old tool output was pruned to make
+        // room, the file the model needed with it.
+        let shown = if output.chars().count() > 600 {
+            "[The output is identical to your previous call's, shown above; not repeated.]"
+                .to_string()
+        } else {
+            output
+        };
         format!(
-            "{output}\n\n[note: this is the same call with the same result as your previous \
+            "{shown}\n\n[note: this is the same call with the same result as your previous \
              {} call(s). Repeating it will not return anything new: use what you already have, \
              change the arguments (e.g. offset/limit), or try a different approach.]",
             repeats
         )
+    }
+
+    /// [`read_file_outline_for_model`], unless the previous call was this
+    /// same read and got the outline: asked again, the model gets the page.
+    fn outline_instead(&self, input: &str, output: &str, budget: Option<usize>) -> Option<String> {
+        let asked_again = self.last_call.lock().ok().is_some_and(|last| {
+            last.as_ref()
+                .is_some_and(|(name, last_input, last_output, _)| {
+                    matches!(name.as_str(), "read_file" | "Read")
+                        && last_input == input
+                        && last_output.contains(READ_OUTLINE_NOTE)
+                })
+        });
+        if asked_again {
+            return None;
+        }
+        read_file_outline_for_model(input, output, budget)
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -15858,13 +17375,46 @@ impl CliToolExecutor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (state.pending_servers(), state.degraded_report())
             });
-        serde_json::to_string_pretty(&self.tool_registry.search(
+        let found = self.tool_registry.search(
             &input.query,
             input.max_results.unwrap_or(5),
             pending_mcp_servers,
             mcp_degraded,
-        ))
-        .map_err(|error| ToolError::new(error.to_string()))
+        );
+        // The matches the session may use are loaded: sent in full from the
+        // next request on, and described here so they can be called now.
+        let usable = found
+            .matches
+            .iter()
+            .map(|name| canonical_allowed_tool_name(name))
+            .filter(|name| {
+                self.allowed_tools
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(name))
+            })
+            .collect::<AllowedToolSet>();
+        let loaded = if usable.is_empty() {
+            Vec::new()
+        } else {
+            LOADED_TOOLS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(usable.iter().cloned());
+            self.tool_registry.definitions(Some(&usable))
+        };
+        let mut result =
+            serde_json::to_value(&found).map_err(|error| ToolError::new(error.to_string()))?;
+        if !loaded.is_empty() {
+            result["loaded"] = json!(loaded
+                .iter()
+                .map(|tool| json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }))
+                .collect::<Vec<_>>());
+        }
+        serde_json::to_string_pretty(&result).map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn execute_runtime_tool(
@@ -15920,7 +17470,39 @@ const PARALLEL_SAFE_TOOLS: &[&str] = &[
 ];
 
 impl CliToolExecutor {
+    /// The tool a call means: models trained on other agents call claw's
+    /// tools by their names there (`Read`, `read`, `Bash`, `web_fetch`),
+    /// which failed as unknown or "not enabled" tools. Like opencode's tool
+    /// call repair, a known alias or a name that differs only in case or
+    /// `_`/`-` is mapped to the real tool; anything else is left as is.
+    fn resolve_tool_name(&self, requested: &str) -> String {
+        let actual = self.tool_registry.actual_tool_names();
+        if actual.iter().any(|name| name == requested)
+            || self.tool_registry.has_runtime_tool(requested)
+        {
+            return requested.to_string();
+        }
+        if let Some(alias) = self.tool_registry.allowed_tool_aliases().get(requested) {
+            if let Some(name) = actual
+                .iter()
+                .find(|name| canonical_allowed_tool_name(name) == *alias)
+            {
+                return name.clone();
+            }
+        }
+        let key = |name: &str| name.to_ascii_lowercase().replace(['_', '-'], "");
+        actual
+            .into_iter()
+            .find(|name| key(name) == key(requested))
+            .unwrap_or_else(|| requested.to_string())
+    }
+
     fn check_allowed(&self, tool_name: &str) -> Result<(), ToolError> {
+        // ToolSearch only describes tools; deferring offers it even when the
+        // allowed list does not name it.
+        if tool_name == "ToolSearch" {
+            return Ok(());
+        }
         if self
             .allowed_tools
             .as_ref()
@@ -15957,7 +17539,8 @@ impl CliToolExecutor {
         }
         match result {
             Ok(output) => {
-                if self.emit_output {
+                let is_read = matches!(tool_name, "read_file" | "Read");
+                if self.emit_output && !is_read {
                     render::print_with_margins(&format_tool_result(tool_name, &output, false));
                 }
                 if matches!(
@@ -15968,10 +17551,26 @@ impl CliToolExecutor {
                 }
                 // read_file pages itself at line boundaries, sized to the
                 // model's window; the flat cap would cut it mid-line again.
-                let for_model = if matches!(tool_name, "read_file" | "Read") {
-                    read_file_result_for_model(output, read_file_budget(self.model.as_deref()))
+                let for_model = if is_read {
+                    let budget =
+                        read_file_budget(answering_model(self.model.as_deref()).as_deref());
+                    let text = self
+                        .outline_instead(input, &output, budget)
+                        .unwrap_or_else(|| read_file_result_for_model(output, budget));
+                    // What the model got (a page, or the outline), not the
+                    // whole file the tool read: the display said "lines
+                    // 1-1049" for a page that held 1-465.
+                    if self.emit_output {
+                        render::print_with_margins(&mark_first_result_line(
+                            &format_read_text_result(&text),
+                        ));
+                    }
+                    text
                 } else {
-                    cap_tool_result_for_model(tool_result_for_model(tool_name, output))
+                    cap_tool_result_to(
+                        tool_result_for_model(tool_name, output),
+                        tool_output_budget(answering_model(self.model.as_deref()).as_deref()),
+                    )
                 };
                 Ok(self.note_repeated_call(tool_name, input, for_model))
             }
@@ -16000,6 +17599,11 @@ impl ToolExecutor for CliToolExecutor {
     /// registry immutably and return their results; printing and everything
     /// else that touches shared state happens here, in the original order.
     fn execute_batch(&mut self, calls: &[(String, String)]) -> Vec<Result<String, ToolError>> {
+        let calls = calls
+            .iter()
+            .map(|(tool_name, input)| (self.resolve_tool_name(tool_name), input.clone()))
+            .collect::<Vec<_>>();
+        let calls = calls.as_slice();
         if calls
             .iter()
             .any(|(tool_name, _)| !self.can_run_in_parallel(tool_name))
@@ -16045,7 +17649,16 @@ impl ToolExecutor for CliToolExecutor {
     }
 
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let tool_name = &self.resolve_tool_name(tool_name);
         self.check_allowed(tool_name)?;
+        if let Some((offset, next_input)) = self.next_page_instead(tool_name, input) {
+            let page = self.execute(tool_name, &next_input)?;
+            return Ok(format!(
+                "[You asked for this file from the start again, right after reading a page \
+                 of it that was cut. This is the next page (offset={offset}); pass `offset` \
+                 yourself to read a particular part, or offset=0 for the start.]\n{page}"
+            ));
+        }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         if tool_name == "AskUserQuestion" && desktop_agent::is_active() {
@@ -16103,7 +17716,16 @@ fn read_file_budget(model: Option<&str>) -> Option<usize> {
 fn read_file_budget_from(configured: Option<usize>, window_tokens: Option<u32>) -> Option<usize> {
     let configured = configured?;
     Some(window_tokens.map_or(configured, |window| {
-        (window as usize).clamp(MIN_READ_FILE_PAGE_CHARS, MAX_READ_FILE_PAGE_CHARS)
+        // One character per window token (a page of ~a quarter of the
+        // window). A small window spends half of itself on the system prompt,
+        // tools and reply, so a page there is half that: a whole 32k-window
+        // page of a large file forced a compaction that dropped it again.
+        let page = if window <= DEFER_TOOLS_WINDOW {
+            window as usize / 2
+        } else {
+            window as usize
+        };
+        page.clamp(MIN_READ_FILE_PAGE_CHARS, MAX_READ_FILE_PAGE_CHARS)
     }))
 }
 
@@ -16113,6 +17735,147 @@ fn tool_result_max_chars() -> Option<usize> {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|max| *max > 0)
+}
+
+/// Marks a `read_file` result that is an outline, not the file's text.
+const READ_OUTLINE_NOTE: &str = "so here is its outline instead of its first page";
+
+/// For a read of a whole file (no `offset`, `limit` or `pages`) that does not
+/// fit in one page: the lines that start its functions, types and sections,
+/// numbered, instead of the first page. The model then reads the part it
+/// needs. Paging through the whole file instead cost a 32k window all of
+/// itself (37k characters for a 1,000-line file); compaction dropped it, and
+/// the model read it all again, nine times in one run. Claude Code refuses
+/// such a read and points at offset/limit and grep; the outline also says
+/// where things are. `None` when the file fits, or has too few such lines
+/// for an outline to help.
+fn read_file_outline_for_model(
+    input: &str,
+    output: &str,
+    max_chars: Option<usize>,
+) -> Option<String> {
+    const MAX_ENTRIES: usize = 150;
+    const MAX_ENTRY_CHARS: usize = 110;
+    let max_chars = max_chars?;
+    let input = serde_json::from_str::<serde_json::Value>(input).ok()?;
+    if ["offset", "limit", "pages", "sheet", "range"]
+        .iter()
+        .any(|key| input.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return None;
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let file = &parsed["file"];
+    let (Some("text"), Some(path), Some(content)) = (
+        parsed["type"].as_str(),
+        file["filePath"].as_str(),
+        file["content"].as_str(),
+    ) else {
+        return None;
+    };
+    if content.len() <= max_chars {
+        return None;
+    }
+    let markdown = path.ends_with(".md") || path.ends_with(".markdown");
+    let entries = content
+        .split('\n')
+        .enumerate()
+        .filter(|(_, line)| outline_line(line, markdown))
+        .collect::<Vec<_>>();
+    if entries.len() < 3 {
+        return None;
+    }
+    let total_lines = content.split('\n').count();
+    let mut text = format!(
+        "[{path}: {total_lines} lines, {} characters: more than one read_file page ({max_chars} \
+         characters), {READ_OUTLINE_NOTE}. Read the part you need with offset and limit \
+         (offset = the line number before it, e.g. offset={} limit=120), or grep_search for a \
+         name. The same call again returns the first page.]\n",
+        content.len(),
+        entries[entries.len() / 2].0,
+    );
+    for (index, line) in entries.iter().take(MAX_ENTRIES) {
+        let line = line.trim_end();
+        let shown = if line.chars().count() > MAX_ENTRY_CHARS {
+            format!(
+                "{}…",
+                line.chars().take(MAX_ENTRY_CHARS).collect::<String>()
+            )
+        } else {
+            line.to_string()
+        };
+        text.push_str(&format!("{}\t{shown}\n", index + 1));
+    }
+    if entries.len() > MAX_ENTRIES {
+        text.push_str(&format!(
+            "[{} more entries not shown]\n",
+            entries.len() - MAX_ENTRIES
+        ));
+    }
+    Some(text)
+}
+
+/// A line that starts a definition or section: a definition keyword at
+/// most one indent deep (methods), or an unindented line that opens a C-like
+/// function (`void Compositor::paintGl() {`); markdown headings in `.md`.
+fn outline_line(line: &str, markdown: bool) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "async fn ",
+        "pub async fn ",
+        "def ",
+        "async def ",
+        "class ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "union ",
+        "impl ",
+        "impl<",
+        "trait ",
+        "pub trait ",
+        "interface ",
+        "type ",
+        "func ",
+        "function ",
+        "export ",
+        "namespace ",
+        "mod ",
+        "pub mod ",
+        "template",
+        "#define ",
+    ];
+    if markdown {
+        return line.starts_with('#');
+    }
+    let trimmed = line.trim();
+    let indent = line.len() - line.trim_start().len();
+    if trimmed.is_empty() || indent > 4 {
+        return false;
+    }
+    if [
+        "//", "/*", "*", "#include", "import ", "use ", "from ", "return", "}",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return false;
+    }
+    if trimmed.ends_with(',') || (indent > 0 && trimmed.ends_with(';')) {
+        return false;
+    }
+    let keyword = KEYWORDS.iter().any(|keyword| trimmed.starts_with(keyword));
+    let c_function = indent == 0
+        && trimmed.contains('(')
+        && !trimmed.ends_with(';')
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '~');
+    keyword || c_function
 }
 
 /// Sends a text `read_file` result as plain text with a line-range header
@@ -16145,16 +17908,22 @@ fn read_file_result_for_model(output: String, max_chars: Option<usize>) -> Strin
             format!("[{path}: empty]")
         };
     }
-    // Leave room for the header and the continuation hint.
-    let budget = max_chars.map(|max| max.saturating_sub(300).max(1));
+    // The budget counts the file's text only: the line numbers and header
+    // are on top. Counting them split a 16.1k-character file over a 16.4k
+    // page, so the model got it in two parts and read it again for the end.
+    let budget = max_chars;
+    // Numbered as `cat -n` numbers them (Claude Code, opencode and hermes
+    // all do): without numbers a model could not tell where a function it
+    // had read was, and read the file from the top again to find it.
     let mut shown = String::new();
     let mut shown_lines = 0;
+    let mut text_chars = 0;
     for line in content.split('\n') {
-        if budget.is_some_and(|budget| shown_lines > 0 && shown.len() + line.len() + 1 > budget) {
+        if budget.is_some_and(|budget| shown_lines > 0 && text_chars + line.len() + 1 > budget) {
             break;
         }
-        shown.push_str(line);
-        shown.push('\n');
+        shown.push_str(&format!("{}\t{line}\n", start_line + shown_lines));
+        text_chars += line.len() + 1;
         shown_lines += 1;
     }
     let end_line = start_line + shown_lines - 1;
@@ -16329,11 +18098,30 @@ fn tool_result_for_model(tool_name: &str, output: String) -> String {
     parts.join("\n")
 }
 
+/// How long one (non-`read_file`) tool result may be; `None` leaves it
+/// whole. Only capped when `CLAW_TOOL_RESULT_MAX_CHARS` is set (the local
+/// launcher sets it): a local model keeps that cap, a hosted model gets a
+/// quarter of its window like `read_file` ([`read_file_budget`]), so a
+/// 1M-token model is not held to a small local model's 12k.
+fn tool_output_budget(model: Option<&str>) -> Option<usize> {
+    match model {
+        Some(model) if !model.starts_with("local/") => read_file_budget(Some(model)),
+        _ => tool_result_max_chars(),
+    }
+}
+
 /// Caps what one tool call sends back to the model at
-/// `CLAW_TOOL_RESULT_MAX_CHARS` (unset: no cap), so a large file or command
-/// output cannot overflow a small local model's context window.
+/// `CLAW_TOOL_RESULT_MAX_CHARS` (unset: no cap).
 fn cap_tool_result_for_model(output: String) -> String {
-    let Some(max_chars) = tool_result_max_chars() else {
+    cap_tool_result_to(output, tool_result_max_chars())
+}
+
+/// Cuts `output` to `max_chars` (at a line end when one is near) so it
+/// cannot overflow the context window. Nothing is lost: the whole output is
+/// saved under `~/.claw/tool-output/` and the note tells the model where,
+/// so it can page through it with read_file or search it (as opencode does).
+fn cap_tool_result_to(output: String, max_chars: Option<usize>) -> String {
+    let Some(max_chars) = max_chars else {
         return output;
     };
     if output.len() <= max_chars {
@@ -16343,13 +18131,56 @@ fn cap_tool_result_for_model(output: String) -> String {
     while !output.is_char_boundary(end) {
         end -= 1;
     }
-    format!(
-        "{}\n\n[output truncated: showing {end} of {} characters. Read less at once: \
-         use read_file with offset/limit, grep_search, or filter command output with \
-         head, tail or grep.]",
-        &output[..end],
-        output.len()
-    )
+    if let Some(newline) = output[..end].rfind('\n').filter(|at| *at > end / 2) {
+        end = newline;
+    }
+    let shown_lines = output[..end].lines().count();
+    let total_lines = output.lines().count();
+    let saved = save_full_tool_output(&output);
+    let note = match saved {
+        Some(path) => format!(
+            "[output cut: showing lines 1-{shown_lines} of {total_lines} ({end} of {} \
+             characters). The full output is saved in {}: read the rest with read_file \
+             (offset {shown_lines}) or search it with grep_search.]",
+            output.len(),
+            path.display()
+        ),
+        None => format!(
+            "[output cut: showing {end} of {} characters. Read less at once: use \
+             read_file with offset/limit, grep_search, or filter command output with \
+             head, tail or grep.]",
+            output.len()
+        ),
+    };
+    format!("{}\n\n{note}", &output[..end])
+}
+
+/// Writes a cut tool result to `~/.claw/tool-output/tool_<ms>.txt` and
+/// deletes saved results older than a week. `None` when it cannot be saved.
+fn save_full_tool_output(output: &str) -> Option<PathBuf> {
+    const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+    let dir = runtime::default_config_home().join("tool-output");
+    fs::create_dir_all(&dir).ok()?;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > RETENTION);
+            if old {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = dir.join(format!("tool_{millis}_{}.txt", std::process::id()));
+    fs::write(&path, output).ok()?;
+    Some(path)
 }
 
 /// Records the current folder in `~/.claw/workspaces.txt` (once), so the
@@ -16865,6 +18696,11 @@ mod tests {
         )
         .is_some_and(|hint| hint.contains("CLAW_API_REQUEST_TIMEOUT")));
         assert!(super::timeout_hint("api returned 404 Not Found").is_none());
+        assert!(super::credits_hint(
+            "api returned 402 Payment Required: {\"message\":\"This request requires more credits\"}"
+        )
+        .is_some());
+        assert!(super::credits_hint("api returned 404 Not Found").is_none());
     }
 
     #[test]
@@ -21439,11 +23275,13 @@ UU conflicted.rs",
         .to_string();
 
         let full = super::read_file_result_for_model(output.clone(), None);
-        assert!(full.starts_with("[/w/a.cpp: lines 1-100 of 100]\nline 1 "));
+        assert!(full.starts_with("[/w/a.cpp: lines 1-100 of 100]\n1\tline 1 "));
+        assert!(full.contains("\n100\tline 100 "));
         assert!(!full.contains("more lines not shown"));
 
         let cut = super::read_file_result_for_model(output, Some(1000));
-        assert!(cut.len() <= 1000);
+        // 1000 characters of the file, plus numbers, header and hint.
+        assert!(cut.len() <= 1_400, "{}", cut.len());
         let header = cut.lines().next().unwrap();
         let end: usize = header
             .trim_end_matches(" of 100]")
@@ -21467,14 +23305,265 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn tool_calls_by_other_agents_names_reach_claws_tools() {
+        let executor =
+            super::CliToolExecutor::new(None, false, super::GlobalToolRegistry::builtin(), None);
+        assert_eq!(executor.resolve_tool_name("read_file"), "read_file");
+        assert_eq!(executor.resolve_tool_name("Read"), "read_file");
+        assert_eq!(executor.resolve_tool_name("read"), "read_file");
+        assert_eq!(executor.resolve_tool_name("Edit"), "edit_file");
+        assert_eq!(executor.resolve_tool_name("Bash"), "bash");
+        assert_eq!(executor.resolve_tool_name("no_such_tool"), "no_such_tool");
+    }
+
+    #[test]
+    fn fallback_triggers_and_empty_replies() {
+        use runtime::AssistantEvent;
+        for error in [
+            "api returned 429 Too Many Requests",
+            "api returned 402 Payment Required: requires more credits",
+            "api returned 503 Service Unavailable",
+            "post-tool stall: model did not respond within timeout",
+            "request timed out",
+            "assistant stream produced no content",
+        ] {
+            assert!(super::is_fallback_worthy(error), "{error}");
+        }
+        for error in [
+            super::INTERRUPTED_BY_USER,
+            "context_window_blocked: request exceeds the available context size",
+            "api returned 400 Bad Request: invalid tool schema",
+        ] {
+            assert!(!super::is_fallback_worthy(error), "{error}");
+        }
+        assert!(super::is_empty_reply(&[AssistantEvent::MessageStop]));
+        assert!(super::is_empty_reply(&[
+            AssistantEvent::TextDelta("  ".to_string()),
+            AssistantEvent::MessageStop
+        ]));
+        assert!(!super::is_empty_reply(&[
+            AssistantEvent::TextDelta("ok".to_string()),
+            AssistantEvent::MessageStop
+        ]));
+        assert!(!super::is_empty_reply(&[
+            AssistantEvent::OutputLimitReached
+        ]));
+    }
+
+    #[test]
+    fn fallback_rejects_names_that_are_not_models() {
+        let _guard = env_lock();
+        let error = super::apply_fallback_setting("no-such-alias").expect_err("not a model");
+        assert!(error.to_string().contains("unknown model 'no-such-alias'"));
+    }
+
+    #[test]
+    fn compaction_notices_say_what_happened() {
+        let pruned = runtime::AutoCompactionEvent {
+            removed_message_count: 0,
+            pruned_tool_results: 3,
+        };
+        assert!(super::auto_compaction_notice(&pruned).contains("cleared 3 old tool results"));
+        let summarized = runtime::AutoCompactionEvent {
+            removed_message_count: 12,
+            pruned_tool_results: 0,
+        };
+        assert!(super::auto_compaction_notice(&summarized).contains("removed 12 messages"));
+    }
+
+    #[test]
+    fn model_picker_lists_each_model_once_current_first() {
+        let aliases = std::collections::BTreeMap::from([
+            ("coder".to_string(), "local/qwen".to_string()),
+            ("local".to_string(), "local/qwen".to_string()),
+        ]);
+        let providers = vec![("OpenRouter", vec!["openrouter/a/b:free".to_string()])];
+        let rows = super::model_picker_options("openrouter/a/b:free", &aliases, &providers);
+        let models = rows
+            .iter()
+            .map(|(model, _)| model.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(models, ["openrouter/a/b:free", "local/qwen"]);
+        assert!(rows[0].1.contains(&"current".to_string()));
+        assert!(rows[0].1.contains(&"OpenRouter".to_string()));
+        assert!(rows[0].1.contains(&"free".to_string()));
+        assert_eq!(rows[1].1, ["alias coder", "alias local"]);
+    }
+
+    #[test]
+    fn broken_images_in_a_reply_are_sent_back_to_the_model() {
+        let dir = std::env::temp_dir().join(format!("claw-image-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.png");
+        std::fs::write(&good, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let html = dir.join("page.jpg");
+        std::fs::write(&html, b"<html>not found</html>").unwrap();
+        let text = format!(
+            "Here: ![a]({}) and ![b]({} \"title\") and ![c](/no/such/file.jpg) and ![a]({})",
+            good.display(),
+            html.display(),
+            good.display()
+        );
+        assert_eq!(super::reply_image_targets(&text).len(), 3);
+        assert_eq!(
+            super::reply_image_targets("![x](https://u.org/c/ZHAO_(A)_P2.jpg) end)"),
+            ["https://u.org/c/ZHAO_(A)_P2.jpg"]
+        );
+        assert_eq!(super::image_problem(&good.to_string_lossy()), None);
+        assert_eq!(
+            super::image_problem(&html.to_string_lossy()).as_deref(),
+            Some("the file is not an image")
+        );
+        let mut session = runtime::Session::new();
+        session
+            .push_message(runtime::ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text { text },
+            ]))
+            .unwrap();
+        let report = super::image_check(&session).expect("broken images");
+        assert!(
+            report.contains("/no/such/file.jpg: no such file"),
+            "{report}"
+        );
+        assert!(
+            report.contains("page.jpg: the file is not an image"),
+            "{report}"
+        );
+        assert!(!report.contains("good.png"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn images_go_to_a_text_only_model_as_text() {
+        assert!(super::is_image_refusal(
+            r#"api returned 404 Not Found: {"error":{"message":"No endpoints found that support image input"}}"#
+        ));
+        assert!(super::is_image_refusal(
+            "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
+        ));
+        assert!(!super::is_image_refusal("api returned 429 rate limit"));
+
+        let model = "openrouter/test/text-only-model";
+        assert!(super::sends_images(model));
+        super::note_no_images(model);
+        assert!(!super::sends_images(model));
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let mut messages = vec![super::InputMessage {
+            role: "user".to_string(),
+            content: vec![
+                super::InputContentBlock::Text {
+                    text: "screenshot taken".to_string(),
+                },
+                super::InputContentBlock::Image {
+                    source: super::ImageSource::base64("image/png".to_string(), "AAAA".to_string()),
+                },
+            ],
+        }];
+        super::images_as_text(&runtime, &mut messages, model);
+        assert!(messages[0]
+            .content
+            .iter()
+            .all(|block| !matches!(block, super::InputContentBlock::Image { .. })));
+        assert!(matches!(
+            &messages[0].content[1],
+            super::InputContentBlock::Text { text } if text.contains("takes no images")
+        ));
+    }
+
+    #[test]
+    fn a_402_naming_an_affordable_budget_lowers_the_reply_budget() {
+        let model = "openrouter/test/affordable-model";
+        let full = super::reply_budget(model);
+        assert!(!super::note_affordable_reply_budget(
+            model,
+            "api returned 500"
+        ));
+        assert!(!super::note_affordable_reply_budget(
+            model,
+            "This request requires more credits, or fewer max_tokens. You requested up to \
+             64000 tokens, but can only afford 900."
+        ));
+        assert!(super::note_affordable_reply_budget(
+            model,
+            "This request requires more credits, or fewer max_tokens. You requested up to \
+             64000 tokens, but can only afford 20000. To increase, visit …"
+        ));
+        assert_eq!(super::reply_budget(model), full.min(18_000));
+        // Other models keep their budget.
+        assert_eq!(
+            super::reply_budget("openrouter/test/other-model"),
+            super::max_tokens_for_model("openrouter/test/other-model")
+        );
+    }
+
+    #[test]
+    fn local_models_answer_without_thinking_after_a_thinking_cut_off() {
+        let request = |text: &str| runtime::ApiRequest {
+            system_prompt: Vec::new(),
+            messages: vec![runtime::ConversationMessage::user_text(text.to_string())],
+        };
+        let after_cut_off = request(&format!(
+            "{}: nothing was shown",
+            runtime::THINKING_CUT_OFF_PROMPT
+        ));
+        let body = super::thinking_off_after_cut_off("local/qwen36-35b-a3b", &after_cut_off);
+        assert_eq!(
+            body["chat_template_kwargs"],
+            serde_json::json!({ "enable_thinking": false })
+        );
+        assert!(
+            super::thinking_off_after_cut_off("openrouter/a/b:free", &after_cut_off).is_empty()
+        );
+        assert!(
+            super::thinking_off_after_cut_off("local/qwen36-35b-a3b", &request("fix it"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn specialised_tools_go_by_name_only() {
+        let tool = |name: &str, description: &str| super::ToolDefinition {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let sent = super::defer_tool_definitions(vec![
+            tool("bash", "Run a shell command."),
+            tool("read_file", "Read a file."),
+            tool("Browser", "Use a real Chrome window."),
+            tool("X11", "Control the X11 desktop: screenshots, clicks."),
+            tool("GitBlame", "Show who last changed each line."),
+        ]);
+        let names = sent.iter().map(|t| t.name.as_str()).collect::<Vec<_>>();
+        // The web and desktop tools stay in full, for every model.
+        assert_eq!(names, ["bash", "read_file", "Browser", "X11", "ToolSearch"]);
+        let search = sent[4].description.as_deref().unwrap();
+        assert!(
+            search.contains("- GitBlame: Show who last changed each line"),
+            "{search}"
+        );
+        assert!(super::defers_tools(
+            "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+        ));
+        assert!(super::NEVER_SENT_TOOLS.contains(&"TestingPermission"));
+        // Nothing deferred: the list is unchanged.
+        let sent = super::defer_tool_definitions(vec![tool("bash", "Run.")]);
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
     fn read_file_pages_scale_with_the_context_window() {
         use super::read_file_budget_from as budget;
         // Unset cap (hosted models): files are sent whole, whatever the window.
         assert_eq!(budget(None, Some(32_768)), None);
         // Unknown window: the flat cap.
         assert_eq!(budget(Some(12_000), None), Some(12_000));
-        // About a quarter of the window, so a 25 KB file fits a 32k model in one read.
-        assert_eq!(budget(Some(12_000), Some(32_768)), Some(32_768));
+        // About a quarter of the window; half that up to 64k, where the
+        // prompt, tools and reply take half the window.
+        assert_eq!(budget(Some(12_000), Some(32_768)), Some(16_384));
+        assert_eq!(budget(Some(12_000), Some(131_072)), Some(100_000));
+        assert_eq!(budget(Some(12_000), Some(98_304)), Some(98_304));
         assert_eq!(budget(Some(12_000), Some(2_048)), Some(4_000));
         assert_eq!(budget(Some(12_000), Some(1_000_000)), Some(100_000));
     }
@@ -21510,6 +23599,89 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn a_whole_read_of_a_large_file_gets_an_outline_first() {
+        let mut lines = vec!["#include <x.h>".to_string(), String::new()];
+        for name in ["setup", "paintGl", "teardown"] {
+            lines.push(format!("void Compositor::{name}() {{"));
+            lines.extend((0..200).map(|n| format!("    call_{n}(a, b);")));
+            lines.push("}".to_string());
+        }
+        lines.push("struct Win {".to_string());
+        lines.push("    int x;".to_string());
+        lines.push("};".to_string());
+        let content = lines.join("\n");
+        let output = serde_json::json!({
+            "type": "text",
+            "file": {"filePath": "/w/a.cpp", "content": content, "numLines": lines.len(),
+                     "startLine": 1, "totalLines": lines.len()}
+        })
+        .to_string();
+        let read = r#"{"path":"/w/a.cpp"}"#;
+
+        let outline =
+            super::read_file_outline_for_model(read, &output, Some(4_000)).expect("outline");
+        assert!(outline.contains(super::READ_OUTLINE_NOTE));
+        assert!(outline.contains("\n3\tvoid Compositor::setup() {\n"));
+        assert!(outline.contains("\n205\tvoid Compositor::paintGl() {\n"));
+        assert!(outline.contains("\tstruct Win {\n"));
+        assert!(!outline.contains("call_1("));
+        assert!(!outline.contains("#include"));
+        // A read with an offset, or of a file that fits, is left alone.
+        assert!(super::read_file_outline_for_model(
+            r#"{"path":"/w/a.cpp","offset":0}"#,
+            &output,
+            Some(4_000)
+        )
+        .is_none());
+        assert!(super::read_file_outline_for_model(read, &output, Some(1_000_000)).is_none());
+        assert!(super::read_file_outline_for_model(read, &output, None).is_none());
+
+        // Asked again right after the outline, the model gets the first page.
+        let executor =
+            super::CliToolExecutor::new(None, false, super::GlobalToolRegistry::builtin(), None);
+        assert!(executor
+            .outline_instead(read, &output, Some(4_000))
+            .is_some());
+        executor.note_repeated_call("read_file", read, outline);
+        assert!(executor
+            .outline_instead(read, &output, Some(4_000))
+            .is_none());
+    }
+
+    #[test]
+    fn a_repeated_read_of_a_cut_file_gets_the_next_page() {
+        let executor =
+            super::CliToolExecutor::new(None, false, super::GlobalToolRegistry::builtin(), None);
+        let read = r#"{"path":"/w/a.cpp"}"#;
+        assert_eq!(executor.next_page_instead("read_file", read), None);
+        executor.note_repeated_call(
+            "read_file",
+            read,
+            "[/w/a.cpp: lines 1-465 of 1049]\n…\n[584 more lines not shown. Continue with \
+             read_file offset=465, or grep_search for what you need.]"
+                .into(),
+        );
+        let (offset, next) = executor
+            .next_page_instead("read_file", read)
+            .expect("next page");
+        assert_eq!(offset, 465);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&next).unwrap()["offset"],
+            465
+        );
+        // An explicit offset, another file or another tool is left alone.
+        assert_eq!(
+            executor.next_page_instead("read_file", r#"{"path":"/w/a.cpp","offset":1}"#),
+            None
+        );
+        assert_eq!(
+            executor.next_page_instead("read_file", r#"{"path":"/w/b.cpp"}"#),
+            None
+        );
+        assert_eq!(executor.next_page_instead("grep_search", read), None);
+    }
+
+    #[test]
     fn repeating_the_same_call_with_the_same_result_is_flagged() {
         let executor =
             super::CliToolExecutor::new(None, false, super::GlobalToolRegistry::builtin(), None);
@@ -21521,6 +23693,12 @@ UU conflicted.rs",
         assert!(third.contains("previous 2 call"));
         let changed = executor.note_repeated_call("read_file", "{\"path\":\"a\"}", "new".into());
         assert_eq!(changed, "new");
+        // A long repeated output is not sent again.
+        let long = "x".repeat(2_000);
+        executor.note_repeated_call("bash", "{}", long.clone());
+        let again = executor.note_repeated_call("bash", "{}", long);
+        assert!(again.contains("identical to your previous call"), "{again}");
+        assert!(!again.contains("xxxx"));
     }
 
     #[test]
@@ -21532,16 +23710,34 @@ UU conflicted.rs",
         std::env::remove_var("CLAW_TOOL_RESULT_MAX_CHARS");
         assert_eq!(super::cap_tool_result_for_model(long.clone()), long);
 
+        let original_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let home = std::env::temp_dir().join(format!("claw-tool-output-{}", std::process::id()));
+        std::env::set_var("CLAW_CONFIG_HOME", &home);
         std::env::set_var("CLAW_TOOL_RESULT_MAX_CHARS", "100");
         let capped = super::cap_tool_result_for_model(long.clone());
         assert!(capped.starts_with(&"x".repeat(100)));
         assert!(!capped.starts_with(&"x".repeat(101)));
-        assert!(capped.contains("showing 100 of 500 characters"));
+        assert!(capped.contains("100 of 500 characters"), "{capped}");
+        // The whole output is kept in a file the note names.
+        let saved = capped
+            .split("saved in ")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .expect("saved path");
+        assert_eq!(std::fs::read_to_string(saved).expect("saved output"), long);
         assert_eq!(
             super::cap_tool_result_for_model("short".to_string()),
             "short"
         );
+        // Hosted models are not held to the local cap; local ones are.
+        assert_eq!(super::tool_output_budget(Some("local/qwen")), Some(100));
+        assert_eq!(super::tool_output_budget(None), Some(100));
 
+        let _ = std::fs::remove_dir_all(&home);
+        match original_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
         match original {
             Some(value) => std::env::set_var("CLAW_TOOL_RESULT_MAX_CHARS", value),
             None => std::env::remove_var("CLAW_TOOL_RESULT_MAX_CHARS"),

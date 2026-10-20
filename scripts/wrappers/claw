@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # claw launcher: runs the real binary (~/.local/lib/claw/claw) against the
-# local llama.cpp server (llama-gpu), from any directory, with a core set of tools (shell,
+# local llama.cpp server (llama-gpu), from any directory, with (for local/ models) a core set of tools (shell,
 # files, search, web, downloads, desktop control (X11), todo list, questions, skills). Sending all ~60 tool descriptions made the
 # local model ~5x slower; run with CLAW_ALL_TOOLS=1 to send them all anyway.
 # Agent lets the model spawn sub-agents (foreground, or background with a
@@ -13,6 +13,17 @@ set -euo pipefail
 # stay free for the real OpenAI API (gpt-* models). Other providers pick
 # their own keys by model name: claude-* ANTHROPIC_API_KEY, xai/* XAI_API_KEY,
 # qwen/* kimi/* DASHSCOPE_API_KEY.
+# Provider API keys (PROVIDERS.md, option B), loaded here as well as from
+# ~/.bashrc so claw started outside a shell (claw desktop, a menu entry) has
+# them. Variables already set in the environment win over the file.
+CLAW_KEYS_FILE="${CLAW_KEYS_FILE:-$HOME/.config/claw-keys.env}"
+if [[ -r "$CLAW_KEYS_FILE" ]]; then
+    exported="$(export -p)"
+    # shellcheck source=/dev/null
+    . "$CLAW_KEYS_FILE"
+    eval "$exported"
+    unset exported
+fi
 export CLAW_LOCAL_BASE_URL="${CLAW_LOCAL_BASE_URL:-http://127.0.0.1:8080/v1}"
 unset OLLAMA_HOST
 # An OPENAI_BASE_URL pointing at the local server (as ~/.bashrc sets for other
@@ -36,10 +47,45 @@ export CLAW_TOOL_RESULT_MAX_CHARS="${CLAW_TOOL_RESULT_MAX_CHARS:-12000}"
 #   export CLAW_SERVER_STOP_ON_EXIT=0   # start it, but leave it running
 #   export CLAW_MANAGE_SERVER=0         # never start or stop servers
 CLAW_BIN="${CLAW_BIN:-$HOME/.local/lib/claw/claw}"
-CORE_TOOLS="bash,bash_output,kill_shell,Agent,read_file,write_file,edit_file,glob_search,grep_search,web_fetch,web_search,download,x11,browser,todo_write,AskUserQuestion,Skill,code_search,pty,checkpoint,diagnostics,google_dork,vision_analyze,repo_signals,trail"
+CORE_TOOLS="bash,bash_output,kill_shell,Agent,read_file,write_file,edit_file,glob_search,grep_search,web_fetch,web_search,download,social_media,x11,browser,todo_write,AskUserQuestion,Skill,code_search,pty,checkpoint,diagnostics,google_dork,vision_analyze,repo_signals,trail,session_search"
+
+# The model claw starts with: --model on the command line, else `model` from
+# ~/.claw/settings.json and the project's .claw/settings.json (the project
+# wins), with their `aliases` resolved. Empty when it cannot be told.
+start_model() {
+    local model="" prev=""
+    for arg in "$@"; do
+        [[ "$prev" == --model ]] && model="$arg"
+        [[ "$arg" == --model=* ]] && model="${arg#--model=}"
+        prev="$arg"
+    done
+    python3 -I - "$model" "${CLAW_CONFIG_HOME:-$HOME/.claw}/settings.json" .claw/settings.json <<'PY' 2>/dev/null || true
+import json, sys
+model, aliases = sys.argv[1], {}
+for path in sys.argv[2:]:
+    try:
+        settings = json.load(open(path))
+    except Exception:
+        continue
+    aliases.update(settings.get("aliases") or {})
+    if not sys.argv[1] and settings.get("model"):
+        model = settings["model"]
+print(aliases.get(model, model))
+PY
+}
+
+# claw uses the same short list when a hosted session falls back to a local
+# model (providerFallbacks), which would otherwise read every tool description.
+export CLAW_LOCAL_CORE_TOOLS="$CORE_TOOLS"
 
 # File tools can reach any path, so starting in $HOME (or anywhere) is fine.
 args=(--allow-broad-cwd "$@")
+# The tool list is trimmed for local models only: hosted models (openrouter/,
+# nvidia/, claude-*, …) handle every tool description without slowing down.
+model="$(start_model "$@")"
+if [[ -n "$model" && "$model" != local/* ]]; then
+    CLAW_ALL_TOOLS=1
+fi
 if [[ "${CLAW_ALL_TOOLS:-0}" != 1 && " $* " != *" --allowedTools "* ]]; then
     args=(--allowedTools "$CORE_TOOLS" "${args[@]}")
 fi

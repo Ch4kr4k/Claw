@@ -1217,6 +1217,14 @@ pub fn save_user_setting(key: &str, value: Option<&str>) -> Result<(), ConfigErr
     write_settings_root(&settings_path, &root)
 }
 
+/// `key` from `~/.claw/settings.json` as any JSON value.
+#[must_use]
+pub fn read_user_setting_value(key: &str) -> Option<serde_json::Value> {
+    read_settings_root(&default_config_home().join("settings.json"))
+        .get(key)
+        .cloned()
+}
+
 /// Read one top-level string key from the user-level `~/.claw/settings.json`.
 #[must_use]
 pub fn read_user_setting(key: &str) -> Option<String> {
@@ -2687,6 +2695,9 @@ fn deep_merge_objects(
 ) {
     for (key, value) in source {
         match (target.get_mut(key), value) {
+            // `null` means "not set": a placeholder that keeps the default
+            // (and does not override a lower-precedence file).
+            (_, JsonValue::Null) => {}
             (Some(JsonValue::Object(existing)), JsonValue::Object(incoming)) => {
                 deep_merge_objects(existing, incoming);
             }
@@ -2695,9 +2706,23 @@ fn deep_merge_objects(
                 existing.extend(incoming.iter().cloned());
             }
             _ => {
-                target.insert(key.clone(), value.clone());
+                target.insert(key.clone(), without_nulls(value));
             }
         }
+    }
+}
+
+/// `value` with every `null` object member removed, at any depth.
+fn without_nulls(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(object) => JsonValue::Object(
+            object
+                .iter()
+                .filter(|(_, value)| !matches!(value, JsonValue::Null))
+                .map(|(key, value)| (key.clone(), without_nulls(value)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -3608,6 +3633,33 @@ mod tests {
         assert_eq!(loaded.plugins().enabled_plugins().len(), 0);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn null_settings_are_placeholders_for_defaults() {
+        let mut target = std::collections::BTreeMap::new();
+        target.insert("model".to_string(), JsonValue::String("base".to_string()));
+        let source = match JsonValue::parse(
+            r#"{"model": null, "oauth": null, "sandbox": {"enabled": false, "allowedMounts": null}}"#,
+        )
+        .expect("json")
+        {
+            JsonValue::Object(object) => object,
+            _ => unreachable!(),
+        };
+        deep_merge_objects(&mut target, &source);
+        // A null leaves the lower layer's value, and never appears itself.
+        assert_eq!(
+            target.get("model"),
+            Some(&JsonValue::String("base".to_string()))
+        );
+        assert!(!target.contains_key("oauth"));
+        let sandbox = target
+            .get("sandbox")
+            .and_then(JsonValue::as_object)
+            .expect("sandbox");
+        assert!(!sandbox.contains_key("allowedMounts"));
+        assert_eq!(sandbox.get("enabled"), Some(&JsonValue::Bool(false)));
     }
 
     #[test]

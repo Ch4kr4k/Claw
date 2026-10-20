@@ -252,15 +252,19 @@ fn prompt_provider<'a>(
     let options: Vec<(String, Option<String>)> = choices
         .iter()
         .map(|choice| {
-            let note = (choice.kind == current_kind).then(|| "current".to_string());
-            (choice.label.to_string(), note)
+            let mut note = choice.key_env.to_string();
+            if choice.kind == current_kind {
+                note.insert_str(0, "current · ");
+            }
+            (choice.label.to_string(), Some(note))
         })
         .collect();
     let default = choices
         .iter()
         .position(|choice| choice.kind == current_kind)
         .unwrap_or(0);
-    match choose("Provider", &options, default, false)? {
+    // With the models.dev providers the list is long: type to filter it.
+    match ask::pick_filtered("Provider (type to filter)", &options, default)? {
         Pick::Index(index) => Ok(&choices[index]),
         _ => Err(Box::new(Cancelled)),
     }
@@ -384,6 +388,48 @@ fn fetch_models(choice: &ProviderChoice, api_key: &str, base_url: Option<&str>) 
             Vec::new()
         }
     }
+}
+
+/// The models of every provider claw can reach now, for the `/model`
+/// picker: each provider whose key is set (all of `/login`'s list), and the
+/// local server when it answers. Fetched in parallel; a provider whose list
+/// cannot be fetched is left out. Pairs of (provider label, model names
+/// routed to it).
+pub fn available_models() -> Vec<(&'static str, Vec<String>)> {
+    let jobs = provider_choices()
+        .into_iter()
+        .filter_map(|choice| {
+            let key = std::env::var(choice.key_env).unwrap_or_default();
+            if key.trim().is_empty() && !choice.key_optional {
+                return None;
+            }
+            let url = std::env::var(choice.url_env)
+                .ok()
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or_else(|| choice.default_url.to_string());
+            Some(std::thread::spawn(move || {
+                let ids = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?
+                    .block_on(api::list_models(&url, &key, choice.kind == "anthropic"))
+                    .ok()?;
+                let names = ids
+                    .iter()
+                    .map(|id| model_name_for(&choice, id))
+                    .collect::<Vec<_>>();
+                let label = if choice.kind == "local" {
+                    "local server"
+                } else {
+                    choice.label
+                };
+                (!names.is_empty()).then_some((label, names))
+            }))
+        })
+        .collect::<Vec<_>>();
+    jobs.into_iter()
+        .filter_map(|job| job.join().ok().flatten())
+        .collect()
 }
 
 fn model_name_for(choice: &ProviderChoice, id: &str) -> String {
@@ -526,7 +572,18 @@ fn load_current_settings_field(field: &str) -> Option<String> {
     json.get(field)?.as_str().map(ToString::to_string)
 }
 
-fn save_settings_field(field: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn save_settings_field(
+    field: &str,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    save_settings_value(field, serde_json::Value::String(value.to_string()))
+}
+
+/// Sets `field` in `~/.claw/settings.json` to any JSON `value`.
+pub(crate) fn save_settings_value(
+    field: &str,
+    value: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
     let home = std::env::var("HOME")?;
     let settings_dir = std::path::Path::new(&home).join(".claw");
     let settings_path = settings_dir.join("settings.json");
@@ -539,10 +596,7 @@ fn save_settings_field(field: &str, value: &str) -> Result<(), Box<dyn std::erro
     };
 
     if let Some(obj) = settings.as_object_mut() {
-        obj.insert(
-            field.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
+        obj.insert(field.to_string(), value);
     }
 
     std::fs::create_dir_all(&settings_dir)?;

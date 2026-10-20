@@ -303,6 +303,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "fallback",
+        aliases: &[],
+        summary: "Show or set the model to fall back to when the current one fails (off to disable)",
+        argument_hint: Some("[model|off]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "btw",
         aliases: &[],
         summary: "Ask a quick side question; the answer is not added to the conversation",
@@ -963,6 +970,9 @@ pub enum SlashCommand {
     Btw {
         question: Option<String>,
     },
+    Fallback {
+        model: Option<String>,
+    },
     Recap,
     Color {
         color: Option<String>,
@@ -1192,6 +1202,7 @@ impl SlashCommand {
             Self::Ultraplan { .. } => "/ultraplan",
             Self::Teleport { .. } => "/teleport",
             Self::Btw { .. } => "/btw",
+            Self::Fallback { .. } => "/fallback",
             Self::Recap => "/recap",
             Self::Color { .. } => "/color",
             Self::Advisor { .. } => "/advisor",
@@ -1463,6 +1474,7 @@ pub fn validate_slash_command_input(
         "btw" => SlashCommand::Btw {
             question: remainder,
         },
+        "fallback" => SlashCommand::Fallback { model: remainder },
         "recap" => {
             validate_no_args(command, &args)?;
             SlashCommand::Recap
@@ -1621,8 +1633,9 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Cost
         }
+        // Without a path the REPL offers this folder's sessions to pick from.
         "resume" | "continue" => SlashCommand::Resume {
-            session_path: Some(require_remainder(command, remainder, "<session-path>")?),
+            session_path: remainder,
         },
         "config" | "settings" => SlashCommand::Config {
             section: parse_config_section(&args)?,
@@ -5608,6 +5621,7 @@ pub fn handle_slash_command(
         | SlashCommand::Ultraplan { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::Btw { .. }
+        | SlashCommand::Fallback { .. }
         | SlashCommand::Recap
         | SlashCommand::Color { .. }
         | SlashCommand::Advisor { .. }
@@ -6396,7 +6410,8 @@ mod tests {
         assert!(help.contains("/scope-check <idea or task>"));
         assert!(help.contains("/diverge <problem>"));
         assert!(help.contains("/reflect [focus]"));
-        assert_eq!(slash_command_specs().len(), 125);
+        assert!(help.contains("/fallback [model|off]"));
+        assert_eq!(slash_command_specs().len(), 126);
         assert!(resume_supported_slash_commands().len() >= 32);
     }
 

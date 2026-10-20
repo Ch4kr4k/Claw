@@ -344,7 +344,7 @@ fn bubblewrap_command(
             "--chdir".to_string(),
             cwd.to_string_lossy().into_owned(),
             "--".to_string(),
-            "sh".to_string(),
+            crate::bash::shell_program().to_string(),
             "-c".to_string(),
             command.to_string(),
         ]);
@@ -453,7 +453,9 @@ mod tests {
 
     #[test]
     fn bubblewrap_enforces_writes_identity_and_network() {
-        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        // Not under the current directory: other tests move it into their
+        // own temp folders and delete them, which took this one along.
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
         let workspace = root.path().join("workspace");
         let outside = root.path().join("outside");
         std::fs::create_dir(&workspace).unwrap();

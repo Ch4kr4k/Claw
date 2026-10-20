@@ -241,7 +241,7 @@ fn monitor(input: MonitorInput) -> Result<String, String> {
     }
     let timeout =
         Duration::from_millis(input.timeout_ms.unwrap_or(300_000).clamp(1_000, 3_600_000));
-    let mut command = Command::new("sh");
+    let mut command = Command::new(runtime::shell_program());
     command.arg("-c").arg(&input.command);
     let id = runtime::global_background_jobs()
         .start_monitor(command, &input.command, &input.description, timeout)

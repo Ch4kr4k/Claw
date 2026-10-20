@@ -14,6 +14,28 @@ pub enum ProviderClient {
 }
 
 impl ProviderClient {
+    /// Sets how often a failed request is retried (and the backoff between
+    /// tries), whatever the provider.
+    #[must_use]
+    pub fn with_retry_policy(
+        self,
+        max_retries: u32,
+        initial_backoff: std::time::Duration,
+        max_backoff: std::time::Duration,
+    ) -> Self {
+        match self {
+            Self::Anthropic(client) => {
+                Self::Anthropic(client.with_retry_policy(max_retries, initial_backoff, max_backoff))
+            }
+            Self::Xai(client) => {
+                Self::Xai(client.with_retry_policy(max_retries, initial_backoff, max_backoff))
+            }
+            Self::OpenAi(client) => {
+                Self::OpenAi(client.with_retry_policy(max_retries, initial_backoff, max_backoff))
+            }
+        }
+    }
+
     pub fn from_model(model: &str) -> Result<Self, ApiError> {
         Self::from_model_with_anthropic_auth(model, None)
     }
