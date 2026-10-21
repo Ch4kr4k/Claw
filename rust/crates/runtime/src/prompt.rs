@@ -1584,6 +1584,18 @@ mod tests {
             r#"{"rulesImport":"none"}"#,
         )
         .expect("write settings");
+        // The user has approved this project file (the trust gate is tested
+        // in project_trust); this test is about rulesImport.
+        if let crate::json::JsonValue::Object(object) =
+            crate::json::JsonValue::parse(r#"{"rulesImport":"none"}"#).expect("json")
+        {
+            crate::project_trust::trust(
+                &root.join("missing-home"),
+                &root.join(".claw").join("settings.json"),
+                &object,
+            )
+            .expect("trust project config");
+        }
 
         let _guard = env_lock();
         ensure_valid_cwd();

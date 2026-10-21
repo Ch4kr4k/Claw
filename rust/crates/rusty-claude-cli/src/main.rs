@@ -15189,19 +15189,44 @@ fn note_affordable_reply_budget(model: &str, error: &str) -> bool {
         .is_ok()
 }
 
-/// The request after a reply cut off mid-thought goes to a local model with
-/// thinking off (the chat template's `enable_thinking`): asked to think only
-/// briefly, Qwen still thought up to the 8k reply limit again, four times in
-/// one run, and the turn ended with nothing done.
-fn thinking_off_after_cut_off(
+/// Thinking controls for a request to a local model (llama-server).
+///
+/// Every request carries `thinking_budget_tokens`: llama-server's reasoning
+/// budget sampler then closes the thinking block itself once the budget is
+/// spent, so the reply always has room left for the answer or tool call.
+/// Without it Qwen thought up to the whole reply limit (a quarter of the
+/// window), the reply was cut off, and the next step reasoned it all out
+/// again. `CLAW_THINKING_BUDGET` sets the budget in tokens (`-1` sends none);
+/// the default is half the reply budget.
+///
+/// The request after a cut-off still goes with thinking off (the chat
+/// template's `enable_thinking`), for servers without the budget sampler.
+fn local_thinking_controls(
     model: &str,
     request: &ApiRequest,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut extra_body = std::collections::BTreeMap::new();
-    if model.starts_with("local/") && request.follows_thinking_cut_off() {
+    if !model.starts_with("local/") {
+        return extra_body;
+    }
+    if request.follows_thinking_cut_off() {
         extra_body.insert(
             "chat_template_kwargs".to_string(),
             serde_json::json!({ "enable_thinking": false }),
+        );
+        return extra_body;
+    }
+    let reply = i64::from(reply_budget(model));
+    let budget = std::env::var("CLAW_THINKING_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(reply / 2);
+    if budget >= 0 {
+        // Leave at least 1k tokens of the reply for the answer itself.
+        let budget = budget.min((reply - 1_024).max(0));
+        extra_body.insert(
+            "thinking_budget_tokens".to_string(),
+            serde_json::json!(budget),
         );
     }
     extra_body
@@ -15620,7 +15645,7 @@ impl AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
-            extra_body: thinking_off_after_cut_off(&self.model, &request),
+            extra_body: local_thinking_controls(&self.model, &request),
             ..Default::default()
         };
         let mut message_request = message_request;
@@ -23507,18 +23532,39 @@ UU conflicted.rs",
             "{}: nothing was shown",
             runtime::THINKING_CUT_OFF_PROMPT
         ));
-        let body = super::thinking_off_after_cut_off("local/qwen36-35b-a3b", &after_cut_off);
+        let body = super::local_thinking_controls("local/qwen36-35b-a3b", &after_cut_off);
         assert_eq!(
             body["chat_template_kwargs"],
             serde_json::json!({ "enable_thinking": false })
         );
-        assert!(
-            super::thinking_off_after_cut_off("openrouter/a/b:free", &after_cut_off).is_empty()
-        );
-        assert!(
-            super::thinking_off_after_cut_off("local/qwen36-35b-a3b", &request("fix it"))
-                .is_empty()
-        );
+        assert!(!body.contains_key("thinking_budget_tokens"));
+        assert!(super::local_thinking_controls("openrouter/a/b:free", &after_cut_off).is_empty());
+        assert!(super::local_thinking_controls("openrouter/a/b:free", &request("fix it")).is_empty());
+    }
+
+    #[test]
+    fn local_models_get_a_thinking_budget_inside_the_reply_budget() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_THINKING_BUDGET");
+        let request = runtime::ApiRequest {
+            system_prompt: Vec::new(),
+            messages: vec![runtime::ConversationMessage::user_text("fix it".to_string())],
+        };
+        let model = "local/qwen36-35b-a3b";
+        let reply = i64::from(super::reply_budget(model));
+        let budget = super::local_thinking_controls(model, &request)["thinking_budget_tokens"]
+            .as_i64()
+            .expect("budget sent");
+        assert!(budget > 0 && budget <= reply - 1_024, "{budget} vs reply {reply}");
+
+        std::env::set_var("CLAW_THINKING_BUDGET", "-1");
+        assert!(super::local_thinking_controls(model, &request).is_empty());
+        std::env::set_var("CLAW_THINKING_BUDGET", "999999999");
+        let capped = super::local_thinking_controls(model, &request)["thinking_budget_tokens"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(capped, reply - 1_024);
+        std::env::remove_var("CLAW_THINKING_BUDGET");
     }
 
     #[test]

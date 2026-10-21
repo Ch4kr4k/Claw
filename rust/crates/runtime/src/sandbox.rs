@@ -282,6 +282,92 @@ fn writable_mounts(request: &SandboxRequest, cwd: &Path) -> std::io::Result<Vec<
     Ok(mounts)
 }
 
+/// Environment passed into the sandbox; everything else is cleared.
+#[cfg(target_os = "linux")]
+const SANDBOX_ENV_ALLOWLIST: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    "TERM", "COLORTERM", "NO_COLOR", "TZ",
+];
+
+/// Credentials and live sessions under `$HOME` the sandbox must not read.
+/// Directories get an empty tmpfs, files are replaced by `/dev/null`.
+#[cfg(target_os = "linux")]
+const HOME_SECRETS: &[&str] = &[
+    ".ssh", ".gnupg", ".password-store", ".aws", ".azure", ".kube", ".docker",
+    ".config/gcloud", ".config/gh", ".config/hub", ".netrc", ".git-credentials",
+    ".pgpass", ".my.cnf", ".mozilla", ".config/chromium", ".config/google-chrome",
+    ".config/BraveSoftware", ".local/share/keyrings", ".claw", ".claude",
+];
+
+/// Unix sockets that reach a process outside the sandbox (container runtimes,
+/// the system bus). Connecting needs no write access to the filesystem.
+#[cfg(target_os = "linux")]
+const HOST_SOCKETS: &[&str] = &[
+    "/run/docker.sock", "/var/run/docker.sock", "/run/podman/podman.sock",
+    "/run/containerd/containerd.sock", "/run/dbus/system_bus_socket",
+    "/var/run/dbus/system_bus_socket", "/tmp/.X11-unix",
+];
+
+#[cfg(target_os = "linux")]
+fn hide_path(args: &mut Vec<String>, path: &Path) {
+    // symlink_metadata: never follow a link planted to redirect the mount.
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    let target = path.to_string_lossy().into_owned();
+    if meta.is_dir() {
+        args.extend(["--tmpfs".to_string(), target]);
+    } else if !meta.file_type().is_symlink() {
+        args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), target]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn hide_host_secrets(args: &mut Vec<String>, uid: u32) {
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        if home.is_absolute() && home != Path::new("/") {
+            for relative in HOME_SECRETS {
+                hide_path(args, &home.join(relative));
+            }
+        }
+    }
+    // The session bus, systemd --user, Wayland, PipeWire, gpg-agent and
+    // ssh-agent all listen here: `systemd-run --user` alone escapes.
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    if runtime_dir.is_absolute() && runtime_dir != Path::new("/") {
+        hide_path(args, &runtime_dir);
+    }
+    for socket in HOST_SOCKETS {
+        hide_path(args, Path::new(socket));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn protect_execution_paths(args: &mut Vec<String>, root: &Path) {
+    let git_dir = root.join(".git");
+    if fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
+        // A missing hooks dir could be created inside the sandbox and would
+        // then be used by git outside it; an empty one is what `git init` makes.
+        let hooks = git_dir.join("hooks");
+        if fs::symlink_metadata(&hooks).is_err() {
+            let _ = fs::create_dir(&hooks);
+        }
+    }
+    for relative in [".git/hooks", ".git/config", ".claw", ".claw.json", ".envrc"] {
+        let path = root.join(relative);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let target = path.to_string_lossy().into_owned();
+        args.extend(["--ro-bind".to_string(), target.clone(), target]);
+    }
+}
+
 fn bubblewrap_command(
     command: &str,
     cwd: &Path,
@@ -305,6 +391,9 @@ fn bubblewrap_command(
         }
         let cwd = cwd.canonicalize()?;
         let mut args: Vec<String> = [
+            // Nothing from claw's environment except what a shell needs: API
+            // keys, agent sockets and display handles stay outside (below).
+            "--clearenv",
             "--unshare-user",
             "--disable-userns",
             "--unshare-pid",
@@ -337,9 +426,29 @@ fn bubblewrap_command(
             ]
             .map(str::to_string),
         );
-        for mount in writable_mounts(request, &cwd)? {
-            args.extend(["--bind".to_string(), mount.clone(), mount]);
+        hide_host_secrets(&mut args, uid);
+        let mounts = writable_mounts(request, &cwd)?;
+        for mount in &mounts {
+            args.extend(["--bind".to_string(), mount.clone(), mount.clone()]);
         }
+        // Writable roots stay writable, except the files that make something
+        // run outside the sandbox later: git hooks and config (core.hooksPath,
+        // core.fsmonitor), claw's own project config, direnv.
+        if request.filesystem_mode != FilesystemIsolationMode::Off {
+            for mount in &mounts {
+                protect_execution_paths(&mut args, Path::new(mount));
+            }
+        }
+        for name in SANDBOX_ENV_ALLOWLIST {
+            if let Some(value) = env::var_os(name) {
+                args.extend([
+                    "--setenv".to_string(),
+                    (*name).to_string(),
+                    value.to_string_lossy().into_owned(),
+                ]);
+            }
+        }
+        args.extend(["--setenv".to_string(), "TMPDIR".to_string(), "/tmp".to_string()]);
         args.extend([
             "--chdir".to_string(),
             cwd.to_string_lossy().into_owned(),

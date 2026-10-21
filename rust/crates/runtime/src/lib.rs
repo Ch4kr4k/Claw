@@ -36,6 +36,7 @@ mod oauth;
 pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
+pub mod project_trust;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;

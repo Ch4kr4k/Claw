@@ -486,6 +486,24 @@ impl ConfigLoader {
         ]
     }
 
+    /// Project and local files are untrusted until the user approves their
+    /// exact content (see [`crate::project_trust`]); until then only
+    /// presentation keys are used. Returns the warning for a gated file.
+    fn gate_untrusted(
+        &self,
+        entry: &ConfigEntry,
+        object: &mut BTreeMap<String, JsonValue>,
+    ) -> Option<String> {
+        if entry.source == ConfigSource::User
+            || crate::project_trust::is_trusted(&self.config_home, &entry.path, object)
+        {
+            return None;
+        }
+        let dropped = crate::project_trust::restrict_untrusted(object);
+        (!dropped.is_empty())
+            .then(|| crate::project_trust::untrusted_warning(&entry.path, &dropped))
+    }
+
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
@@ -494,9 +512,10 @@ impl ConfigLoader {
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
+            let OptionalConfigFile::Loaded(mut parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
+            let untrusted = self.gate_untrusted(&entry, &mut parsed.object);
             let validation = crate::config_validate::validate_config_file(
                 &parsed.object,
                 &parsed.source,
@@ -505,6 +524,9 @@ impl ConfigLoader {
             if !validation.is_ok() {
                 let first_error = &validation.errors[0];
                 return Err(ConfigError::Parse(first_error.to_string()));
+            }
+            if let Some(warning) = untrusted {
+                emit_config_warning_once(&warning);
             }
             all_warnings.extend(validation.warnings);
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
@@ -533,9 +555,10 @@ impl ConfigLoader {
 
         for entry in self.discover() {
             crate::config_validate::check_unsupported_format(&entry.path)?;
-            let OptionalConfigFile::Loaded(parsed) = read_optional_json_object(&entry.path)? else {
+            let OptionalConfigFile::Loaded(mut parsed) = read_optional_json_object(&entry.path)? else {
                 continue;
             };
+            let untrusted = self.gate_untrusted(&entry, &mut parsed.object);
             let validation = crate::config_validate::validate_config_file(
                 &parsed.object,
                 &parsed.source,
@@ -545,6 +568,7 @@ impl ConfigLoader {
                 let first_error = &validation.errors[0];
                 return Err(ConfigError::Parse(first_error.to_string()));
             }
+            all_warnings.extend(untrusted);
             all_warnings.extend(validation.warnings.iter().map(|w| w.to_string()));
             validate_optional_hooks_config(&parsed.object, &entry.path)?;
             merge_mcp_servers(&mut mcp, entry.source, &parsed.object, &entry.path)?;
@@ -2728,6 +2752,23 @@ fn without_nulls(value: &JsonValue) -> JsonValue {
 
 #[cfg(test)]
 mod tests {
+    /// The user approving every project file the loader would read, as
+    /// `claw trust` does; these tests are about parsing, not the trust gate.
+    pub(crate) fn trusting(loader: super::ConfigLoader) -> super::ConfigLoader {
+        for entry in loader.discover() {
+            if entry.source == super::ConfigSource::User {
+                continue;
+            }
+            if let Ok(super::OptionalConfigFile::Loaded(parsed)) =
+                super::read_optional_json_object(&entry.path)
+            {
+                crate::project_trust::trust(&loader.config_home, &entry.path, &parsed.object)
+                    .expect("trust project config");
+            }
+        }
+        loader
+    }
+
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
         ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
@@ -2811,7 +2852,7 @@ mod tests {
         )
         .expect("write local settings");
 
-        let loaded = ConfigLoader::new(&cwd, &home)
+        let loaded = trusting(ConfigLoader::new(&cwd, &home))
             .load()
             .expect("config should load");
 
@@ -3032,7 +3073,7 @@ mod tests {
         )
         .expect("write local settings");
 
-        let loaded = ConfigLoader::new(&cwd, &home)
+        let loaded = trusting(ConfigLoader::new(&cwd, &home))
             .load()
             .expect("config should load");
 
@@ -3322,7 +3363,7 @@ mod tests {
         )
         .expect("write local settings");
 
-        let loaded = ConfigLoader::new(&cwd, &home)
+        let loaded = trusting(ConfigLoader::new(&cwd, &home))
             .load()
             .expect("config should load");
 
@@ -3590,7 +3631,7 @@ mod tests {
         .expect("write local settings");
 
         // when
-        let loaded = ConfigLoader::new(&cwd, &home)
+        let loaded = trusting(ConfigLoader::new(&cwd, &home))
             .load()
             .expect("config should load");
 
@@ -3715,7 +3756,7 @@ mod tests {
         )
         .expect("write invalid project settings");
 
-        let loaded = ConfigLoader::new(&cwd, &home)
+        let loaded = trusting(ConfigLoader::new(&cwd, &home))
             .load()
             .expect("config should load valid hook entries and record invalid siblings");
 
