@@ -1201,6 +1201,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::SessionList { output_format } => run_session_list(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::Trust => run_trust()?,
         CliAction::Setup { output_format: _ } => run_setup()?,
         // #146: dispatch pure-local introspection. Text mode uses existing
         // render_config_report/render_diff_report; JSON mode uses the
@@ -1359,6 +1360,9 @@ enum CliAction {
     Init {
         output_format: CliOutputFormat,
     },
+    /// `claw trust`: review and approve the project config files in the
+    /// current directory, whose settings are ignored until then.
+    Trust,
     Setup {
         output_format: CliOutputFormat,
     },
@@ -2315,6 +2319,15 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             })
         }
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
+        "trust" => {
+            if rest.len() > 1 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw trust`: {}\nUsage: claw trust (reviews the project config files in the current directory)",
+                    rest[1..].join(" ")
+                ));
+            }
+            Ok(CliAction::Trust)
+        }
         "init" => {
             // #771: extra positional args to `init` were silently ignored — now rejected
             if rest.len() > 1 {
@@ -7244,6 +7257,7 @@ fn run_resume_command(
             // from the same InitReport so both surfaces stay in sync.
             let cwd = env::current_dir()?;
             let report = crate::init::initialize_repo(&cwd)?;
+            report.trust_created_config();
             let message = report.render();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -12938,12 +12952,56 @@ fn render_memory_json() -> Result<serde_json::Value, Box<dyn std::error::Error>>
 
 fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    Ok(initialize_repo(&cwd)?.render())
+    let report = initialize_repo(&cwd)?;
+    report.trust_created_config();
+    Ok(report.render())
+}
+
+/// `claw trust`: shows each project config file in the current directory
+/// whose settings are being ignored, and records the user's approval of that
+/// exact content. Asks on a terminal only, so a command the model runs
+/// (`echo y | claw trust`) cannot approve anything; inside the sandbox the
+/// trust store is hidden as well.
+fn run_trust() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let files = loader.untrusted_files();
+    if files.is_empty() {
+        println!(
+            "Nothing to trust: every config file in {} already applies.",
+            cwd.display()
+        );
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(
+            "claw trust asks for confirmation on a terminal; run it yourself in this directory"
+                .into(),
+        );
+    }
+    for file in files {
+        println!("── {} ──", file.path.display());
+        println!("{}", file.contents.trim_end());
+        println!("──");
+        println!("Ignored until trusted: {}", file.ignored_keys.join(", "));
+        print!("Trust this exact content? Hooks, MCP servers and sandbox or permission settings in it apply on this machine. [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if matches!(answer.trim(), "y" | "Y" | "yes") {
+            loader.trust(&file)?;
+            println!("Trusted. Any later change to the file needs a new approval.\n");
+        } else {
+            println!("Left untrusted.\n");
+        }
+    }
+    Ok(())
 }
 
 fn run_init(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let report = initialize_repo(&cwd)?;
+    report.trust_created_config();
     let message = report.render();
     match output_format {
         CliOutputFormat::Text => println!("{message}"),
@@ -15189,19 +15247,46 @@ fn note_affordable_reply_budget(model: &str, error: &str) -> bool {
         .is_ok()
 }
 
-/// The request after a reply cut off mid-thought goes to a local model with
-/// thinking off (the chat template's `enable_thinking`): asked to think only
-/// briefly, Qwen still thought up to the 8k reply limit again, four times in
-/// one run, and the turn ended with nothing done.
-fn thinking_off_after_cut_off(
+/// Thinking controls for a request to a local model (llama-server).
+///
+/// Every request carries `thinking_budget_tokens`: llama-server's reasoning
+/// budget sampler then closes the thinking block itself once the budget is
+/// spent, so the reply always has room left for the answer or tool call.
+/// Without it Qwen thought up to the whole reply limit (a quarter of the
+/// window), the reply was cut off, and the next step reasoned it all out
+/// again. `CLAW_THINKING_BUDGET` sets the budget in tokens (`-1` sends none);
+/// the default is half the reply budget.
+///
+/// The request after a cut-off still goes with thinking off (the chat
+/// template's `enable_thinking`), for servers without the budget sampler:
+/// asked to think only briefly, Qwen still thought up to the 8k reply limit
+/// again, four times in one run, and the turn ended with nothing done.
+fn local_thinking_controls(
     model: &str,
     request: &ApiRequest,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut extra_body = std::collections::BTreeMap::new();
-    if model.starts_with("local/") && request.follows_thinking_cut_off() {
+    if !model.starts_with("local/") {
+        return extra_body;
+    }
+    if request.follows_thinking_cut_off() {
         extra_body.insert(
             "chat_template_kwargs".to_string(),
             serde_json::json!({ "enable_thinking": false }),
+        );
+        return extra_body;
+    }
+    let reply = i64::from(reply_budget(model));
+    let budget = env::var("CLAW_THINKING_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(reply / 2);
+    if budget >= 0 {
+        // Leave at least 1k tokens of the reply for the answer itself.
+        let budget = budget.min((reply - 1_024).max(0));
+        extra_body.insert(
+            "thinking_budget_tokens".to_string(),
+            serde_json::json!(budget),
         );
     }
     extra_body
@@ -15620,7 +15705,7 @@ impl AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
-            extra_body: thinking_off_after_cut_off(&self.model, &request),
+            extra_body: local_thinking_controls(&self.model, &request),
             ..Default::default()
         };
         let mut message_request = message_request;
@@ -18356,6 +18441,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
+    writeln!(out, "  claw trust")?;
+    writeln!(
+        out,
+        "      Review and approve this directory's project config files"
+    )?;
     writeln!(out, "  claw doctor")?;
     writeln!(
         out,
@@ -19456,6 +19546,27 @@ mod tests {
         assert_eq!(resolve_model_alias("opus"), "anthropic/claude-opus-4-7");
     }
 
+    /// The user approving `cwd`'s project config files with `claw trust`, for
+    /// tests about what those files set rather than about the trust gate.
+    fn trust_project_config(cwd: &Path, config_home: &Path) {
+        let loader = ConfigLoader::new(cwd, config_home);
+        for file in loader.untrusted_files() {
+            loader.trust(&file).expect("trust project config");
+        }
+    }
+
+    /// Runs `f` with `CLAW_CONFIG_HOME` set to `config_home`.
+    fn with_config_home<T>(config_home: &Path, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", config_home);
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        result
+    }
+
     #[test]
     fn user_defined_aliases_resolve_before_provider_dispatch() {
         // given
@@ -19471,6 +19582,7 @@ mod tests {
         )
         .expect("project config should write");
 
+        trust_project_config(&cwd, &config_home);
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
 
@@ -20238,6 +20350,7 @@ mod tests {
         )
         .expect("write malformed .claw.json");
 
+        trust_project_config(&cwd, &config_home);
         let previous_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         let payload = super::plugins_command_payload_for(
@@ -20293,9 +20406,13 @@ mod tests {
         )
         .expect("write malformed .claw.json");
 
-        let context = with_current_dir(&cwd, || {
-            super::status_context(None)
-                .expect("status_context should not hard-fail on config parse errors (#143)")
+        let config_home = root.join("config-home");
+        trust_project_config(&cwd, &config_home);
+        let context = with_config_home(&config_home, || {
+            with_current_dir(&cwd, || {
+                super::status_context(None)
+                    .expect("status_context should not hard-fail on config parse errors (#143)")
+            })
         });
 
         // Config-shape errors still populate config_load_error.
@@ -22414,8 +22531,11 @@ mod tests {
         git(&["add", "tracked.txt"], &workspace);
         git(&["commit", "-m", "init", "--quiet"], &workspace);
 
-        let loader = ConfigLoader::default_for(&workspace);
-        let config = loader.load().expect("config should load");
+        let config_home = temp_workspace("boot-preflight-config-home");
+        trust_project_config(&workspace, &config_home);
+        let config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("config should load");
         let status = super::run_git_capture_in(&workspace, &["status", "--short", "--branch"]);
         let snapshot = super::build_boot_preflight_snapshot(
             &workspace,
@@ -23507,18 +23627,46 @@ UU conflicted.rs",
             "{}: nothing was shown",
             runtime::THINKING_CUT_OFF_PROMPT
         ));
-        let body = super::thinking_off_after_cut_off("local/qwen36-35b-a3b", &after_cut_off);
+        let body = super::local_thinking_controls("local/qwen36-35b-a3b", &after_cut_off);
         assert_eq!(
             body["chat_template_kwargs"],
             serde_json::json!({ "enable_thinking": false })
         );
+        assert!(!body.contains_key("thinking_budget_tokens"));
+        assert!(super::local_thinking_controls("openrouter/a/b:free", &after_cut_off).is_empty());
         assert!(
-            super::thinking_off_after_cut_off("openrouter/a/b:free", &after_cut_off).is_empty()
+            super::local_thinking_controls("openrouter/a/b:free", &request("fix it")).is_empty()
         );
+    }
+
+    #[test]
+    fn local_models_get_a_thinking_budget_inside_the_reply_budget() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_THINKING_BUDGET");
+        let request = runtime::ApiRequest {
+            system_prompt: Vec::new(),
+            messages: vec![runtime::ConversationMessage::user_text(
+                "fix it".to_string(),
+            )],
+        };
+        let model = "local/qwen36-35b-a3b";
+        let reply = i64::from(super::reply_budget(model));
+        let budget = super::local_thinking_controls(model, &request)["thinking_budget_tokens"]
+            .as_i64()
+            .expect("budget sent");
         assert!(
-            super::thinking_off_after_cut_off("local/qwen36-35b-a3b", &request("fix it"))
-                .is_empty()
+            budget > 0 && budget <= reply - 1_024,
+            "{budget} vs reply {reply}"
         );
+
+        std::env::set_var("CLAW_THINKING_BUDGET", "-1");
+        assert!(super::local_thinking_controls(model, &request).is_empty());
+        std::env::set_var("CLAW_THINKING_BUDGET", "999999999");
+        let capped = super::local_thinking_controls(model, &request)["thinking_budget_tokens"]
+            .as_i64()
+            .expect("budget sent");
+        assert_eq!(capped, reply - 1_024);
+        std::env::remove_var("CLAW_THINKING_BUDGET");
     }
 
     #[test]

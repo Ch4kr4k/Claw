@@ -136,6 +136,7 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
     .expect("local config should write");
 
     // when
+    trust_project_config(&project_dir, &config_home);
     let output = run_claw_with_env(
         &project_dir,
         &[
@@ -647,6 +648,16 @@ fn run_claw_with_env(current_dir: &Path, args: &[&str], envs: &[(&str, &str)]) -
         command.env(key, value);
     }
     command.output().expect("claw should launch")
+}
+
+/// The user approving the workspace's config files with `claw trust`; these
+/// tests are about what the files set, not about the trust gate. The config
+/// home must be outside the workspace, which cannot vouch for itself.
+fn trust_project_config(cwd: &Path, config_home: &Path) {
+    let loader = runtime::ConfigLoader::new(cwd, config_home);
+    for file in loader.untrusted_files() {
+        loader.trust(&file).expect("trust project config");
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

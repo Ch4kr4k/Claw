@@ -35,6 +35,43 @@ const UNCHANGED_READ_NOTE: &str = "[Unchanged: your earlier read of these same l
      in this conversation, above. Use it instead of reading again; to see other lines, pass a \
      different offset and limit.]";
 
+/// How many times in a row one call (same tool, same input) may return the
+/// same result in a turn before it is no longer run. Repeating a call that
+/// changed nothing is a loop; `cargo test` after an edit gives a new result
+/// and is never stopped.
+const REPEATED_CALL_LIMIT: u32 = 3;
+
+const REPEATED_CALL_NOTE: &str = "Not run: you already made this exact call several times this \
+     turn and it returned the same result each time. Repeating it will not change anything. \
+     Use the result you have, try a different approach, or answer the user with what you \
+     found.";
+
+/// Counts how many times in a row the call `key` returned this same result.
+fn note_repeated_call(
+    repeated_calls: &mut BTreeMap<(String, String), (u64, u32)>,
+    key: (String, String),
+    message: &ConversationMessage,
+) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for block in &message.blocks {
+        if let ContentBlock::ToolResult {
+            output, is_error, ..
+        } = block
+        {
+            output.hash(&mut hasher);
+            is_error.hash(&mut hasher);
+        }
+    }
+    let result = hasher.finish();
+    let entry = repeated_calls.entry(key).or_insert((result, 0));
+    if entry.0 == result {
+        entry.1 += 1;
+    } else {
+        *entry = (result, 1);
+    }
+}
+
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -596,6 +633,8 @@ where
         let mut iterations = 0;
         let mut auto_compaction = None;
         let mut cut_off_continuations = 0;
+        // (tool, input) -> (hash of its last result, times in a row it was that).
+        let mut repeated_calls: BTreeMap<(String, String), (u64, u32)> = BTreeMap::new();
 
         loop {
             iterations += 1;
@@ -727,8 +766,17 @@ where
             for group in groups {
                 let mut prepared = Vec::with_capacity(group.len());
                 for (tool_use_id, tool_name, input) in group {
-                    let (pre_hook_result, effective_input, outcome) =
+                    let (pre_hook_result, effective_input, mut outcome) =
                         self.authorize_tool_use(&tool_name, &input, prompter.as_deref_mut());
+                    if outcome == PermissionOutcome::Allow
+                        && repeated_calls
+                            .get(&(tool_name.clone(), effective_input.clone()))
+                            .is_some_and(|(_, times)| *times >= REPEATED_CALL_LIMIT)
+                    {
+                        outcome = PermissionOutcome::Deny {
+                            reason: REPEATED_CALL_NOTE.to_string(),
+                        };
+                    }
                     prepared.push(PreparedToolUse {
                         tool_use_id,
                         tool_name,
@@ -769,7 +817,9 @@ where
                             let result = results.next().unwrap_or_else(|| {
                                 Err(ToolError::new("tool executor returned no result"))
                             });
+                            let key = (call.tool_name.clone(), call.effective_input.clone());
                             let mut message = self.finish_tool_use(call, result);
+                            note_repeated_call(&mut repeated_calls, key, &message);
                             self.note_unchanged_read(&mut message);
                             message
                         }
@@ -2210,6 +2260,61 @@ mod tests {
             self.requests.push(request);
             Ok(self.replies.remove(0))
         }
+    }
+
+    #[test]
+    fn a_call_that_keeps_returning_the_same_result_stops_running() {
+        let call = |id: &str, command: &str| {
+            vec![
+                AssistantEvent::ToolUse {
+                    id: id.to_string(),
+                    name: "bash".to_string(),
+                    input: format!(r#"{{"command":"{command}"}}"#),
+                },
+                AssistantEvent::MessageStop,
+            ]
+        };
+        // `ls` four times with the same result; `cargo test` four times with
+        // a new result each time (an edit between runs).
+        let mut replies: Vec<_> = (0..4).map(|i| call(&format!("l{i}"), "ls")).collect();
+        replies.extend((0..4).map(|i| call(&format!("t{i}"), "cargo test")));
+        replies.push(vec![
+            AssistantEvent::TextDelta("done".to_string()),
+            AssistantEvent::MessageStop,
+        ]);
+        let runs = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = runs.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CutOffApi {
+                replies,
+                requests: Vec::new(),
+            },
+            StaticToolExecutor::new().register("bash", move |input| {
+                seen.borrow_mut().push(input.to_string());
+                let count = seen.borrow().len();
+                Ok(if input.contains("ls") {
+                    "a b".to_string()
+                } else {
+                    format!("{count} passed")
+                })
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("fix it", None).expect("turn runs");
+
+        let ls_runs = runs.borrow().iter().filter(|i| i.contains("ls")).count();
+        assert_eq!(ls_runs, super::REPEATED_CALL_LIMIT as usize);
+        assert_eq!(runs.borrow().len(), super::REPEATED_CALL_LIMIT as usize + 4);
+        let stopped = summary.tool_results.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { output, is_error: true, .. }
+                    if output.contains("Not run: you already made this exact call"))
+            })
+        });
+        assert!(stopped);
     }
 
     #[test]

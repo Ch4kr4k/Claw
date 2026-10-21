@@ -48,7 +48,7 @@ Upstream claw-code is a general harness that mostly targets hosted APIs. This fo
 
 ```bash
 llama-server -m Qwen3.6-35B-A3B-Q4_K_M.gguf --alias local/qwen3.6-35b-a3b \
-  --host 127.0.0.1 --port 8080 --jinja -c 16384 \
+  --host 127.0.0.1 --port 8080 --jinja -c 65536 \
   -ngl 99 -ncmoe 99 -fa on -ctk q8_0 -ctv q8_0   # MoE experts in RAM, rest on the GPU
 ```
 
@@ -64,7 +64,7 @@ scripts/install-local.sh            # release build, installs `claw` to ~/.local
 
 ```bash
 export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
-export CLAW_CONTEXT_WINDOW=16384    # match llama-server's -c; shown in the status line
+export CLAW_CONTEXT_WINDOW=65536    # match llama-server's -c; shown in the status line
 claw --model local/qwen3.6-35b-a3b
 ```
 

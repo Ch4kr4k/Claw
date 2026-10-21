@@ -133,7 +133,7 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
 fn config_command_loads_defaults_from_standard_config_locations() {
     // given
     let temp_dir = unique_temp_dir("config-defaults");
-    let config_home = temp_dir.join("home").join(".claw");
+    let config_home = unique_temp_dir("config-defaults-home").join(".claw");
     fs::create_dir_all(temp_dir.join(".claw")).expect("project config dir should exist");
     fs::create_dir_all(&config_home).expect("home config dir should exist");
 
@@ -146,6 +146,7 @@ fn config_command_loads_defaults_from_standard_config_locations() {
         r#"{"model":"opus"}"#,
     )
     .expect("write local settings");
+    trust_project_config(&temp_dir, &config_home);
     let session_path = write_session(&temp_dir, "config-defaults");
 
     // when
@@ -338,6 +339,16 @@ fn assert_success(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The user approving the workspace's config files with `claw trust`; these
+/// tests are about what the files set, not about the trust gate. The config
+/// home must be outside the workspace, which cannot vouch for itself.
+fn trust_project_config(cwd: &Path, config_home: &Path) {
+    let loader = runtime::ConfigLoader::new(cwd, config_home);
+    for file in loader.untrusted_files() {
+        loader.trust(&file).expect("trust project config");
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

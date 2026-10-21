@@ -473,7 +473,8 @@ section and switches the permission mode to read-only until `/plan off`.
 | Sessions | `.claw/sessions/` in the workspace (JSONL, resumable with `--resume`) |
 | Checkpoints | Shadow git repo `~/.claw/checkpoints/<hash>.git` whose work tree is the project; the project's own `.git` is never touched. Disabled for `$HOME`, `/`, huge folders, missing git, or `CLAW_SNAPSHOTS=0` |
 | Background jobs | In memory (`runtime/src/background_jobs.rs`); output buffered up to 1 MB per job; killed when the REPL exits |
-| Project config | `.claw.json`, `.claw/settings.json`, `.claw/settings.local.json` (see [`USAGE.md`](./USAGE.md#config-file-resolution-order)) |
+| Project config | `.claw.json`, `.claw/settings.json`, `.claw/settings.local.json` (see [`USAGE.md`](./USAGE.md#config-file-resolution-order)); only presentation keys apply until trusted |
+| Project config trust | `~/.claw/trusted-project-configs.json` (mode 0600): canonical path → SHA-256 of the parsed file, written only by `claw trust` and user edits through claw (`runtime/src/project_trust.rs`) |
 | Known workspaces | `~/.claw/workspaces.txt`: every folder claw started a session in, for the desktop app |
 | Desktop app state | `~/.claw/desktop.json` (projects, chat titles, which sessions the app started, preferences, scheduled tasks); project instructions in `<folder>/.claw/instructions.md`; skills, MCP servers and turned-off tools go to claw's own `~/.claw/skills` and `~/.claw/settings.json` |
 
@@ -570,6 +571,21 @@ are canonicalized and must exist. Network isolation is probed with `--unshare-ne
 when requested. Missing backends, invalid mounts and denied namespaces fail
 closed. There is no unshare/plain-shell fallback or fake-root Portage environment.
 
+As in Claude Code, the sandbox confines writes, not reads: the environment and
+readable host files are inherited. Mounts are applied in order: read-only root,
+writable roots, then the paths that execute later outside the sandbox
+(`.git/hooks`, `.git/config`, `.envrc`, claw's project config) read-only inside
+each writable root. The file-writing tools run in claw itself, so
+`PermissionPolicy` requires full access for writes to those same paths.
+`sandbox.excludedCommands` (`SandboxConfig::excludes`) runs a command on the
+host when every simple command in it starts with an entry; a sandboxed command
+that fails on a refused write gets a note telling the model to request a host
+run (`dangerouslyDisableSandbox`).
+
+Project config files are gated in `ConfigLoader` (`project_trust`): until the
+user approves a file's exact content, only presentation keys are merged, so a
+cloned repository cannot turn the sandbox off or add hooks and MCP servers.
+
 `PermissionPolicy` treats Bash `dangerouslyDisableSandbox: true` as a separate
 host permission request, after deny rules and before allow rules/mode shortcuts.
 The CLI distinguishes this prompt and binds remembered host approvals to the full
@@ -582,5 +598,7 @@ per-call override fields. Background jobs use the same checked launcher.
 
 The parent Claw process is the host executor; it is not itself launched inside the
 per-command sandbox. An outer sandbox on Claw still applies to host requests.
-This boundary covers Bash writes and requested network namespaces, not every tool
-or confidentiality of host files. Other tools retain their own permission checks.
+This boundary covers Bash writes and requested network namespaces, not
+confidentiality of host files; localhost stays reachable without network
+isolation. Other tools retain their own permission
+checks.

@@ -110,7 +110,7 @@ pub async fn download_post(
         if graphql::is_stale_doc_id_failure(failure) {
             cache::delete_cached_operation(cache_file, TARGET_OPERATION_NAME).await;
         } else {
-            return Err(describe_terminal_failure(failure));
+            return Err(describe_terminal_failure(failure, cookies.is_some()));
         }
     }
 
@@ -142,17 +142,33 @@ pub async fn download_post(
 
     Err(describe_terminal_failure(
         graphql::classify_graphql_failure(&result),
+        cookies.is_some(),
     ))
 }
 
-fn describe_terminal_failure(failure: types::GraphQlFailure) -> String {
+fn describe_terminal_failure(failure: types::GraphQlFailure, logged_in: bool) -> String {
     use types::GraphQlFailure::*;
     match failure {
         RateLimited => "Instagram rate-limited this request — try again later".to_string(),
         LoginRequired => "Instagram is requiring a logged-in session to view this post".to_string(),
         MediaUnavailable => "post unavailable, private, or deleted".to_string(),
-        // Not a login problem: an id Instagram does not know, or a change
-        // in its web API. The old wording sent a model off to set up cookies.
+        // Reached only after a fresh doc_id discovery, so the query itself is
+        // current. Confirmed live: logged out, a deleted, private or
+        // login-only post and a made-up shortcode all get the identical
+        // `execution error` on `xdt_api__v1__media__shortcode__web_info`,
+        // so the message has to cover both readings.
+        ExecutionError if logged_in => "Instagram did not return the post even with the saved \
+             login (~/.claw/cookies/instagram.txt): the link may be wrong, the post deleted, or \
+             that account unable to see it; if the cookies are old, export them again"
+            .to_string(),
+        ExecutionError => {
+            "Instagram did not return the post to a logged-out visitor: either the link \
+             is wrong, the post deleted, or it is private or shown only to logged-in users \
+             (Instagram answers both the same way). If it opens in a browser where you are logged \
+             in, export that browser's instagram.com cookies (Netscape format) to \
+             ~/.claw/cookies/instagram.txt and try again"
+                .to_string()
+        }
         other => format!(
             "Instagram did not return the post ({other:?}): check that the link is a post or reel \
              (instagram.com/p/…, /reel/…); if it is, Instagram's web API may have changed"

@@ -487,9 +487,30 @@ sandbox. When a sandboxed command names such a device, its result ends with a
 missing on the machine and can ask to rerun the command on the host. Network access is
 available unless `networkIsolation: true` is set. `namespaceRestrictions: false`
 disables the extra IPC/UTS isolation, not the namespaces needed for enforcement.
-This is a shell write boundary, not a confidentiality boundary: readable host
-files remain readable, and filesystem restrictions alone do not isolate services
-reachable over sockets. It does not sandbox other tools or the Claw process.
+
+As in Claude Code, the sandbox confines **writes**, not reads: commands
+inherit claw's environment (API keys, `SSH_AUTH_SOCK`, `DISPLAY`) and can read
+your home folder, so ssh, git over ssh, docker and GUI programs work as they
+do in your shell. Two things are kept from running outside the sandbox later:
+in the workspace, `.git/hooks`, `.git/config`, `.envrc`, `.claw.json` and
+`.claw/settings*.json` are read-only, so a command cannot plant something that
+runs on your next `git commit`, `git status`, `cd` or claw start. `git add`,
+`commit`, `status`, `log` and `push` work; `git config` does not.
+`write_file`/`edit_file` run in claw itself, so writing those paths (anything
+under `.git`) asks first, in every mode below full access.
+
+When a sandboxed command fails on a write the sandbox refuses (`Read-only file
+system`, `Permission denied`, `Operation not permitted`), its result tells the
+model so, and the model asks you to rerun it on the host (below).
+`sandbox.excludedCommands` lists commands that always run on the host, for
+example `["docker", "git config", "npm publish"]`: an entry matches a command
+that starts with it as whole words, and only when every command in the line
+matches (`docker ps` runs on the host, `docker ps; rm -rf ~` does not).
+Ordinary Bash permissions still apply to them. Network access stays on unless
+`networkIsolation: true`, so `localhost` services remain reachable. Don't
+start claw in your home folder: the whole home folder then becomes the
+writable workspace. The sandbox covers shell commands only, not other tools or
+the Claw process.
 
 `/sandbox` probes the requested setup, including network isolation and mount roots.
 If it cannot be enforced, shell execution stops with an error. It never silently
@@ -1029,6 +1050,18 @@ Settings merge in this order, later files winning:
 4. `<repo>/.claw/settings.json`
 5. `<repo>/.claw/settings.local.json` (personal, not committed)
 
+**Project files need your approval.** Files 3–5 come with whatever directory
+claw starts in: a cloned repository or a downloaded archive can ship them.
+Until you trust a file, claw uses only its presentation keys (`theme`,
+`editorMode`, `viewMode`, `outputStyle`, `diffPanel`, `scrollSpeed`,
+`autoCompactWindow`, `overflowToolResultChars`) and warns about the rest
+(hooks, MCP servers, sandbox, permissions, model and provider settings, ...).
+Run `claw trust` in the directory: it shows each such file and asks before
+trusting it. Trust is pinned to the file's content (recorded in
+`~/.claw/trusted-project-configs.json`), so any later change, by anyone,
+needs a new approval. Edits you make through claw (`/permissions`, `/config`,
+`/auto-mode-setup`, `/init`) keep a file trusted when it was trusted before.
+
 **Every key.** `~/.claw/settings.json` can list all of them; `null` means
 "not set" (the default applies, and a lower file's value is kept), so a full
 file works as a template.
@@ -1045,7 +1078,7 @@ file works as a template.
 | `customProviders` | `{id: {baseUrl, apiKeyEnv, apiKey, label, maxOutputTokens}}` | Extra OpenAI-compatible providers (`id/model`) |
 | `modelServers` | `{provider: {start, stop, health, stopOnExit}}` | Start/stop a model server (llama-gpu for `local/`) |
 | `permissions` | `{defaultMode, bashApproval, allow, ask, deny, deniedTools}` | Permission mode and rules (section 6) |
-| `sandbox` | `{enabled, namespaceRestrictions (true), networkIsolation (false), filesystemMode ("workspace-only"\|"off"\|"allow-list"), allowedMounts}` | Command sandbox |
+| `sandbox` | `{enabled, namespaceRestrictions (true), networkIsolation (false), filesystemMode ("workspace-only"\|"off"\|"allow-list"), allowedMounts, excludedCommands}` | Command sandbox |
 | `trustedRoots` | `[path]` ([]) | Folders trusted without asking |
 | `hooks` | `{PreToolUse, PostToolUse, PostToolUseFailure: [command]}` | Commands run around tool calls |
 | `env` | `{NAME: value}` | Environment for claw and its commands |
@@ -1106,6 +1139,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_API_CONNECT_TIMEOUT` | Seconds to wait for a connection (default 30) |
 | `CLAW_API_REQUEST_TIMEOUT` | Seconds to wait for the next piece of a reply before giving up (default 300; 1800 for local servers such as Ollama). Long replies that keep streaming are never cut off |
 | `CLAW_REASONING_REPLAY_MAX_CHARS` | How much of each earlier step's thinking (its end) goes back to a `local/` model within a turn; default 4000, `0` for all of it. Hosted models always get all of it |
+| `CLAW_THINKING_BUDGET` | Most tokens a `local/` model may think per reply (llama-server's `thinking_budget_tokens`); default half the reply budget, never more than the reply budget minus 1024; `-1` sends none |
 | `CLAW_DEFER_TOOLS` | `0` sends every tool's full description, instead of listing the specialised tools by name in `ToolSearch` |
 | `CLAW_TOOL_RESULT_MAX_CHARS` | Cap on what one tool call sends to a local model (the launcher sets 12000). Hosted models get a quarter of their context window instead (4k–100k characters). A cut result is saved whole under `~/.claw/tool-output/` (kept a week) and the note tells the model where to read the rest |
 | `CLAW_MODELS_CATALOG=0` | Don't look up hosted models' context and output limits in the models.dev catalog |

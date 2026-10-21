@@ -400,6 +400,10 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
         name: "allowedMounts",
         expected: FieldType::StringArray,
     },
+    FieldSpec {
+        name: "excludedCommands",
+        expected: FieldType::StringArray,
+    },
 ];
 
 const OAUTH_FIELDS: &[FieldSpec] = &[

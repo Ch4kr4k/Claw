@@ -37,6 +37,7 @@ pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
 mod policy_engine;
+mod project_trust;
 mod prompt;
 pub mod recovery_recipes;
 mod remote;
@@ -101,7 +102,7 @@ pub use config::{
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
     RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    RuntimeProviderConfig, ScopedMcpServerConfig, CLAW_SETTINGS_SCHEMA_NAME,
+    RuntimeProviderConfig, ScopedMcpServerConfig, UntrustedConfigFile, CLAW_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -178,6 +179,7 @@ pub use policy_engine::{
     PolicyAction, PolicyCondition, PolicyDecisionEvent, PolicyDecisionKind, PolicyEngine,
     PolicyEvaluation, PolicyRule, ReconcileReason, ReviewStatus,
 };
+pub use project_trust::trust_store_path;
 pub use prompt::{
     load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
     ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,

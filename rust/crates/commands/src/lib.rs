@@ -5723,6 +5723,14 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// The user approving the workspace's config files (`claw trust`); these
+    /// tests are about what the files set, not about the trust gate.
+    fn trust_project_config(loader: &ConfigLoader) {
+        for file in loader.untrusted_files() {
+            loader.trust(&file).expect("trust project config");
+        }
+    }
+
     fn temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7224,6 +7232,7 @@ mod tests {
         .expect("write local settings");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
+        trust_project_config(&loader);
         let list = super::render_mcp_report_for(&loader, &workspace, None)
             .expect("mcp list report should render");
         assert!(list.contains("Configured servers 2"));
@@ -7303,6 +7312,7 @@ mod tests {
         .expect("write local settings");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
+        trust_project_config(&loader);
         let list =
             render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
         assert_eq!(list["kind"], "mcp");
@@ -7366,6 +7376,7 @@ mod tests {
         .expect("write malformed .claw.json");
 
         let loader = ConfigLoader::new(&workspace, &config_home);
+        trust_project_config(&loader);
         // list action: must return Ok (not Err) with degraded envelope.
         let list = render_mcp_report_json_for(&loader, &workspace, None)
             .expect("mcp list should not hard-fail on config parse errors (#144)");

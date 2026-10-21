@@ -1746,7 +1746,11 @@ mod tests {
             "                ]",
             "            }",
             "        })",
+            // Exit on the next request, unanswered: exiting right away raced
+            // the next call, and a child already gone is restarted before
+            // the call instead of failing it.
             "        if EXIT_AFTER_TOOLS_LIST:",
+            "            read_message()",
             "            raise SystemExit(0)",
             "    elif method == 'tools/call':",
             "        if FAIL_ONCE_MODE == 'tool_call_disconnect' and should_fail_once():",

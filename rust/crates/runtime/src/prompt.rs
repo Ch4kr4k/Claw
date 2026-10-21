@@ -1584,6 +1584,14 @@ mod tests {
             r#"{"rulesImport":"none"}"#,
         )
         .expect("write settings");
+        // The user has approved this project file (the gate is tested in
+        // config); this test is about rulesImport. The config home must be
+        // outside the workspace, which cannot vouch for itself.
+        let config_home = temp_dir();
+        let loader = crate::ConfigLoader::new(&root, &config_home);
+        for file in loader.untrusted_files() {
+            loader.trust(&file).expect("trust project config");
+        }
 
         let _guard = env_lock();
         ensure_valid_cwd();
@@ -1592,7 +1600,7 @@ mod tests {
         let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
         let original_claude_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("HOME", &root);
-        std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::set_var(
             "CLAUDE_CONFIG_DIR",
             std::path::Path::new(&root.join("missing-home")).join("claude-home"),

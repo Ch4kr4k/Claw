@@ -4362,10 +4362,77 @@ fn duckduckgo_hits(query: &str) -> Result<Vec<SearchHit>, String> {
     Ok(hits)
 }
 
+/// Whether `host` is, or resolves to, an address on this machine or a
+/// private network: loopback, RFC 1918, CGNAT, link-local (cloud metadata at
+/// 169.254.169.254), unique-local IPv6, or the unspecified address. A name
+/// that does not resolve counts as public.
+fn is_private_host(host: &str) -> bool {
+    use std::net::{IpAddr, ToSocketAddrs};
+    fn private(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+                    || (a == 100 && (64..128).contains(&b))
+            }
+            IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80
+                    || v6
+                        .to_ipv4_mapped()
+                        .is_some_and(|v4| private(IpAddr::V4(v4)))
+            }
+        }
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return private(ip);
+    }
+    (host, 0)
+        .to_socket_addrs()
+        .is_ok_and(|mut addrs| addrs.any(|addr| private(addr.ip())))
+}
+
+/// Follows up to 10 redirects, but never from a public address to a private
+/// one: WebFetch runs in claw itself, outside the shell sandbox, so a page
+/// could otherwise send it to `localhost` services or the cloud metadata
+/// endpoint. Asking for a private address directly still works.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let started_public = attempt
+            .previous()
+            .first()
+            .and_then(|url| url.host_str())
+            .is_some_and(|host| !is_private_host(host));
+        let lands_private = attempt.url().host_str().is_none_or(is_private_host);
+        if started_public && lands_private {
+            let target = attempt.url().to_string();
+            attempt.error(format!(
+                "refused a redirect from a public page to a private address ({target}); fetch that address directly if you mean to"
+            ))
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(redirect_policy())
         .user_agent("clawd-rust-tools/0.1")
         .build()
         .map_err(|error| error.to_string())
@@ -8498,6 +8565,15 @@ mod tests {
         let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
         let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
+        // The user has trusted this project file (`claw trust`).
+        let _env = crate::test_env_guard();
+        let config_home = temp_path("config-trust-home");
+        let loader = runtime::ConfigLoader::new(&worktree, &config_home);
+        for file in loader.untrusted_files() {
+            loader.trust(&file).expect("trust project config");
+        }
+        let previous_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
@@ -8507,8 +8583,12 @@ mod tests {
                 "cwd": cwd
                 // trusted_roots intentionally omitted
             }),
-        )
-        .expect("WorkerCreate should succeed");
+        );
+        match previous_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let created = created.expect("WorkerCreate should succeed");
         let output: serde_json::Value = serde_json::from_str(&created).expect("json");
 
         // worktree is under /tmp, so config roots auto-resolve trust
@@ -9222,6 +9302,30 @@ mod tests {
         let titled_output: serde_json::Value = serde_json::from_str(&titled).expect("valid json");
         let titled_summary = titled_output["result"].as_str().expect("result string");
         assert!(titled_summary.contains("Title: Ignored"));
+    }
+
+    #[test]
+    fn private_hosts_are_recognised_for_the_redirect_check() {
+        for host in [
+            "localhost",
+            "api.localhost",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "[::1]",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(super::is_private_host(host), "{host}");
+        }
+        for host in ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "100.128.0.1"] {
+            assert!(!super::is_private_host(host), "{host}");
+        }
     }
 
     #[test]

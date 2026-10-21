@@ -1805,7 +1805,7 @@ fn config_section_json_emits_section_and_value() {
 #[test]
 fn mcp_json_reports_required_optional_and_redacts_secret_values() {
     let root = unique_temp_dir("mcp-required-optional");
-    let config_home = root.join("config-home");
+    let config_home = unique_temp_dir("mcp-required-optional-config-home");
     let home = root.join("home");
     fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
@@ -1834,6 +1834,7 @@ fn mcp_json_reports_required_optional_and_redacts_secret_values() {
     )
     .expect("mcp config should write");
 
+    trust_project_config(&root, &config_home);
     let envs = [
         (
             "CLAW_CONFIG_HOME",
@@ -1924,6 +1925,7 @@ fn mcp_degraded_config_and_failed_usage_are_distinct_json_contracts() {
         }"#,
     )
     .expect("malformed mcp config should write");
+    trust_project_config(&workspace, &config_home);
     let envs = [
         (
             "CLAW_CONFIG_HOME",
@@ -2249,7 +2251,7 @@ fn status_deduplicates_config_deprecation_warnings_per_invocation_425() {
 #[test]
 fn config_json_attributes_precedence_and_shadowed_keys_425() {
     let root = unique_temp_dir("config-precedence-425");
-    let config_home = root.join("config-home");
+    let config_home = unique_temp_dir("config-precedence-425-config-home");
     let home = root.join("home");
     fs::create_dir_all(root.join(".claw")).expect("workspace config should exist");
     fs::create_dir_all(&config_home).expect("config home should exist");
@@ -2265,6 +2267,7 @@ fn config_json_attributes_precedence_and_shadowed_keys_425() {
     )
     .expect("project settings fixture should write");
 
+    trust_project_config(&root, &config_home);
     let envs = [
         (
             "CLAW_CONFIG_HOME",
@@ -2727,6 +2730,16 @@ fn hermetic(bin: &str) -> Command {
         .env_remove("CLAW_LOCAL_API_KEY")
         .env_remove("CLAW_SEARXNG_URL");
     command
+}
+
+/// The user approving the workspace's config files with `claw trust`; these
+/// tests are about what the files set, not about the trust gate. The config
+/// home must be outside the workspace, which cannot vouch for itself.
+fn trust_project_config(cwd: &Path, config_home: &Path) {
+    let loader = runtime::ConfigLoader::new(cwd, config_home);
+    for file in loader.untrusted_files() {
+        loader.trust(&file).expect("trust project config");
+    }
 }
 
 fn unique_temp_dir(label: &str) -> PathBuf {

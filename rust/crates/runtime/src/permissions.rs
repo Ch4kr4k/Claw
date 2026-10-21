@@ -211,9 +211,10 @@ impl PermissionPolicy {
         // memory folder counts as inside, so keeping memories never asks.
         if FILE_WRITING_TOOLS.contains(&tool_name)
             && extract_permission_subject(input).is_some_and(|path| {
-                !path_inside_cwd(&path)
+                (!path_inside_cwd(&path)
                     && !crate::memory::is_memory_path(&path)
-                    && path_exists_from_cwd(&path)
+                    && path_exists_from_cwd(&path))
+                    || runs_outside_the_sandbox(&path)
             })
         {
             return base.max(PermissionMode::DangerFullAccess);
@@ -714,6 +715,28 @@ const FILE_WRITING_TOOLS: &[&str] = &[
     "write_xlsx",
 ];
 
+/// Whether writing `path` plants something that runs on the host later,
+/// outside the sandbox: anything under `.git` (hooks, `core.hooksPath`,
+/// `core.fsmonitor`), direnv's `.envrc`, or claw's own project config and
+/// trust store (`claw trust`). The
+/// sandbox mounts these read-only for shell commands; the file tools run in
+/// claw itself, so they ask instead.
+fn runs_outside_the_sandbox(path: &str) -> bool {
+    let path = crate::expand_home(path);
+    let names = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let file = names.last().copied().unwrap_or_default();
+    let parent = names.len().checked_sub(2).map(|index| names[index]);
+    names.contains(&".git")
+        || matches!(
+            file,
+            ".envrc" | ".claw.json" | "trusted-project-configs.json"
+        )
+        || (parent == Some(".claw") && file.starts_with("settings"))
+}
+
 /// Whether `path` (`~` expanded, relative to the current directory) exists.
 /// A dangling symlink counts: writing through it would change something.
 fn path_exists_from_cwd(path: &str) -> bool {
@@ -770,7 +793,7 @@ fn path_inside_cwd(path: &str) -> bool {
 /// The simple commands in a shell line: split at `;`, `&`, `|`, newlines,
 /// subshells and quotes, with leading `VAR=value` assignments and wrappers
 /// such as `env`, `time` and `nohup` removed.
-fn shell_command_segments(command: &str) -> Vec<String> {
+pub(crate) fn shell_command_segments(command: &str) -> Vec<String> {
     const WRAPPERS: &[&str] = &[
         "env", "time", "nohup", "nice", "exec", "command", "builtin", "xargs", "then", "do", "else",
     ];
@@ -1375,6 +1398,45 @@ mod tests {
             policy.authorize("WebFetch", r#"{"url":"https://x"}"#, None),
             PermissionOutcome::Deny { ref reason } if reason.contains("denied by rule")
         ));
+    }
+
+    #[test]
+    fn writing_files_that_run_on_the_host_later_needs_approval() {
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("edit_file", PermissionMode::WorkspaceWrite);
+        let input = |path: &str| serde_json::json!({ "path": path, "content": "x" }).to_string();
+        for path in [
+            ".git/hooks/pre-commit",
+            ".git/config",
+            "sub/.git/hooks/post-checkout",
+            ".envrc",
+            ".claw.json",
+            ".claw/settings.json",
+            ".claw/settings.local.json",
+        ] {
+            for tool in ["write_file", "edit_file"] {
+                assert!(
+                    matches!(
+                        policy.authorize(tool, &input(path), None),
+                        PermissionOutcome::Deny { ref reason } if reason.contains("requires approval")
+                    ),
+                    "{tool} {path}"
+                );
+            }
+        }
+        for path in [
+            "src/git.rs",
+            ".gitignore",
+            ".claw/skills/x/SKILL.md",
+            "envrc",
+        ] {
+            assert_eq!(
+                policy.authorize("write_file", &input(path), None),
+                PermissionOutcome::Allow,
+                "{path}"
+            );
+        }
     }
 
     #[test]

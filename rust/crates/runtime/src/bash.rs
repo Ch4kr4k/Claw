@@ -341,6 +341,14 @@ async fn execute_bash_async(
             stderr.push_str(&note);
         }
     }
+    if sandbox_status.active && status.code() != Some(0) {
+        if let Some(note) = sandbox_block_note(&stderr) {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(note);
+        }
+    }
     if status.code() != Some(0) {
         if let Some(note) = no_terminal_note(&stdout, &stderr) {
             if !stderr.is_empty() && !stderr.ends_with('\n') {
@@ -513,8 +521,11 @@ fn sandbox_status_for_input(
         .clone();
     let baseline = config.resolve_request(None, None, None, None, None);
     validate_sandbox_overrides(input, &baseline)?;
+    // `sandbox.excludedCommands` run on the host, as the user configured;
+    // ordinary Bash permissions still apply to them.
+    let excluded = config.excludes(&input.command).then_some(false);
     let request = config.resolve_request(
-        input.dangerously_disable_sandbox.map(|disabled| !disabled),
+        excluded.or(input.dangerously_disable_sandbox.map(|disabled| !disabled)),
         input.namespace_restrictions,
         input.isolate_network,
         input.filesystem_mode,
@@ -951,6 +962,19 @@ fn hidden_device_note(command: &str) -> Option<String> {
     ))
 }
 
+/// A note for a sandboxed command that failed on a write the sandbox
+/// refuses, so the model asks to rerun it on the host (as Claude Code does)
+/// instead of working around it or giving up.
+fn sandbox_block_note(stderr: &str) -> Option<&'static str> {
+    let lower = stderr.to_lowercase();
+    let blocked = lower.contains("read-only file system")
+        || lower.contains("operation not permitted")
+        || (lower.contains("permission denied") && !lower.contains("permission denied (publickey"));
+    blocked.then_some(
+        "[sandbox] This command ran in claw's sandbox, where only the workspace (and /tmp) is writable and .git/hooks, .git/config, .envrc and claw's settings files are read-only, so this failure may come from the sandbox rather than the machine. If the command is needed, rerun the same command with dangerouslyDisableSandbox=true: the user is asked to approve running it on the host.",
+    )
+}
+
 /// A note for a command that failed because it wanted a terminal to ask
 /// the user something (`emerge --ask`, `sudo` asking for a password, ...).
 /// Commands run with stdin closed and no terminal, so the model should
@@ -1023,6 +1047,17 @@ mod truncation_tests {
     #[test]
     fn no_device_note_for_devices_the_sandbox_provides() {
         assert_eq!(super::hidden_device_note("cargo build 2>/dev/null"), None);
+        assert!(super::sandbox_block_note(
+            "error: could not lock config file .git/config: Read-only file system"
+        )
+        .is_some());
+        assert!(
+            super::sandbox_block_note("touch: cannot touch '/etc/x': Permission denied").is_some()
+        );
+        assert!(
+            super::sandbox_block_note("git@github.com: Permission denied (publickey).").is_none()
+        );
+        assert!(super::sandbox_block_note("error[E0425]: cannot find value").is_none());
         assert_eq!(
             super::hidden_device_note("head -c8 /dev/urandom > /dev/stderr; tty </dev/pts/0"),
             None

@@ -67,6 +67,19 @@ pub(crate) struct InitReport {
 }
 
 impl InitReport {
+    /// Approves the config files this init just created (see `claw trust`):
+    /// the user asked for them and the content is claw's own starter.
+    pub(crate) fn trust_created_config(&self) {
+        let loader = runtime::ConfigLoader::default_for(&self.project_root);
+        for artifact in &self.artifacts {
+            if artifact.status == InitStatus::Created
+                && matches!(artifact.name, ".claw.json" | ".claw/settings.json")
+            {
+                let _ = loader.trust_user_edit(&self.project_root.join(artifact.name));
+            }
+        }
+    }
+
     #[must_use]
     pub(crate) fn render(&self) -> String {
         let mut lines = vec![

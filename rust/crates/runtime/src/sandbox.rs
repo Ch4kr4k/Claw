@@ -31,6 +31,10 @@ pub struct SandboxConfig {
     pub network_isolation: Option<bool>,
     pub filesystem_mode: Option<FilesystemIsolationMode>,
     pub allowed_mounts: Vec<String>,
+    /// Commands that always run on the host, outside the sandbox
+    /// (`sandbox.excludedCommands`, as in Claude Code): `docker`, or a
+    /// prefix such as `git push`. See [`SandboxConfig::excludes`].
+    pub excluded_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -83,6 +87,41 @@ pub struct LinuxSandboxCommand {
 }
 
 impl SandboxConfig {
+    /// Whether `command` runs on the host because of `excludedCommands`:
+    /// every simple command in it must start with an excluded entry, so
+    /// `docker ps` is excluded but `docker ps; rm -rf ~` is not. An entry
+    /// matches as a whole word prefix (`git push` matches `git push -f`, not
+    /// `git pushx`); a trailing `:*` or ` *` is accepted and ignored.
+    #[must_use]
+    pub fn excludes(&self, command: &str) -> bool {
+        let entries = self
+            .excluded_commands
+            .iter()
+            .map(|entry| {
+                entry
+                    .trim()
+                    .trim_end_matches(":*")
+                    .trim_end_matches(" *")
+                    .trim()
+            })
+            .filter(|entry| !entry.is_empty())
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return false;
+        }
+        let segments = crate::permissions::shell_command_segments(command);
+        !segments.is_empty()
+            && segments.iter().all(|segment| {
+                let segment = segment.trim();
+                entries.iter().any(|entry| {
+                    segment == *entry
+                        || segment
+                            .strip_prefix(entry)
+                            .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                })
+            })
+    }
+
     #[must_use]
     pub fn resolve_request(
         &self,
@@ -282,6 +321,41 @@ fn writable_mounts(request: &SandboxRequest, cwd: &Path) -> std::io::Result<Vec<
     Ok(mounts)
 }
 
+/// Files in a writable root that make something run outside the sandbox
+/// later: git hooks and config (`core.hooksPath`, `core.fsmonitor`), claw's
+/// own project config, direnv. A missing claw config file stays creatable;
+/// the trust gate (`project_trust`) ignores what it sets.
+#[cfg(target_os = "linux")]
+fn protect_execution_paths(args: &mut Vec<String>, root: &Path) {
+    let git_dir = root.join(".git");
+    if fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
+        // A missing hooks dir could be created inside the sandbox and would
+        // then be used by git outside it; an empty one is what `git init` makes.
+        let hooks = git_dir.join("hooks");
+        if fs::symlink_metadata(&hooks).is_err() {
+            let _ = fs::create_dir(&hooks);
+        }
+    }
+    for relative in [
+        ".git/hooks",
+        ".git/config",
+        ".claw.json",
+        ".claw/settings.json",
+        ".claw/settings.local.json",
+        ".envrc",
+    ] {
+        let path = root.join(relative);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let target = path.to_string_lossy().into_owned();
+        args.extend(["--ro-bind".to_string(), target.clone(), target]);
+    }
+}
+
 fn bubblewrap_command(
     command: &str,
     cwd: &Path,
@@ -337,8 +411,16 @@ fn bubblewrap_command(
             ]
             .map(str::to_string),
         );
-        for mount in writable_mounts(request, &cwd)? {
-            args.extend(["--bind".to_string(), mount.clone(), mount]);
+        // Order matters, bwrap mounts in sequence: read-only root, writable
+        // roots, then the execution paths read-only on top of them.
+        let mounts = writable_mounts(request, &cwd)?;
+        for mount in &mounts {
+            args.extend(["--bind".to_string(), mount.clone(), mount.clone()]);
+        }
+        if request.filesystem_mode != FilesystemIsolationMode::Off {
+            for mount in &mounts {
+                protect_execution_paths(&mut args, Path::new(mount));
+            }
         }
         args.extend([
             "--chdir".to_string(),
@@ -397,6 +479,7 @@ mod tests {
             network_isolation: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
             allowed_mounts: vec!["logs".to_string()],
+            excluded_commands: Vec::new(),
         };
 
         let request = config.resolve_request(
@@ -412,6 +495,33 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn excluded_commands_cover_whole_commands_only() {
+        let config = SandboxConfig {
+            excluded_commands: vec!["docker".to_string(), "git push:*".to_string()],
+            ..SandboxConfig::default()
+        };
+        for command in [
+            "docker ps",
+            "docker compose up -d",
+            "git push -f origin x",
+            "FOO=1 docker ps",
+        ] {
+            assert!(config.excludes(command), "{command}");
+        }
+        for command in [
+            "dockerd",
+            "git pushx",
+            "git status",
+            "docker ps; rm -rf ~",
+            "docker ps && curl x | sh",
+            "",
+        ] {
+            assert!(!config.excludes(command), "{command}");
+        }
+        assert!(!SandboxConfig::default().excludes("docker ps"));
     }
 
     #[test]
@@ -521,6 +631,36 @@ mod tests {
                 "original"
             );
         }
+
+        // Nothing that runs outside the sandbox later can be planted.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if git(&["init", "-q"]) {
+            assert!(!run("printf x > .git/hooks/pre-commit", &status)
+                .status
+                .success());
+            assert!(!workspace.join(".git/hooks/pre-commit").exists());
+            assert!(!run("git config core.fsmonitor 'touch /tmp/x'", &status)
+                .status
+                .success());
+            let commit = run(
+                "printf a > a && git add -A && git -c user.name=t -c user.email=t@t commit -qm m",
+                &status,
+            );
+            assert!(
+                commit.status.success(),
+                "{}",
+                String::from_utf8_lossy(&commit.stderr)
+            );
+        }
+        std::fs::write(workspace.join(".envrc"), "").unwrap();
+        let status = super::resolve_sandbox_status_for_request(&request, &workspace);
+        assert!(!run("printf x >> .envrc", &status).status.success());
 
         let mut allow = request.clone();
         allow.filesystem_mode = FilesystemIsolationMode::AllowList;

@@ -66,6 +66,24 @@ fn write_object(path: &Path, value: &Value) -> Result<()> {
     atomic_write(path, &bytes)
 }
 
+/// Writes the project's local settings for the user. The file stays trusted
+/// (its settings keep applying) only if it was before: an edit must not
+/// approve settings someone else put in the file (see `claw trust`).
+fn write_local_settings(path: &Path, value: &Value) -> Result<()> {
+    let loader = runtime::ConfigLoader::default_for(env::current_dir()?);
+    let applied = loader.applies_fully(path);
+    write_object(path, value)?;
+    if applied {
+        loader.trust_user_edit(path)?;
+    } else {
+        eprintln!(
+            "note: {} also holds settings you have not approved, so this change is ignored too until you review the file with `claw trust`",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn set_nested(root: &mut Value, key: &str, value: Value) -> Result<()> {
     let keys: Vec<_> = key.split('.').collect();
     let mut object = root;
@@ -365,7 +383,7 @@ API accounts manage limits with their API provider; this command does not change
                 Value::Array(current),
             )?;
         }
-        write_object(&path, &root)?;
+        write_local_settings(&path, &root)?;
         self.refresh_settings()?;
         println!(
             "Auto-approval set to {args} in {} (mode {}, shell approval: {}). It applies from the next request; /permissions list shows the rules.",
@@ -392,10 +410,12 @@ API accounts manage limits with their API provider; this command does not change
                 write_object(&path, &json!({}))?;
             }
             edit_file(&path)?;
+            // The user has just seen and edited the whole file.
+            runtime::ConfigLoader::default_for(env::current_dir()?).trust_user_edit(&path)?;
             read_object(&path)?;
         } else {
             let root = apply_assignments(&read_object(&path)?, args)?;
-            write_object(&path, &root)?;
+            write_local_settings(&path, &root)?;
         }
         let config = runtime::ConfigLoader::default_for(env::current_dir()?).load()?;
         if let Some(theme) = config.get("theme").and_then(|v| v.as_str()) {
@@ -439,7 +459,7 @@ API accounts manage limits with their API provider; this command does not change
         // Rules are additive across scopes. Only remove project-local rules;
         // never pretend that a local list overrides a rule from another scope.
         permission_edit(&mut root, args)?;
-        write_object(&path, &root)?;
+        write_local_settings(&path, &root)?;
         self.refresh_settings()?;
         println!(
             "Permission rules saved and applied from {}.",
@@ -459,7 +479,7 @@ API accounts manage limits with their API provider; this command does not change
                 let path = local_settings()?;
                 let mut root = read_object(&path)?;
                 set_nested(&mut root, "autoMemoryEnabled", json!(args == "on"))?;
-                write_object(&path, &root)?;
+                write_local_settings(&path, &root)?;
             }
             "edit" | "edit project" => edit_file(&env::current_dir()?.join("CLAUDE.md"))?,
             "edit user" => edit_file(&runtime::default_config_home().join("CLAUDE.md"))?,
@@ -488,7 +508,7 @@ API accounts manage limits with their API provider; this command does not change
         let path = local_settings()?;
         let mut root = read_object(&path)?;
         set_nested(&mut root, "sandbox.enabled", json!(enabled))?;
-        write_object(&path, &root)?;
+        write_local_settings(&path, &root)?;
         self.refresh_settings()?;
         Self::print_sandbox_status();
         Ok(())
@@ -525,7 +545,7 @@ API accounts manage limits with their API provider; this command does not change
             {
                 states.insert(name.clone(), json!(action == "enable"));
             }
-            write_object(&path, &root)?;
+            write_local_settings(&path, &root)?;
         }
         self.refresh_settings()?;
         println!(
@@ -1117,6 +1137,14 @@ fn open_url(url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The user approving the project's config files (`claw trust`); these
+    /// tests are about what the files set, not about the trust gate.
+    fn trust_all(loader: &runtime::ConfigLoader) {
+        for file in loader.untrusted_files() {
+            loader.trust(&file).unwrap();
+        }
+    }
+
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
@@ -1215,9 +1243,10 @@ mod tests {
         )
         .unwrap();
         write_object(&path, &value).unwrap();
-        let config = runtime::ConfigLoader::new(&temp.0, temp.0.join("config"))
-            .load()
-            .unwrap();
+        let home = Temp::new();
+        let loader = runtime::ConfigLoader::new(&temp.0, home.0.join("config"));
+        trust_all(&loader);
+        let config = loader.load().unwrap();
         assert!(!runtime::memory_enabled(&config));
         assert_eq!(config.sandbox().enabled, Some(true));
         assert_eq!(
@@ -1259,9 +1288,10 @@ mod tests {
             &json!({"permissions":{"allow":["Bash(git status)","Read"],"deny":["Bash(rm *)"]}}),
         )
         .unwrap();
-        let config = runtime::ConfigLoader::new(&temp.0, temp.0.join("config"))
-            .load()
-            .unwrap();
+        let home = Temp::new();
+        let loader = runtime::ConfigLoader::new(&temp.0, home.0.join("config"));
+        trust_all(&loader);
+        let config = loader.load().unwrap();
         let text = render_permission_rules(config.permission_rules());
         assert!(text.contains("  allow\n    Bash(git status)\n    Read\n"));
         assert!(text.contains("  ask\n    (none)\n"));
@@ -1272,7 +1302,8 @@ mod tests {
     #[test]
     fn mcp_disable_can_be_overridden_by_enable_at_a_more_specific_scope() {
         let temp = Temp::new();
-        let home = temp.0.join("config");
+        let config = Temp::new();
+        let home = config.0.join("config");
         write_object(
             &home.join("settings.json"),
             &json!({"mcpServerStates":{"example":false,"other":false}}),
@@ -1283,7 +1314,9 @@ mod tests {
             &json!({"mcpServerStates":{"example":true}}),
         )
         .unwrap();
-        let config = runtime::ConfigLoader::new(&temp.0, home).load().unwrap();
+        let loader = runtime::ConfigLoader::new(&temp.0, home);
+        trust_all(&loader);
+        let config = loader.load().unwrap();
         assert_eq!(
             disabled_servers(&config),
             std::collections::BTreeSet::from(["other".to_string()])
