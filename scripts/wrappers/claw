@@ -33,7 +33,7 @@ if [[ "${OPENAI_BASE_URL:-}" == "$CLAW_LOCAL_BASE_URL" ]]; then
 fi
 # Context size of the local server. claw asks llama-server's /props for the
 # real size (-c) and only falls back to this when the server cannot say.
-export CLAW_CONTEXT_WINDOW="${CLAW_CONTEXT_WINDOW:-32768}"
+export CLAW_CONTEXT_WINDOW="${CLAW_CONTEXT_WINDOW:-65536}"
 # A tool result larger than this (about 3k tokens) is cut down before it is
 # sent to the model, so it cannot overflow the local context.
 export CLAW_TOOL_RESULT_MAX_CHARS="${CLAW_TOOL_RESULT_MAX_CHARS:-12000}"

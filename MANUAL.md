@@ -296,7 +296,7 @@ Mention files with `@path` (Tab completes them) so the agent reads them. See
 | Ctrl+C | Stop the reply (same as Esc; the program keeps running) |
 | Typing + Enter | Queue a message. It is passed to the agent before its next step, shown as `> text (sent to the agent)` |
 | Typing without Enter | Kept and pre-filled at the next prompt |
-| Shift+Tab | Pick the next permission mode. The status line shows it with *(after this reply)*; it takes effect when the reply ends |
+| Shift+Tab | Pick the next permission mode. At the prompt the status line changes in place (your typing stays) and the mode applies to what you send next; during a reply it shows *(after this reply)* and takes effect when the reply ends |
 
 At the bottom of the window, a block shows what is happening, what you are
 typing and the status line:
@@ -1140,6 +1140,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_API_REQUEST_TIMEOUT` | Seconds to wait for the next piece of a reply before giving up (default 300; 1800 for local servers such as Ollama). Long replies that keep streaming are never cut off |
 | `CLAW_REASONING_REPLAY_MAX_CHARS` | How much of each earlier step's thinking (its end) goes back to a `local/` model within a turn; default 4000, `0` for all of it. Hosted models always get all of it |
 | `CLAW_THINKING_BUDGET` | Most tokens a `local/` model may think per reply (llama-server's `thinking_budget_tokens`); default half the reply budget, never more than the reply budget minus 1024; `-1` sends none |
+| `WGPU_POWER_PREF` | Which GPU the desktop app draws on: `low` (its default, a laptop's integrated GPU, leaving the discrete GPU's memory to a local model) or `high`. `ICED_BACKEND=tiny-skia` draws on the CPU instead |
 | `CLAW_DEFER_TOOLS` | `0` sends every tool's full description, instead of listing the specialised tools by name in `ToolSearch` |
 | `CLAW_TOOL_RESULT_MAX_CHARS` | Cap on what one tool call sends to a local model (the launcher sets 12000). Hosted models get a quarter of their context window instead (4k–100k characters). A cut result is saved whole under `~/.claw/tool-output/` (kept a week) and the note tells the model where to read the rest |
 | `CLAW_MODELS_CATALOG=0` | Don't look up hosted models' context and output limits in the models.dev catalog |

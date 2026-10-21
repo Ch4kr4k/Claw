@@ -146,6 +146,10 @@ pub fn set_wheel_rows(rows: usize) {
 /// Shift+Tab presses during the current turn. The running turn keeps its
 /// permission mode; the CLI applies the presses when the turn ends.
 static MODE_PRESSES: AtomicU32 = AtomicU32::new(0);
+/// The presses in MODE_PRESSES were made at the idle prompt, not during a
+/// turn: they apply as soon as the prompt returns, so the footer shows the new
+/// mode without "(after this reply)".
+static MODE_PRESSES_IDLE: AtomicBool = AtomicBool::new(false);
 /// Reads the terminal size as `(rows, cols)`; set by the CLI. Without it the
 /// block is laid out for 80 columns.
 static SIZE_PROBE: OnceLock<SizeProbe> = OnceLock::new();
@@ -211,7 +215,11 @@ pub fn footer_status_line(width: usize, colored: bool) -> String {
     let presses = MODE_PRESSES.load(Ordering::SeqCst) as usize;
     let (mode, mode_sgr) = if presses > 0 && !footer.cycle.is_empty() {
         let (mode, sgr) = &footer.cycle[(presses - 1) % footer.cycle.len()];
-        (format!("{mode} (after this reply)"), sgr.clone())
+        if MODE_PRESSES_IDLE.load(Ordering::SeqCst) {
+            (format!("{mode} (shift+tab to cycle)"), sgr.clone())
+        } else {
+            (format!("{mode} (after this reply)"), sgr.clone())
+        }
     } else {
         (footer.mode.clone(), footer.mode_sgr.clone())
     };
@@ -569,7 +577,16 @@ fn terminal_cols() -> usize {
 /// Takes the Shift+Tab presses made during the last turn.
 #[must_use]
 pub fn take_mode_presses() -> u32 {
+    MODE_PRESSES_IDLE.store(false, Ordering::SeqCst);
     MODE_PRESSES.swap(0, Ordering::SeqCst)
+}
+
+/// Shift+Tab at the idle prompt: counted like a press during a turn, so the
+/// line editor only redraws its status line; the REPL applies the presses
+/// when the prompt returns ([`take_mode_presses`]).
+pub fn note_idle_mode_press() {
+    MODE_PRESSES_IDLE.store(true, Ordering::SeqCst);
+    MODE_PRESSES.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Takes the unfinished text typed while the last turn was running.

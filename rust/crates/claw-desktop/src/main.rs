@@ -37,6 +37,13 @@ const MONO: Font = Font::MONOSPACE;
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 pub fn main() -> iced::Result {
+    // Draw on the low-power GPU (a laptop's integrated one) unless told otherwise:
+    // on the discrete GPU the window took 374 MiB that a local model running on a
+    // 4 GB card needs. WGPU_POWER_PREF=high brings it back; ICED_BACKEND=tiny-skia
+    // draws on the CPU.
+    if std::env::var_os("WGPU_POWER_PREF").is_none() {
+        std::env::set_var("WGPU_POWER_PREF", "low");
+    }
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)

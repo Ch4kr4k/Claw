@@ -23,10 +23,11 @@ PRESET="${LLAMA_MODELS_PRESET:-$HOME/.config/llama-gpu/models.ini}"
 
 # Batches of at least this many tokens run the RAM-resident experts on the GPU,
 # which first copies them over PCIe (~20 GB); smaller ones stay on the CPU.
-# llama.cpp's default of 32 makes short follow-up turns slow. llama-bench,
-# Qwen3.6-35B-A3B, -ub 1024: 128 tokens 30 tok/s on the GPU vs 70 on the CPU;
-# 512: 70 vs 85; 768: 89 vs 83 (crossover ~690). Re-measure for a new model.
-export GGML_OP_OFFLOAD_MIN_BATCH="${GGML_OP_OFFLOAD_MIN_BATCH:-640}"
+# llama.cpp's default of 32 makes short follow-up turns slow. Since the fork's
+# CPU MoE kernels (iqk), the CPU is faster at every batch size this preset uses
+# (ubatch 2048), so the experts never go to the GPU: llama-bench, Qwen3.6-35B-A3B,
+# ub 1024, pp2048 112.3 tok/s at 2048 vs 95.8 at the old 640 (2026-10-21).
+export GGML_OP_OFFLOAD_MIN_BATCH="${GGML_OP_OFFLOAD_MIN_BATCH:-4096}"
 
 PORT="${LLAMA_PORT:-8080}"
 if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -48,5 +49,5 @@ fi
 exec "$LLAMA_DIR/build/bin/llama-server" \
     --models-preset "$PRESET" --models-max 1 \
     --host 127.0.0.1 --port "$PORT" \
-    -c "${LLAMA_CONTEXT_LENGTH:-32768}" \
+    -c "${LLAMA_CONTEXT_LENGTH:-65536}" \
     "$@"

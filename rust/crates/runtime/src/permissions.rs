@@ -188,6 +188,11 @@ impl PermissionPolicy {
         self.active_mode
     }
 
+    /// Switches the mode, keeping the rules and tool requirements (Shift+Tab).
+    pub fn set_active_mode(&mut self, mode: PermissionMode) {
+        self.active_mode = mode;
+    }
+
     #[must_use]
     pub fn required_mode_for(&self, tool_name: &str) -> PermissionMode {
         self.tool_requirements

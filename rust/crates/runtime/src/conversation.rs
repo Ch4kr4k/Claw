@@ -356,6 +356,12 @@ where
     }
 
     /// Like [`Self::with_job_notices`], on an existing runtime.
+    /// Switches the permission mode of the policy in use; rules, tool
+    /// requirements and everything else stay as they are.
+    pub fn set_permission_mode(&mut self, mode: crate::permissions::PermissionMode) {
+        self.permission_policy.set_active_mode(mode);
+    }
+
     pub fn set_job_notices(&mut self, deliver: bool) {
         self.deliver_job_notices = deliver;
     }

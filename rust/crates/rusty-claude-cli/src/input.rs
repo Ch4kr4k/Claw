@@ -46,9 +46,6 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
-    /// Shift+Tab: switch to the next permission mode. Carries the text
-    /// typed so far; hand it back with [`LineEditor::restore_draft`].
-    CycleMode(String),
     /// A background shell or agent finished while the prompt was empty: run
     /// a turn so the agent can pick up its result (like Claude Code).
     Wake,
@@ -168,12 +165,6 @@ impl LineEditor {
         }
     }
 
-    /// Puts `text` back into the next prompt, e.g. after a Shift+Tab mode
-    /// switch interrupted typing.
-    pub fn restore_draft(&mut self, text: String) {
-        self.draft = (!text.is_empty()).then_some(text);
-    }
-
     pub fn set_completions(&mut self, completions: Vec<String>) {
         self.completions = normalize_completions(completions);
         self.commands = menu_commands(&self.completions);
@@ -237,13 +228,7 @@ impl LineEditor {
             let event = event::read()?;
             let action = self.handle_event(event)?;
             if let KeyAction::Done(outcome) = action {
-                if matches!(outcome, ReadOutcome::CycleMode(_)) {
-                    // Shift+Tab redraws the box in place with the new mode in
-                    // the status line, instead of leaving a finished prompt.
-                    self.erase()?;
-                } else {
-                    self.finish()?;
-                }
+                self.finish()?;
                 return Ok(outcome);
             }
             self.refresh()?;
@@ -540,9 +525,10 @@ impl LineEditor {
                 }
                 return KeyAction::Done(ReadOutcome::Submit(state.expanded_text()));
             }
-            KeyCode::BackTab => {
-                return KeyAction::Done(ReadOutcome::CycleMode(state.expanded_text()));
-            }
+            // Shift+Tab: the next permission mode. Only the status line under
+            // the box changes; the draft and the cursor stay. The REPL switches
+            // the mode when this prompt returns (turn_keys::take_mode_presses).
+            KeyCode::BackTab => runtime::turn_keys::note_idle_mode_press(),
             KeyCode::Esc => {
                 if state.menu.is_empty() {
                     state.set_buffer("");
@@ -1618,13 +1604,17 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_hands_back_the_draft() {
+    fn shift_tab_keeps_the_prompt_open_and_counts_the_press() {
+        let _ = runtime::turn_keys::take_mode_presses();
         let mut editor = editor();
         type_text(&mut editor, "half typed");
         assert_eq!(
             press(&mut editor, KeyCode::BackTab, KeyModifiers::SHIFT),
-            KeyAction::Done(ReadOutcome::CycleMode("half typed".to_string()))
+            KeyAction::Continue
         );
+        press(&mut editor, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(editor.state.buf.iter().collect::<String>(), "half typed");
+        assert_eq!(runtime::turn_keys::take_mode_presses(), 2);
     }
 
     #[test]

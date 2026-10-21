@@ -7909,6 +7909,11 @@ fn run_repl(
             }
             None => editor.read_line()?,
         };
+        // Shift+Tab pressed at the prompt: the status line already shows the
+        // new mode; switch to it before the input runs.
+        if let Err(error) = cli.cycle_permission_mode_by(runtime::turn_keys::take_mode_presses()) {
+            eprintln!("error: {error}");
+        }
         match outcome {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
@@ -8006,12 +8011,6 @@ fn run_repl(
                     println!("  {TOOL_DIM_STYLE}⎿ background task reported, resuming{STYLE_RESET}");
                     report_repl_turn_error(cli.run_turn(BACKGROUND_WAKE_PROMPT));
                 }
-            }
-            input::ReadOutcome::CycleMode(draft) => {
-                if let Err(error) = cli.cycle_permission_mode() {
-                    eprintln!("error: {error}");
-                }
-                editor.restore_draft(draft);
             }
             input::ReadOutcome::Exit => {
                 cli.reflect_before_exit();
@@ -10167,13 +10166,9 @@ impl LiveCli {
         });
     }
 
-    /// Shift+Tab: read-only -> workspace-write -> danger-full-access -> ...,
-    /// with a one-line notice like Claude Code's mode indicator.
-    fn cycle_permission_mode(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.cycle_permission_mode_by(1)
-    }
-
-    /// Applies `presses` Shift+Tab presses at once (those made during a turn).
+    /// Shift+Tab: read-only -> workspace-write -> danger-full-access -> ...
+    /// Applies `presses` presses at once: those made at the prompt (when it
+    /// returns) or during a turn (when the turn ends).
     fn cycle_permission_mode_by(&mut self, presses: u32) -> Result<(), Box<dyn std::error::Error>> {
         if presses == 0 {
             return Ok(());
@@ -10182,9 +10177,13 @@ impl LiveCli {
         for _ in 0..presses {
             next = next_permission_mode(next);
         }
-        // The status line under the input box shows the new mode.
-        self.apply_permission_mode(permission_mode_from_label(next))?;
-        self.persist_session()
+        // The status line under the input box shows the new mode. Only the
+        // policy changes: no runtime rebuild (plugins, MCP servers) and no
+        // session write, so the switch is instant.
+        let mode = permission_mode_from_label(next);
+        self.permission_mode = mode;
+        self.runtime.set_permission_mode(mode);
+        Ok(())
     }
 
     /// Switches to a new, empty session (the old one stays resumable).

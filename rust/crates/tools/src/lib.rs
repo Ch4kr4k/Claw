@@ -799,7 +799,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Link to the post, reel, video or pin" },
-                    "dest": { "type": "string", "description": "Directory to save into; default ~/Downloads/claw-social/<platform>" },
+                    "dest": { "type": "string", "description": "Directory to save into; once given, later calls in this session use it too. Default ~/Downloads/claw-social/<platform>" },
                     "count": { "type": "integer", "minimum": 1, "maximum": 24, "description": "Instagram profile: how many of its latest posts (default 6)" }
                 },
                 "required": ["url"],

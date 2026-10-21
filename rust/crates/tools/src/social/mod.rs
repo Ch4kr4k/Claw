@@ -29,7 +29,8 @@ pub(crate) struct SocialMediaInput {
     /// A post, reel, video or pin link (share and short links work).
     #[serde(alias = "link")]
     url: String,
-    /// Directory to save into; default `~/Downloads/claw-social/<platform>`.
+    /// Directory to save into; default the last `dest` given in this session (see
+    /// [`session_dest`]), else `~/Downloads/claw-social/<platform>`.
     #[serde(alias = "save_to", alias = "dir")]
     dest: Option<String>,
     /// For an Instagram profile: how many of its latest posts (default 6).
@@ -81,13 +82,33 @@ struct Saved {
     extension: &'static str,
 }
 
+/// The last `dest` given in this process (one claw process per session). A model
+/// downloading a list of posts into one folder left `dest` out of every other
+/// call; the files went to ~/Downloads and it spent a step moving each batch.
+static LAST_DEST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `dest` when given (remembered for the calls that follow), else the remembered one.
+fn session_dest(dest: Option<&str>) -> Option<String> {
+    let mut last = LAST_DEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match dest.map(str::trim).filter(|dest| !dest.is_empty()) {
+        Some(dest) => {
+            *last = Some(dest.to_string());
+            Some(dest.to_string())
+        }
+        None => last.clone(),
+    }
+}
+
 pub(crate) fn run(input: SocialMediaInput) -> Result<Value, String> {
+    let dest = session_dest(input.dest.as_deref());
     let url =
         instagram_handle_url(input.url.trim()).unwrap_or_else(|| input.url.trim().to_string());
     if platform_for(&url) == Some(Platform::Instagram)
         && igd::utils::extract_shortcode(&url).is_none()
     {
-        return run_instagram_profile(&url, input.dest.as_deref(), input.count);
+        return run_instagram_profile(&url, dest.as_deref(), input.count);
     }
     let platform = platform_for(&url).ok_or_else(|| {
         "not an Instagram, Facebook or Pinterest link; for other sites use WebFetch (it lists \
@@ -103,7 +124,7 @@ pub(crate) fn run(input: SocialMediaInput) -> Result<Value, String> {
         return Err("the post has no images or videos that could be fetched".to_string());
     }
 
-    let dir = input.dest.as_deref().map_or_else(
+    let dir = dest.as_deref().map_or_else(
         || home().join("Downloads/claw-social").join(platform.name()),
         expand_home,
     );
@@ -466,7 +487,19 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_blocked_ip, platform_for, post_id, sniffed_extension, Platform};
+    use super::{is_blocked_ip, platform_for, post_id, session_dest, sniffed_extension, Platform};
+
+    #[test]
+    fn a_given_dest_is_kept_for_the_calls_that_leave_it_out() {
+        assert_eq!(
+            session_dest(Some("~/Pictures/a")).as_deref(),
+            Some("~/Pictures/a")
+        );
+        assert_eq!(session_dest(None).as_deref(), Some("~/Pictures/a"));
+        assert_eq!(session_dest(Some("  ")).as_deref(), Some("~/Pictures/a"));
+        assert_eq!(session_dest(Some("/tmp/b")).as_deref(), Some("/tmp/b"));
+        assert_eq!(session_dest(None).as_deref(), Some("/tmp/b"));
+    }
 
     #[test]
     fn links_go_to_their_platform() {
