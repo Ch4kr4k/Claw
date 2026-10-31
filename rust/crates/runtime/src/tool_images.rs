@@ -12,6 +12,62 @@ pub const TOOL_IMAGE_MARKER: &str = "claw-image: ";
 pub const KEEP_TOOL_IMAGES: usize = 2;
 /// Larger files are not attached.
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Estimated tokens one tool result may carry, text and images together
+/// (after deepseek-harness's shared spill budget): a result naming many
+/// screenshots no longer sends them all. `CLAW_TOOL_RESULT_MAX_CHARS`
+/// (a quarter of it, in tokens) lowers it.
+const DEFAULT_RESULT_TOKEN_BUDGET: usize = 25_000;
+/// What an image costs when its size cannot be read: the most a provider
+/// charges after scaling it down.
+const MAX_IMAGE_TOKENS: usize = 1_600;
+
+fn result_token_budget() -> usize {
+    std::env::var("CLAW_TOOL_RESULT_MAX_CHARS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|chars| *chars > 0)
+        .map_or(DEFAULT_RESULT_TOKEN_BUDGET, |chars| {
+            (chars / 4).max(MAX_IMAGE_TOKENS)
+        })
+}
+
+/// Estimated tokens for an image: width × height / 750 (Anthropic's rule),
+/// at most [`MAX_IMAGE_TOKENS`]; the maximum when the size is unknown.
+fn image_tokens(bytes: &[u8]) -> usize {
+    image_size(bytes).map_or(MAX_IMAGE_TOKENS, |(width, height)| {
+        ((width * height) / 750).clamp(1, MAX_IMAGE_TOKENS)
+    })
+}
+
+/// Width and height of a PNG, GIF or JPEG.
+fn image_size(bytes: &[u8]) -> Option<(usize, usize)> {
+    let be = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?) as usize);
+    let be16 =
+        |at: usize| Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize);
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some((be(16)?, be(20)?));
+    }
+    if bytes.starts_with(b"GIF8") {
+        let le16 =
+            |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?) as usize);
+        return Some((le16(6)?, le16(8)?));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        let mut at = 2;
+        while at + 9 < bytes.len() {
+            if bytes[at] != 0xFF {
+                at += 1;
+                continue;
+            }
+            let marker = bytes[at + 1];
+            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+                return Some((be16(at + 7)?, be16(at + 5)?));
+            }
+            at += 2 + be16(at + 2)?;
+        }
+    }
+    None
+}
 
 /// Attaches the images that `message`'s tool output names.
 pub fn attach_tool_images(message: &mut ConversationMessage) {
@@ -26,6 +82,17 @@ pub fn attach_tool_images(message: &mut ConversationMessage) {
         .filter_map(|line| line.trim().strip_prefix(TOOL_IMAGE_MARKER))
         .map(|path| path.trim().to_string())
         .collect();
+    let text_tokens: usize = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::ToolResult { output, .. } => output.len() / 4,
+            _ => 0,
+        })
+        .sum();
+    // The first image always goes; later ones while the budget lasts.
+    let mut room = result_token_budget().saturating_sub(text_tokens);
+    let mut left_out = Vec::new();
     for path in paths {
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
@@ -36,11 +103,35 @@ pub fn attach_tool_images(message: &mut ConversationMessage) {
         if bytes.len() > MAX_IMAGE_BYTES {
             continue;
         }
+        let cost = image_tokens(&bytes);
+        let attached = message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }));
+        if attached && cost > room {
+            left_out.push(path);
+            continue;
+        }
+        room = room.saturating_sub(cost);
         message.blocks.push(ContentBlock::Image {
             media_type: media_type.to_string(),
             data: base64(&bytes),
             source: path,
         });
+    }
+    if !left_out.is_empty() {
+        if let Some(ContentBlock::ToolResult { output, .. }) = message
+            .blocks
+            .iter_mut()
+            .find(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        {
+            output.push_str(&format!(
+                "\n[{} more image(s) not attached: over this result's size budget. To see one, \
+                 read it with read_file: {}]",
+                left_out.len(),
+                left_out.join(", ")
+            ));
+        }
     }
 }
 
@@ -97,8 +188,44 @@ fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_tool_images, base64, drop_old_tool_images, TOOL_IMAGE_MARKER};
+    use super::{attach_tool_images, base64, drop_old_tool_images, image_size, TOOL_IMAGE_MARKER};
     use crate::session::{ContentBlock, ConversationMessage};
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn images_over_the_results_budget_are_named_instead_of_attached() {
+        let dir = std::env::temp_dir().join(format!("claw-image-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = (0..20)
+            .map(|i| {
+                let path = dir.join(format!("page{i}.png"));
+                std::fs::write(&path, png(1500, 1000)).unwrap();
+                path.display().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(image_size(&png(1500, 1000)), Some((1500, 1000)));
+        let output = paths
+            .iter()
+            .map(|path| format!("{TOOL_IMAGE_MARKER}{path}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut message = ConversationMessage::tool_result("t", "pdf", output, false);
+        attach_tool_images(&mut message);
+        // 25k tokens of budget, 1,600 per page: 15 attached, 5 named.
+        assert_eq!(images(&message), 15);
+        let ContentBlock::ToolResult { output, .. } = &message.blocks[0] else {
+            panic!("tool result first");
+        };
+        assert!(output.contains("5 more image(s) not attached"), "{output}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn images(message: &ConversationMessage) -> usize {
         message

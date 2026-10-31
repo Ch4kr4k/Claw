@@ -1232,8 +1232,12 @@ impl McpStdioProcess {
         self.flush().await
     }
 
+    /// Reads one message in either framing: a newline-delimited JSON line
+    /// (the MCP stdio spec, used by the official SDKs) or a legacy
+    /// LSP-style `Content-Length` frame.
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
         let mut content_length = None;
+        let mut saw_header = false;
         loop {
             let mut line = String::new();
             let bytes_read = self.stdout.read_line(&mut line).await?;
@@ -1243,9 +1247,16 @@ impl McpStdioProcess {
                     "MCP stdio stream closed while reading headers",
                 ));
             }
-            if line == "\r\n" {
-                break;
+            if !saw_header && line.trim_start().starts_with(['{', '[']) {
+                return Ok(line.trim_end().as_bytes().to_vec());
             }
+            if line == "\r\n" || line == "\n" {
+                if saw_header {
+                    break;
+                }
+                continue;
+            }
+            saw_header = true;
             let header = line.trim_end_matches(['\r', '\n']);
             if let Some((name, value)) = header.split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Content-Length") {
@@ -1407,10 +1418,11 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
+/// MCP stdio framing: one JSON message per line. Compact `serde_json`
+/// output escapes newlines inside strings, so a message is exactly one line.
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let header = format!("Content-Length: {}\r\n\r\n", payload.len());
-    let mut framed = header.into_bytes();
-    framed.extend_from_slice(payload);
+    let mut framed = payload.to_vec();
+    framed.push(b'\n');
     framed
 }
 
@@ -1487,18 +1499,10 @@ mod tests {
             "import json, os, sys",
             "LOWERCASE_CONTENT_LENGTH = os.environ.get('MCP_LOWERCASE_CONTENT_LENGTH') == '1'",
             "MISMATCHED_RESPONSE_ID = os.environ.get('MCP_MISMATCHED_RESPONSE_ID') == '1'",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "line = sys.stdin.buffer.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
+            "request = json.loads(line.decode())",
             r"assert request['jsonrpc'] == '2.0'",
             r"assert request['method'] == 'initialize'",
             "response_id = 'wrong-id' if MISMATCHED_RESPONSE_ID else request['id']",
@@ -1536,22 +1540,14 @@ mod tests {
             "INVALID_TOOL_CALL_RESPONSE = os.environ.get('MCP_INVALID_TOOL_CALL_RESPONSE') == '1'",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            r"    sys.stdout.buffer.write(payload + b'\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
@@ -1689,18 +1685,10 @@ mod tests {
             "    return True",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",
@@ -1959,7 +1947,7 @@ mod tests {
     }
 
     #[test]
-    fn write_jsonrpc_request_emits_content_length_frame() {
+    fn write_jsonrpc_request_emits_newline_delimited_frame() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2688,18 +2676,8 @@ mod tests {
         let script = [
             "#!/usr/bin/env python3",
             "import sys",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "if length:",
-            "    sys.stdin.buffer.read(length)",
+            "if not sys.stdin.buffer.readline():",
+            "    raise SystemExit(1)",
             "raise SystemExit(0)",
             "",
         ]

@@ -755,6 +755,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "learn",
+        aliases: &["learned"],
+        summary: "Show what claw learned (skills, memories); review now, undo, pin",
+        argument_hint: Some("[now|undo|pin <skill>|unpin <skill>|on|off]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "tasks",
         aliases: &["bashes"],
         summary: "List and manage background tasks",
@@ -1112,6 +1119,9 @@ pub enum SlashCommand {
         pr: Option<String>,
     },
     Todos,
+    Learn {
+        args: Option<String>,
+    },
     Tasks {
         args: Option<String>,
     },
@@ -1272,6 +1282,7 @@ impl SlashCommand {
             Self::Simplify { .. } => "/simplify",
             Self::PrComments { .. } => "/pr-comments",
             Self::Todos => "/todos",
+            Self::Learn { .. } => "/learn",
             Self::Tasks { .. } => "/tasks",
             Self::Theme { .. } => "/theme",
             Self::Usage { .. } => "/usage",
@@ -1727,6 +1738,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Todos
         }
+        "learn" | "learned" => SlashCommand::Learn { args: remainder },
         "tasks" | "bashes" => SlashCommand::Tasks { args: remainder },
         "theme" => SlashCommand::Theme { name: remainder },
         "usage" => SlashCommand::Usage { scope: remainder },
@@ -3368,6 +3380,112 @@ pub fn resolve_skill_invocation(
         }
     }
     Ok(dispatch)
+}
+
+/// A custom agent definition (`.claw/agents/`, `.claude/agents/`,
+/// `~/.claude/agents/`, … as `/agents` lists them) the Agent tool runs
+/// when its `subagent_type` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomAgent {
+    pub name: String,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    /// The tools it may use, as written (Claude Code names such as `Read`
+    /// or `Bash`); `None` for all of a general-purpose agent's.
+    pub tools: Option<Vec<String>>,
+    /// Its instructions: the file's body (Markdown) or
+    /// `developer_instructions` (Codex TOML).
+    pub prompt: String,
+    pub path: PathBuf,
+}
+
+/// The custom agents for `cwd`, each name once (the first root wins, as in
+/// `/agents`).
+#[must_use]
+pub fn custom_agents(cwd: &Path) -> Vec<CustomAgent> {
+    let roots = discover_definition_roots(cwd, "agents");
+    let Ok(agents) = load_agents_from_roots(&roots) else {
+        return Vec::new();
+    };
+    agents
+        .into_iter()
+        .filter(|agent| agent.shadowed_by.is_none())
+        .filter_map(|agent| {
+            let path = agent.path?;
+            let contents = fs::read_to_string(&path).ok()?;
+            let (prompt, tools) = if path.extension().is_some_and(|ext| ext == "toml") {
+                (
+                    parse_toml_string(&contents, "developer_instructions")
+                        .or_else(|| parse_toml_string(&contents, "instructions"))
+                        .unwrap_or_default(),
+                    None,
+                )
+            } else {
+                (
+                    markdown_body(&contents),
+                    frontmatter_list(&contents, "tools"),
+                )
+            };
+            Some(CustomAgent {
+                name: agent.name,
+                description: agent.description,
+                model: agent.model,
+                tools,
+                prompt,
+                path,
+            })
+        })
+        .collect()
+}
+
+/// The custom agent called `name` (case-insensitive).
+#[must_use]
+pub fn find_custom_agent(cwd: &Path, name: &str) -> Option<CustomAgent> {
+    custom_agents(cwd)
+        .into_iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(name.trim()))
+}
+
+/// What follows a Markdown file's frontmatter.
+fn markdown_body(contents: &str) -> String {
+    let Some(rest) = contents.strip_prefix("---") else {
+        return contents.trim().to_string();
+    };
+    rest.find("\n---")
+        .map_or(contents, |end| &rest[end + 4..])
+        .trim()
+        .to_string()
+}
+
+/// A frontmatter list: `key: a, b` or `key:` followed by `- a` lines.
+fn frontmatter_list(contents: &str, key: &str) -> Option<Vec<String>> {
+    let mut lines = contents.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut found: Option<Vec<String>> = None;
+    for line in lines.take_while(|line| line.trim() != "---") {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
+            let value = value.trim().trim_start_matches('[').trim_end_matches(']');
+            found = Some(
+                value
+                    .split(',')
+                    .map(|item| unquote_frontmatter_value(item.trim()))
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+            );
+        } else if let (Some(list), Some(item)) = (found.as_mut(), trimmed.strip_prefix("- ")) {
+            list.push(unquote_frontmatter_value(item.trim()));
+        } else if found
+            .as_ref()
+            .is_some_and(|list| !list.is_empty() || !trimmed.is_empty())
+            && !line.starts_with(' ')
+        {
+            break;
+        }
+    }
+    found.filter(|list| !list.is_empty())
 }
 
 pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
@@ -5682,6 +5800,7 @@ pub fn handle_slash_command(
         | SlashCommand::PrComments { .. }
         | SlashCommand::Todos
         | SlashCommand::Tasks { .. }
+        | SlashCommand::Learn { .. }
         | SlashCommand::Theme { .. }
         | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
@@ -5695,6 +5814,31 @@ pub fn handle_slash_command(
         | SlashCommand::Setup
         | SlashCommand::LocalAction { .. }
         | SlashCommand::Unknown(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod custom_agent_tests {
+    use super::{frontmatter_list, markdown_body};
+
+    #[test]
+    fn agent_files_give_their_tools_and_instructions() {
+        let file = "---\nname: rust-reviewer\ndescription: Reviews Rust\ntools: Read, Grep, \"Bash\"\nmodel: sonnet\n---\n\n# Rust reviewer\nCheck ownership.\n";
+        assert_eq!(
+            frontmatter_list(file, "tools"),
+            Some(vec![
+                "Read".to_string(),
+                "Grep".to_string(),
+                "Bash".to_string()
+            ])
+        );
+        assert_eq!(markdown_body(file), "# Rust reviewer\nCheck ownership.");
+        let listed = "---\nname: x\ntools:\n  - Read\n  - Glob\n---\nbody";
+        assert_eq!(
+            frontmatter_list(listed, "tools"),
+            Some(vec!["Read".to_string(), "Glob".to_string()])
+        );
+        assert_eq!(frontmatter_list("---\nname: x\n---\nbody", "tools"), None);
     }
 }
 
@@ -6419,7 +6563,8 @@ mod tests {
         assert!(help.contains("/diverge <problem>"));
         assert!(help.contains("/reflect [focus]"));
         assert!(help.contains("/fallback [model|off]"));
-        assert_eq!(slash_command_specs().len(), 126);
+        assert!(help.contains("/learn [now|undo|pin <skill>|unpin <skill>|on|off]"));
+        assert_eq!(slash_command_specs().len(), 127);
         assert!(resume_supported_slash_commands().len() >= 32);
     }
 

@@ -88,6 +88,19 @@ pub mod screen {
     pub fn focus() -> bool {
         false
     }
+    pub fn open_tasks_view(_: Option<&str>) -> bool {
+        false
+    }
+    pub fn close_tasks_view() {}
+    #[must_use]
+    pub fn tasks_view_open() -> bool {
+        false
+    }
+    pub fn tasks_view_step(_: isize) {}
+    pub fn fold_begin() {}
+    pub fn fold_full() {}
+    pub fn fold_end() {}
+    pub fn toggle_all_folds() {}
 }
 
 /// Moves the conversation in full-screen mode.
@@ -110,7 +123,163 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 /// Set by the watcher once it has stopped reading after [`PAUSED`].
 static PARKED: AtomicBool = AtomicBool::new(false);
-static TYPE_AHEAD: Mutex<String> = Mutex::new(String::new());
+static TYPE_AHEAD: Mutex<TypeAhead> = Mutex::new(TypeAhead::new());
+
+/// The slash commands and their descriptions, for the `/` menu while
+/// typing during a turn (see [`set_command_menu`]).
+static COMMAND_MENU: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// Rows of the `/` menu shown at once.
+const MENU_ROWS: usize = 8;
+
+/// The commands the `/` menu offers while typing during a turn, as (name
+/// without the slash, description), in the order to list them.
+pub fn set_command_menu(commands: Vec<(String, String)>) {
+    *COMMAND_MENU.lock().unwrap_or_else(|e| e.into_inner()) = commands;
+}
+
+/// The commands matching `text` (a `/` and part of a name, nothing after
+/// it): exact name first, then names starting with it, then containing it.
+fn menu_matches(text: &str, commands: &[(String, String)]) -> Vec<usize> {
+    let Some(query) = text
+        .strip_prefix('/')
+        .filter(|query| !query.contains(char::is_whitespace))
+    else {
+        return Vec::new();
+    };
+    let query = query.to_ascii_lowercase();
+    let mut ranked: Vec<(u8, usize)> = commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (name, _))| {
+            let name = name.to_ascii_lowercase();
+            let rank = if name == query {
+                0
+            } else if name.starts_with(&query) {
+                1
+            } else if name.contains(&query) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, index))
+        })
+        .collect();
+    ranked.sort_unstable();
+    ranked.into_iter().map(|(_, index)| index).collect()
+}
+
+/// The `/` menu's rows under the input box, `width` columns wide.
+fn menu_rows(width: usize) -> Vec<String> {
+    let commands = COMMAND_MENU.lock().unwrap_or_else(|e| e.into_inner());
+    let (matches, selected) = TYPE_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .menu(&commands);
+    if matches.is_empty() || width < 20 {
+        return Vec::new();
+    }
+    let top = selected.saturating_sub(MENU_ROWS - 1);
+    let visible = &matches[top..(top + MENU_ROWS).min(matches.len())];
+    let name_width = visible
+        .iter()
+        .map(|&index| commands[index].0.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(22)
+        + 1;
+    let mut rows: Vec<String> = visible
+        .iter()
+        .enumerate()
+        .map(|(offset, &index)| {
+            let (name, description) = &commands[index];
+            let chosen = top + offset == selected;
+            let line = format!(
+                "{} /{name:<name_width$} {description}",
+                if chosen { ">" } else { " " }
+            );
+            let line: String = line.chars().take(width).collect();
+            let style = if chosen { "\x1b[36m" } else { "\x1b[38;5;245m" };
+            format!("{style}{line}\x1b[0m")
+        })
+        .collect();
+    if matches.len() > visible.len() {
+        rows.push(format!(
+            "\x1b[38;5;245m  ({}/{}, ↑↓ for more · tab completes)\x1b[0m",
+            selected + 1,
+            matches.len()
+        ));
+    }
+    rows
+}
+
+/// Esc with the `/` menu open closes it; returns whether it was open.
+fn close_command_menu() -> bool {
+    let commands = COMMAND_MENU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut type_ahead = TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    if type_ahead.menu(&commands).0.is_empty() {
+        return false;
+    }
+    type_ahead.menu_closed_for = Some(type_ahead.text.clone());
+    true
+}
+
+/// Text typed during a turn and where its cursor is.
+struct TypeAhead {
+    text: String,
+    /// Cursor position in chars, `0..=text.chars().count()`.
+    cursor: usize,
+    /// The `/` menu's selected row, and the text it was chosen for (a
+    /// different text starts again at the top).
+    menu_index: usize,
+    menu_for: String,
+    /// The text the menu was closed for with Esc.
+    menu_closed_for: Option<String>,
+}
+
+impl TypeAhead {
+    const fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+            menu_index: 0,
+            menu_for: String::new(),
+            menu_closed_for: None,
+        }
+    }
+
+    /// The `/` menu for what is typed: indexes into `commands`, best first,
+    /// and the selected one's position. Empty while no menu shows.
+    fn menu(&mut self, commands: &[(String, String)]) -> (Vec<usize>, usize) {
+        if self.menu_closed_for.as_ref() == Some(&self.text) {
+            return (Vec::new(), 0);
+        }
+        self.menu_closed_for = None;
+        let matches = menu_matches(&self.text, commands);
+        if self.menu_for != self.text {
+            self.menu_for.clone_from(&self.text);
+            self.menu_index = 0;
+        }
+        self.menu_index = self.menu_index.min(matches.len().saturating_sub(1));
+        (matches, self.menu_index)
+    }
+
+    fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Byte offset of char position `pos`.
+    fn byte_at(&self, pos: usize) -> usize {
+        self.text
+            .char_indices()
+            .nth(pos)
+            .map_or(self.text.len(), |(index, _)| index)
+    }
+
+    fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.text)
+    }
+}
 /// Prompts submitted with Enter while a turn was running, oldest first.
 static QUEUED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Set once something other than the key watcher (claw desktop's agent)
@@ -119,6 +288,11 @@ static EXTERNAL_QUEUE: AtomicBool = AtomicBool::new(false);
 /// Answers `/btw` typed during a turn right away (set by the CLI); without
 /// it the question waits in the queue until the turn ends.
 static SIDE_QUESTION_HANDLER: OnceLock<fn(String)> = OnceLock::new();
+/// Runs a slash command typed during a turn; see [`set_command_handler`].
+static COMMAND_HANDLER: OnceLock<fn(&str) -> bool> = OnceLock::new();
+/// Slash commands typed during a turn, for the watcher to run once it has
+/// let go of the type-ahead.
+static TYPED_COMMANDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// `/btw` questions being answered while the turn runs.
 static SIDE_PENDING: AtomicUsize = AtomicUsize::new(0);
 /// Answered `/btw` questions waiting to be printed: (question, answer).
@@ -592,7 +766,7 @@ pub fn note_idle_mode_press() {
 /// Takes the unfinished text typed while the last turn was running.
 #[must_use]
 pub fn take_type_ahead() -> String {
-    std::mem::take(&mut *TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()))
+    TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// Takes the oldest prompt queued with Enter during a turn.
@@ -623,9 +797,10 @@ pub fn take_queued_for_running_turn() -> Vec<String> {
     let mut all = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
     // A `/btw` side question is not for the running task: it stays queued
     // and is answered on its own when the turn ends.
-    let (side, queued): (Vec<String>, Vec<String>) = std::mem::take(&mut *all)
-        .into_iter()
-        .partition(|line| is_btw(line));
+    let (side, queued): (Vec<String>, Vec<String>) =
+        std::mem::take(&mut *all).into_iter().partition(|line| {
+            is_btw(line) || (COMMAND_HANDLER.get().is_some() && is_slash_command(line))
+        });
     *all = side;
     drop(all);
     if !queued.is_empty() {
@@ -652,13 +827,59 @@ pub fn set_side_question_handler(handler: fn(String)) {
     let _ = SIDE_QUESTION_HANDLER.set(handler);
 }
 
-/// Hands over the answer to a `/btw` asked during the turn; it is printed
-/// at the next step or when the turn ends ([`print_side_answers`]).
+/// Lets slash commands typed during a turn run at once, like Claude Code:
+/// `handler` runs the ones that can (it gets the line, on the key watcher's
+/// thread, so it must be quick) and returns false for the ones that must
+/// wait for the turn to end. Those stay queued, run as commands when the
+/// turn ends, and are never passed to the model.
+pub fn set_command_handler(handler: fn(&str) -> bool) {
+    let _ = COMMAND_HANDLER.set(handler);
+}
+
+/// Whether `line` is a slash command (`/name …`), not a path or a message.
+fn is_slash_command(line: &str) -> bool {
+    let name = line.split_whitespace().next().unwrap_or_default();
+    name.strip_prefix('/').is_some_and(|name| {
+        name.starts_with(|ch: char| ch.is_ascii_alphabetic()) && !name.contains('/')
+    })
+}
+
+/// Runs the slash commands typed since the last call (see
+/// [`set_command_handler`]).
+fn run_typed_commands() {
+    let commands = std::mem::take(&mut *TYPED_COMMANDS.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(handler) = COMMAND_HANDLER.get() else {
+        return;
+    };
+    for command in commands {
+        if !handler(&command) {
+            let mut stdout = std::io::stdout().lock();
+            let _ = write!(
+                stdout,
+                "\n\x1b[1;36m> \x1b[0m{command}  \x1b[2m(runs when the reply ends)\x1b[0m\n"
+            );
+            let _ = stdout.flush();
+            drop(stdout);
+            QUEUED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(command);
+        }
+    }
+    draw_status_line();
+}
+
+/// Hands over the answer to a `/btw` asked during the turn. It is printed
+/// as soon as it arrives while a turn runs or claw draws the window;
+/// otherwise at the next prompt ([`print_side_answers`]).
 pub fn push_side_answer(question: String, answer: String) {
     SIDE_ANSWERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((question, answer));
+    if ACTIVE.load(Ordering::SeqCst) || screen::active() {
+        print_side_answers();
+    }
     SIDE_PENDING
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             Some(n.saturating_sub(1))
@@ -800,10 +1021,13 @@ fn block_rows(cols: usize) -> Vec<String> {
             }
         })
         .unwrap_or_default();
-    let typed = TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (typed, cursor) = {
+        let type_ahead = TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+        (type_ahead.text.clone(), type_ahead.cursor)
+    };
     let queued = queued_count();
     let mut queued_note = if queued > 0 {
-        format!("  [{queued} queued]")
+        format!("  [{queued} queued · ↑ to edit]")
     } else {
         String::new()
     };
@@ -818,25 +1042,52 @@ fn block_rows(cols: usize) -> Vec<String> {
             prompt_color_sgr()
         )
     } else {
-        // Show the end of long input, like a text field scrolled right.
-        let room = width.saturating_sub(3 + queued_note.chars().count());
-        let shown = typed.chars().count().saturating_sub(room);
-        let tail = typed.chars().skip(shown).collect::<String>();
         format!(
-            "\x1b[1;{}m❯\x1b[0m {tail}\x1b[7m \x1b[0m\x1b[2m{queued_note}\x1b[0m",
-            prompt_color_sgr()
+            "\x1b[1;{}m❯\x1b[0m {}\x1b[2m{queued_note}\x1b[0m",
+            prompt_color_sgr(),
+            type_ahead_field(
+                &typed,
+                cursor,
+                width.saturating_sub(2 + queued_note.chars().count())
+            )
         )
     };
     let rule = rule_line(width, colored);
-    let status = footer_status_line(width, colored);
-    vec![
-        String::new(),
-        activity_line,
-        rule.clone(),
-        input_line,
-        rule,
-        status,
-    ]
+    let mut rows = vec![String::new(), activity_line, rule.clone(), input_line, rule];
+    // The `/` menu while one is being typed, otherwise the status line,
+    // as at the prompt.
+    let menu = menu_rows(width);
+    if menu.is_empty() {
+        rows.push(footer_status_line(width, colored));
+    } else {
+        rows.extend(menu);
+    }
+    rows
+}
+
+/// `typed` in a field `room` cells wide, with the cursor drawn in reverse
+/// video. Long input scrolls like a text field: the end shows unless the
+/// cursor is further left. Line breaks (between queued messages pulled back
+/// with Up) show as `↵`, so the field stays one row.
+fn type_ahead_field(typed: &str, cursor: usize, room: usize) -> String {
+    let chars = typed
+        .chars()
+        .map(|ch| if ch == '\n' { '↵' } else { ch })
+        .collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    // One more cell than the text, for the cursor after its last char.
+    let room = room.max(1);
+    let start = (chars.len() + 1).saturating_sub(room).min(cursor);
+    let end = (start + room).min(chars.len() + usize::from(cursor == chars.len()));
+    let mut field = String::new();
+    for (pos, ch) in (start..end).map(|pos| (pos, chars.get(pos).copied().unwrap_or(' '))) {
+        if pos == cursor {
+            field.push_str(&format!("\x1b[7m{ch}\x1b[0m"));
+        } else {
+            field.push(ch);
+        }
+    }
+    field
 }
 
 /// What was read from the keyboard during a turn.
@@ -852,15 +1103,24 @@ struct Keys {
     wheels: Vec<(Scroll, usize, usize)>,
     /// Left-button presses, drags and releases (text selection).
     mice: Vec<screen::Mouse>,
+    /// Ctrl+O presses: expand or collapse every fold.
+    fold_toggles: u32,
 }
 
 /// Splits what was read from the keyboard into typed text, Shift+Tab
-/// presses and scrolling; other escape sequences (arrows, function keys,
-/// Alt+key, mouse clicks) are dropped.
+/// presses and scrolling. Up/Down, Left/Right, Home/End and Delete stay in
+/// the text, in order, as the Ctrl+P/N/B/F/A/E/D bytes that
+/// [`record_type_ahead`] reads as editing keys; other escape sequences (function keys,
+/// Alt+key, modified arrows, mouse clicks) are dropped.
 fn split_keys(bytes: &[u8]) -> Keys {
     let mut keys = Keys::default();
     let mut i = 0;
     while i < bytes.len() {
+        if bytes[i] == CTRL_O {
+            keys.fold_toggles += 1;
+            i += 1;
+            continue;
+        }
         if bytes[i] != 0x1b {
             keys.text.push(bytes[i]);
             i += 1;
@@ -873,8 +1133,25 @@ fn split_keys(bytes: &[u8]) -> Keys {
                 while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
                     end += 1;
                 }
-                if bytes[i + 1] == b'[' {
-                    let params = &bytes[i + 2..end.min(bytes.len())];
+                let params = &bytes[i + 2..end.min(bytes.len())];
+                // Normal and application cursor mode (`ESC O D`), and the
+                // `ESC [ n ~` forms of Home/End/Delete.
+                let csi = bytes[i + 1] == b'[';
+                let cursor_key = match (params, bytes.get(end)) {
+                    (b"", Some(b'A')) => Some(CTRL_P),
+                    (b"", Some(b'B')) => Some(CTRL_N),
+                    (b"", Some(b'D')) => Some(CTRL_B),
+                    (b"", Some(b'C')) => Some(CTRL_F),
+                    (b"", Some(b'H')) => Some(CTRL_A),
+                    (b"", Some(b'F')) => Some(CTRL_E),
+                    (b"1" | b"7", Some(b'~')) if csi => Some(CTRL_A),
+                    (b"4" | b"8", Some(b'~')) if csi => Some(CTRL_E),
+                    (b"3", Some(b'~')) if csi => Some(CTRL_D),
+                    _ => None,
+                };
+                if let Some(byte) = cursor_key {
+                    keys.text.push(byte);
+                } else if csi {
                     match (params, bytes.get(end)) {
                         (b"", Some(b'Z')) => keys.back_tabs += 1,
                         (b"5", Some(b'~')) => keys.scrolls.push(Scroll::PageUp),
@@ -938,17 +1215,7 @@ fn parse_sgr_mouse(params: &[u8], release: bool) -> Option<SgrMouse> {
 /// Moves queued prompts back into the type-ahead, so they are pre-filled in
 /// the input instead of running (used when the user stops a reply with Esc).
 pub fn unqueue_into_type_ahead() {
-    let queued = std::mem::take(&mut *QUEUED.lock().unwrap_or_else(|e| e.into_inner()));
-    if queued.is_empty() {
-        return;
-    }
-    let mut type_ahead = TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-    let mut text = queued.join("\n");
-    if !type_ahead.is_empty() {
-        text.push('\n');
-        text.push_str(&type_ahead);
-    }
-    *type_ahead = text;
+    pull_queued_into(&mut TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
 /// Watches the keyboard until dropped. Does nothing when stdin is not a
@@ -1057,21 +1324,124 @@ impl Drop for PauseGuard {
     }
 }
 
-/// Applies typed bytes: text goes to the type-ahead, Enter queues it.
+/// Cursor keys in the type-ahead, as the terminal sends them for Ctrl+letter
+/// (and as [`split_keys`] turns arrows, Home/End and Delete into).
+const CTRL_A: u8 = 0x01;
+const CTRL_B: u8 = 0x02;
+const CTRL_D: u8 = 0x04;
+const CTRL_E: u8 = 0x05;
+const CTRL_F: u8 = 0x06;
+const CTRL_K: u8 = 0x0b;
+/// Expands or collapses every fold (see [`screen::toggle_all_folds`]).
+const CTRL_O: u8 = 0x0f;
+/// Up (as Ctrl+P): pull the queued messages back to edit them.
+const CTRL_P: u8 = 0x10;
+/// Down (as Ctrl+N): the next row of the `/` menu.
+const CTRL_N: u8 = 0x0e;
+const CTRL_U: u8 = 0x15;
+
+/// Moves every queued message, oldest first and one per line, in front of
+/// what is being typed, with the cursor after them. Returns whether any were
+/// queued. Messages the running turn has already taken are gone from the
+/// queue and stay sent.
+fn pull_queued_into(type_ahead: &mut TypeAhead) -> bool {
+    let queued = std::mem::take(&mut *QUEUED.lock().unwrap_or_else(|e| e.into_inner()));
+    if queued.is_empty() {
+        return false;
+    }
+    let mut text = queued.join("\n");
+    let cursor = text.chars().count();
+    if !type_ahead.text.is_empty() {
+        text.push('\n');
+        text.push_str(&type_ahead.text);
+    }
+    type_ahead.text = text;
+    type_ahead.cursor = cursor;
+    true
+}
+
+/// Applies typed bytes: text goes into the type-ahead at its cursor, Enter
+/// queues it, Up pulls queued messages back into it, and the cursor keys
+/// (Ctrl+A/E/B/F, Ctrl+D deletes forward, Ctrl+U/K delete to the start/end)
+/// edit it like the prompt.
 fn record_type_ahead(bytes: &[u8]) {
+    let commands = COMMAND_MENU.lock().unwrap_or_else(|e| e.into_inner());
     let mut type_ahead = TYPE_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
     for ch in String::from_utf8_lossy(bytes).chars() {
+        let control = u8::try_from(u32::from(ch)).ok();
+        // The `/` menu takes ↑/↓, Tab and Enter while it is open.
+        let (menu, selected) = if matches!(ch, '\t' | '\r' | '\n')
+            || control.is_some_and(|byte| byte == CTRL_P || byte == CTRL_N)
+        {
+            type_ahead.menu(&commands)
+        } else {
+            (Vec::new(), 0)
+        };
+        if !menu.is_empty() {
+            let name = &commands[menu[selected]].0;
+            match ch {
+                _ if control == Some(CTRL_P) => {
+                    type_ahead.menu_index = (selected + menu.len() - 1) % menu.len();
+                    continue;
+                }
+                _ if control == Some(CTRL_N) => {
+                    type_ahead.menu_index = (selected + 1) % menu.len();
+                    continue;
+                }
+                '\t' => {
+                    type_ahead.text = format!("/{name} ");
+                    type_ahead.cursor = type_ahead.len();
+                    continue;
+                }
+                // Enter runs the selected command, as at the prompt.
+                _ => {
+                    type_ahead.text = format!("/{name}");
+                }
+            }
+        }
         match ch {
-            '\u{7f}' | '\u{8}' => {
-                type_ahead.pop();
+            // At the start (Backspace) or end (Delete) they do nothing.
+            '\u{7f}' | '\u{8}' if type_ahead.cursor > 0 => {
+                type_ahead.cursor -= 1;
+                let at = type_ahead.byte_at(type_ahead.cursor);
+                type_ahead.text.remove(at);
+            }
+            _ if control == Some(CTRL_D) && type_ahead.cursor < type_ahead.len() => {
+                let at = type_ahead.byte_at(type_ahead.cursor);
+                type_ahead.text.remove(at);
+            }
+            _ if control == Some(CTRL_A) => type_ahead.cursor = 0,
+            _ if control == Some(CTRL_E) => type_ahead.cursor = type_ahead.len(),
+            _ if control == Some(CTRL_B) => {
+                type_ahead.cursor = type_ahead.cursor.saturating_sub(1);
+            }
+            _ if control == Some(CTRL_F) => {
+                type_ahead.cursor = (type_ahead.cursor + 1).min(type_ahead.len());
+            }
+            _ if control == Some(CTRL_U) => {
+                let at = type_ahead.byte_at(type_ahead.cursor);
+                type_ahead.text.drain(..at);
+                type_ahead.cursor = 0;
+            }
+            _ if control == Some(CTRL_K) => {
+                let at = type_ahead.byte_at(type_ahead.cursor);
+                type_ahead.text.truncate(at);
+            }
+            _ if control == Some(CTRL_P) => {
+                pull_queued_into(&mut type_ahead);
             }
             '\r' | '\n' => {
-                let line = std::mem::take(&mut *type_ahead);
+                let line = type_ahead.take();
                 if let (Some(question), Some(handler)) =
                     (btw_question(&line), SIDE_QUESTION_HANDLER.get())
                 {
                     SIDE_PENDING.fetch_add(1, Ordering::SeqCst);
                     handler(question.to_string());
+                } else if COMMAND_HANDLER.get().is_some() && is_slash_command(&line) {
+                    TYPED_COMMANDS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(line.trim().to_string());
                 } else if !line.trim().is_empty() {
                     QUEUED
                         .lock()
@@ -1079,8 +1449,21 @@ fn record_type_ahead(bytes: &[u8]) {
                         .push(line.trim().to_string());
                 }
             }
-            ch if !ch.is_control() => type_ahead.push(ch),
+            ch if !ch.is_control() => {
+                let at = type_ahead.byte_at(type_ahead.cursor);
+                type_ahead.text.insert(at, ch);
+                type_ahead.cursor += 1;
+            }
             _ => {}
+        }
+        // A menu closed with Esc opens again once the text changes, even
+        // when it comes back to the same text within one read.
+        if type_ahead
+            .menu_closed_for
+            .as_ref()
+            .is_some_and(|closed| *closed != type_ahead.text)
+        {
+            type_ahead.menu_closed_for = None;
         }
     }
 }
@@ -1096,8 +1479,8 @@ mod imp {
     use std::time::Instant;
 
     use super::{
-        draw_status_line, live, record_type_ahead, screen, split_keys, Activity, ACTIVITY,
-        MODE_PRESSES, PARKED, PAUSED,
+        close_command_menu, draw_status_line, live, record_type_ahead, run_typed_commands, screen,
+        split_keys, Activity, ACTIVITY, CTRL_B, CTRL_F, MODE_PRESSES, PARKED, PAUSED,
     };
     use crate::HookAbortSignal;
 
@@ -1228,11 +1611,27 @@ mod imp {
         }
         if bytes == [0x1b] {
             // A lone ESC is the Esc key; arrow and function keys send
-            // ESC followed by more bytes in the same read.
-            abort.abort();
+            // ESC followed by more bytes in the same read. With the
+            // background-task view open it closes the view instead.
+            // The same for an open `/` menu.
+            if screen::tasks_view_open() {
+                screen::close_tasks_view();
+            } else if !close_command_menu() {
+                abort.abort();
+            }
             return;
         }
-        let keys = split_keys(bytes);
+        let mut keys = split_keys(bytes);
+        if screen::tasks_view_open() {
+            // ←/→ (here as Ctrl+B/F) switch the task the view shows.
+            keys.text.retain(|&byte| match byte {
+                CTRL_B | CTRL_F => {
+                    screen::tasks_view_step(if byte == CTRL_B { -1 } else { 1 });
+                    false
+                }
+                _ => true,
+            });
+        }
         if keys.back_tabs > 0 {
             MODE_PRESSES.fetch_add(keys.back_tabs, Ordering::SeqCst);
         }
@@ -1245,7 +1644,11 @@ mod imp {
         for mouse in keys.mice {
             screen::mouse(mouse);
         }
+        for _ in 0..keys.fold_toggles {
+            screen::toggle_all_folds();
+        }
         record_type_ahead(&keys.text);
+        run_typed_commands();
         draw_status_line();
     }
 }
@@ -1260,6 +1663,47 @@ pub fn note_tool_input(chars: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_slash_menu_ranks_commands_and_keeps_its_selection() {
+        use super::{menu_matches, TypeAhead};
+        let commands: Vec<(String, String)> = ["model", "compact", "cost", "mode"]
+            .iter()
+            .map(|name| ((*name).to_string(), String::new()))
+            .collect();
+        assert_eq!(menu_matches("/mode", &commands), vec![3, 0], "exact first");
+        assert_eq!(menu_matches("/co", &commands), vec![1, 2]);
+        assert_eq!(menu_matches("/st", &commands), vec![2], "contains");
+        assert!(
+            menu_matches("/model opus", &commands).is_empty(),
+            "arguments"
+        );
+        assert!(menu_matches("plain text", &commands).is_empty());
+
+        let mut typed = TypeAhead::new();
+        typed.text = "/co".to_string();
+        assert_eq!(typed.menu(&commands), (vec![1, 2], 0));
+        typed.menu_index = 1;
+        assert_eq!(typed.menu(&commands).1, 1, "kept while the text stays");
+        typed.text = "/c".to_string();
+        assert_eq!(typed.menu(&commands).1, 0, "back to the top on new text");
+        // Esc closes it for this text only.
+        typed.menu_closed_for = Some(typed.text.clone());
+        assert!(typed.menu(&commands).0.is_empty());
+        typed.text = "/com".to_string();
+        assert_eq!(typed.menu(&commands).0, vec![1]);
+    }
+
+    #[test]
+    fn slash_commands_are_told_from_paths_and_messages() {
+        use super::is_slash_command;
+        assert!(is_slash_command("/model opus"));
+        assert!(is_slash_command("  /help"));
+        assert!(!is_slash_command("/tmp/x.log has the error"));
+        assert!(!is_slash_command("/ alone"));
+        assert!(!is_slash_command("fix /help"));
+        assert!(!is_slash_command(""));
+    }
 
     #[test]
     fn btw_lines_name_their_question() {
@@ -1344,10 +1788,22 @@ mod tests {
 
     #[test]
     fn shift_tab_is_counted_and_other_escape_sequences_are_dropped() {
-        let keys = super::split_keys(b"ab\x1b[Zc\x1b[A\x1bOP\x1b[1;5Cd\x1b[Z");
-        assert_eq!(keys.text, b"abcd");
+        let keys = super::split_keys(b"ab\x1b[Zc\x1b[B\x1bOP\x1b[1;5Cd\x1b[Z");
+        // Down stays, as Ctrl+N, for the `/` menu (typed text ignores it).
+        assert_eq!(keys.text, b"abc\x0ed");
         assert_eq!(keys.back_tabs, 2);
         assert!(keys.scrolls.is_empty());
+    }
+
+    #[test]
+    fn cursor_keys_stay_in_the_text_as_control_bytes() {
+        let keys = super::split_keys(
+            b"a\x1b[Db\x1b[C\x1bOD\x1bOC\x1b[H\x1bOH\x1b[1~\x1b[7~\x1b[F\x1bOF\x1b[4~\x1b[8~\x1b[3~\x1b[A\x1bOA",
+        );
+        assert_eq!(
+            keys.text,
+            b"a\x02b\x06\x02\x06\x01\x01\x01\x01\x05\x05\x05\x05\x04\x10\x10"
+        );
     }
 
     #[test]
@@ -1472,5 +1928,66 @@ mod tests {
         unqueue_into_type_ahead();
         assert_eq!(queued_count(), 0);
         assert_eq!(take_type_ahead(), "a\nb\ntail");
+
+        // Arrows move the cursor: typing and Backspace act there, in the
+        // order the keys arrived.
+        record_type_ahead(
+            &super::split_keys(b"fix teh bug\x1b[D\x1b[D\x1b[D\x1b[D\x7f\x7fhe").text,
+        );
+        record_type_ahead(&super::split_keys(b"\x1bOH!\x1b[F?").text);
+        assert_eq!(take_type_ahead(), "!fix the bug?");
+        record_type_ahead(&super::split_keys(b"h\xc3\xa9llo\x1b[1~\x1b[3~\x1b[C\x1b[C\x15").text);
+        record_type_ahead(&super::split_keys(b"\x1b[4~\x1b[D\x0b").text);
+        assert_eq!(
+            take_type_ahead(),
+            "l",
+            "Ctrl+U and Ctrl+K cut around the cursor, by chars"
+        );
+        record_type_ahead(b"x\rnext");
+        assert_eq!(take_queued().as_deref(), Some("x"));
+        record_type_ahead(&super::split_keys(b"\x1b[D\x1b[D!").text);
+        assert_eq!(
+            take_type_ahead(),
+            "ne!xt",
+            "Enter leaves the cursor in the new line"
+        );
+
+        // Up pulls queued messages back to edit, in front of what is being
+        // typed, with the cursor after them; Enter queues the result again.
+        record_type_ahead(b"fix teh tests\rand docs\rdraft");
+        assert_eq!(queued_count(), 2);
+        record_type_ahead(&super::split_keys(b"\x1b[A").text);
+        assert_eq!(queued_count(), 0);
+        let right7 = b"\x1b[C".repeat(7);
+        let mut keys = b" too\x1b[H".to_vec();
+        keys.extend_from_slice(&right7);
+        keys.extend_from_slice(b"\x7f\x7fhe\r");
+        record_type_ahead(&super::split_keys(&keys).text);
+        assert_eq!(
+            take_queued().as_deref(),
+            Some("fix the tests\nand docs too\ndraft")
+        );
+        record_type_ahead(&super::split_keys(b"\x1b[Ax").text);
+        assert_eq!(
+            take_type_ahead(),
+            "x",
+            "Up with nothing queued does nothing"
+        );
+    }
+
+    #[test]
+    fn type_ahead_field_draws_the_cursor_where_it_is() {
+        let field = super::type_ahead_field;
+        assert_eq!(field("abc", 3, 20), "abc\x1b[7m \x1b[0m");
+        assert_eq!(field("abc", 1, 20), "a\x1b[7mb\x1b[0mc");
+        // Too long: the end shows, unless the cursor is further left.
+        assert_eq!(field("abcdefgh", 8, 4), "fgh\x1b[7m \x1b[0m");
+        assert_eq!(field("abcdefgh", 2, 4), "\x1b[7mc\x1b[0mdef");
+        assert_eq!(field("abcdefgh", 6, 4), "f\x1b[7mg\x1b[0mh");
+        assert_eq!(
+            field("a\nb", 3, 20),
+            "a↵b\x1b[7m \x1b[0m",
+            "line breaks keep one row"
+        );
     }
 }

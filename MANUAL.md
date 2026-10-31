@@ -58,8 +58,8 @@ Local servers (llama.cpp, vLLM, LM Studio) are covered in
 
 With the launcher setup, `llama-gpu` runs llama.cpp in router mode: every model
 in `~/.config/llama-gpu/models.ini` (repo copy: `scripts/wrappers/llama-models.ini`)
-is available, and `/model local/<section>` (or an alias such as `/model coder`
-or `/model uncensored` from `"aliases"` in `~/.claw/settings.json`) switches to
+is available, and `/model local/<section>` (e.g. `/model local/cybertiel-35b-a3b`,
+or an alias of your own from `"aliases"` in `~/.claw/settings.json`) switches to
 it mid-session. The server loads the model on the first request and unloads the
 previous one, so the first reply after a switch waits for the load. `/model`
 also switches to API models (`/model sonnet`, `/model gpt-4.1`) as long as that
@@ -147,7 +147,7 @@ tools, models and sessions are the same as in the terminal.
 - **Model:** the picker in the header switches models for the rest of the
   chat. It lists the models your local llama.cpp server is serving right now
   (`local/<name>`), your aliases with the model each points to
-  (`coder → local/qwen36-35b-a3b`; aliases to local models the server no
+  (`coder → local/cybertiel-35b-a3b`; aliases to local models the server no
   longer has are left out), and `sonnet`/`opus`/`haiku` only when an
   Anthropic key or `claw login` is set up.
 - **Approvals:** commands that need approval show a card with **Allow once**,
@@ -207,6 +207,14 @@ the `/` menu, an approval or a question, and shrinks back afterwards.
 | Ctrl+Home | Jump to the start of the conversation |
 | Ctrl+End | Jump back to the end (a *Jump to bottom* hint shows while you are scrolled up; clicking it does the same) |
 | Click and drag | Select conversation text; it is copied to the clipboard when you let go (*Copied N characters* shows briefly). Dragging past the top or bottom edge scrolls. A click clears the selection |
+| Click on a cut-short tool call, result or thinking line | Expand it in place: the whole command or file content the agent wrote, the whole output, the whole reasoning. Click it again to collapse it |
+| Ctrl+O | Expand every cut-short item; press again to collapse them all (also works while a reply is running) |
+| Click **N shells** in the status line | Watch a background job's output live (see [Background jobs](#9-background-jobs)) |
+
+Tool calls and results longer than a few lines, and the agent's thinking,
+are shown cut short with *(ctrl+o to expand)*; the full text stays in memory
+for this session's window. Without full-screen mode (`CLAW_FULLSCREEN=0`,
+`/tui default`) they stay cut short.
 
 While you are scrolled up, new output does not move the view. Selected text
 is copied with `wl-copy`, `xclip`, `xsel` or `pbcopy`, or else through the
@@ -247,7 +255,7 @@ built-in ones (`/keybindings` creates it and lists the actions):
 
 ```json
 { "bindings": {
-    "ctrl+o": "/focus",
+    "f2": "/focus",
     "ctrl+g": "submit",
     "ctrl+t": "text:TODO: ",
     "ctrl+l": "none"
@@ -294,8 +302,13 @@ Mention files with `@path` (Tab completes them) so the agent reads them. See
 |---|---|
 | Esc | Stop the reply, and the shell command it is running (that command's process group gets SIGTERM, then SIGKILL after 3 s). Background jobs keep running; stop them with `KillShell`/`TaskStop` or `/tasks` |
 | Ctrl+C | Stop the reply (same as Esc; the program keeps running) |
-| Typing + Enter | Queue a message. It is passed to the agent before its next step, shown as `> text (sent to the agent)` |
+| Typing + Enter | Queue a message. It is passed to the agent before its next step (after the tools it is running, or right after its reply, which then goes on in the same turn), shown as `> text (sent to the agent)` |
+| `/` | Opens the same command menu as at the prompt, under the input row: ↑/↓ select, Tab completes, Enter runs the selected command, Esc closes the menu (the reply keeps running) |
+| `/command` + Enter | Runs a slash command. Commands that only show something or change the view (`/help`, `/todos`, `/tasks`, `/diff`, `/config`, `/agents`, `/skills`, `/hooks`, `/focus`, `/diffpanel`, `/theme`, `/color`, `/stop`, `/keybindings`, `/version`, `/sandbox`) run at once; the others (`/model`, `/compact`, `/cost`, …) show `(runs when the reply ends)` and run then. Slash commands are never passed to the agent |
 | Typing without Enter | Kept and pre-filled at the next prompt |
+| Ctrl+O | Expand or collapse every cut-short tool call, result and thinking block (full-screen mode) |
+| ↑ (Ctrl+P) | Edit queued messages: every message the agent has not received yet comes back into the input row (one per line, shown as `↵`), in front of what you are typing. Enter queues the edited text again, as one message. Messages already passed to the agent stay sent |
+| ←/→, Home/End (Ctrl+A/E), Backspace, Delete (Ctrl+D), Ctrl+U/K | Move the cursor and edit what you are typing, as at the prompt. Down and Ctrl+←/→ do nothing here |
 | Shift+Tab | Pick the next permission mode. At the prompt the status line changes in place (your typing stays) and the mode applies to what you send next; during a reply it shows *(after this reply)* and takes effect when the reply ends |
 
 At the bottom of the window, a block shows what is happening, what you are
@@ -319,11 +332,15 @@ typing and the status line:
 
 The time counts the whole request; tokens are an estimate of what the model
 has sent. The input row shows what you are typing and how many messages are
-queued. When you stop a reply, queued messages go back into the input box
+queued (`[2 queued · ↑ to edit]`). When you stop a reply, queued messages go back into the input box
 instead of running. A `/btw` question typed during a reply is not passed to
 the running task: it is answered at once, beside it, from the conversation as
-last sent to the model (no tools), and the answer is printed between the task's
-steps (the input row shows `answering /btw…` meanwhile). claw desktop works the
+last sent to the model (no tools), and the answer is printed as soon as it
+arrives (the input row shows `answering /btw…` meanwhile). A `local/` model
+served with `--parallel 1` (llama-gpu's default) answers it only once the
+running step is done, so claw waits up to 15 minutes for it there (3 for
+hosted models); set `auxiliaryModel` to answer side questions elsewhere at
+once. claw desktop works the
 same way: a message sent while the agent works is queued for its next step, and
 `/btw <question>` is answered without starting a turn.
 
@@ -501,7 +518,11 @@ under `.git`) asks first, in every mode below full access.
 
 When a sandboxed command fails on a write the sandbox refuses (`Read-only file
 system`, `Permission denied`, `Operation not permitted`), its result tells the
-model so, and the model asks you to rerun it on the host (below).
+model so, and the model asks you to rerun it on the host (below). The same goes
+for `sudo`, `su`, `doas` and `pkexec`, which cannot gain root in the sandbox:
+there sudo reports root's files as owned by uid 65534 and a "no new
+privileges" flag, which the model is told comes from the sandbox, not a broken
+sudo.
 `sandbox.excludedCommands` lists commands that always run on the host, for
 example `["docker", "git config", "npm publish"]`: an entry matches a command
 that starts with it as whole words, and only when every command in the line
@@ -585,7 +606,7 @@ request or change billing.
 | `/fallback [model\|off]` | The model to switch to when the current one fails (rate limit, no credit, errors, silence, empty replies). Without an argument, a list like `/model`'s with `off` at the top; type to filter. Saved as `providerFallbacks.fallbacks`; a `local/` fallback starts its model server when needed. Works in claw desktop too |
 | `/btw [question]` | Quick side question, answered from the conversation without tools; neither question nor answer is kept in the conversation or the saved session. Without a question, shows the last one |
 | `/recap` | One-line summary of the session (not kept in the conversation) |
-| `/goal [condition\|clear]` | Keep working across turns until the condition holds (up to 20 rounds; Esc pauses). No argument shows the goal |
+| `/goal [--fresh] [condition\|clear]` | Keep working across turns until the condition holds (up to 20 rounds; Esc pauses). The model can answer `GOAL BLOCKED: <reason>` for something only you can fix; blocked twice in a row, the goal pauses instead of using up its rounds. The goal is saved with the session, so it survives a restart or `/resume`. `--fresh` runs each round in a new session that starts with only the goal, the previous round's report and `.claw/goal-progress.md` (kept by the model): for long goals on a small local context window. Earlier rounds stay saved (`/resume`). No argument shows the goal |
 | `/loop [interval] <prompt>` (`/proactive`) | With an interval (`30s`, `5m`, `2h`): run the prompt now and again every interval until you press a key. Without one: self-paced; after each run the agent picks when to run again (1 min to 1 h, with ScheduleWakeup) or ends the loop, and the next run starts while the prompt is idle. `/loop stop` cancels the pending run |
 | `/autocompact [auto\|<tokens>]` | Show or set the context size that triggers compaction (`150k`, `1m`); saved |
 | `/branch [name]` | Fork the conversation here and switch to the fork; `/resume <id>` returns to the original |
@@ -602,7 +623,8 @@ request or change billing.
 | `/dataviz [request]` | Chart and dashboard design guidance |
 | `/run-skill-generator` | Write a project skill that teaches `/run` and `/verify` to start the app |
 | `/context [show\|clear]` | Estimated tokens versus the model's context window |
-| `/usage`, `/cost`, `/stats` | Token usage, estimated cost, cache hit rate |
+| `/usage`, `/cost` | Token usage, estimated cost, cache hit rate |
+| `/stats` | Token usage and cost, plus a speed table for the last turn: per model request, the context size and how much of it the server had cached, the wait for the first token, the generating time and output tokens/s, and the time the tools took; then session averages. A low cache share means the prompt is re-read every step; a long first-token wait means slow prompt reading |
 | `/resume [session]`, `/session` | Load, list, fork or delete saved sessions. `/resume` alone lists this folder's sessions (newest first, by their first request, with age and size) to pick from; type to filter |
 | `/rename <name>` | Name the session |
 | `/history [count]` | Summary of recent turns |
@@ -672,7 +694,8 @@ mode on and starts planning that task.
 
 | Command | What it does |
 |---|---|
-| `/tasks [list\|get <id>\|stop <id>]` | Background jobs started by the agent |
+| `/learn [now\|undo\|pin <skill>\|unpin <skill>\|on\|off]` | What the learning loop saved (learned skills with their use, recent changes); `now` reviews the conversation at once, `undo` reverts the last review or curator pass, `pin` keeps a skill from being archived (see [Learning loop](#learning-loop)) |
+| `/tasks [list\|view [id]\|get <id>\|stop <id>]` | Background jobs started by the agent; `view` watches one's output live |
 | `/theme [name]` | `dark`, `light`, `solarized-dark`, `solarized-light`, `tokyo-night`, `none`; saved for next time |
 | `/config`, `/memory`, `/hooks`, `/mcp`, `/agents`, `/skills`, `/plugin` | Inspect configuration and extensions |
 | `/doctor`, `/sandbox`, `/version`, `/providers`, `/setup` | Diagnostics and provider setup |
@@ -704,9 +727,19 @@ builds) in the background and keep working. You manage them with:
 
 ```text
 /tasks            # list jobs and their state
-/tasks get 2      # show job 2's output
-/tasks stop 2     # stop it
+/tasks view bg2   # watch bg2's output live (no id: the running one)
+/tasks get bg2    # print its output not read yet
+/tasks stop bg2   # stop it
 ```
+
+In full-screen mode, click **N shells** in the status line (shown while
+jobs run), or the *Started background job bg2* line under the agent's Bash
+call, to watch a job's output live in place of the conversation, like
+Claude Code's background tasks. The bottom row shows whether it is still
+running. ←/→ switch between jobs, PgUp/PgDn and the wheel scroll back, the
+**stop** button ends it, and Esc or ✕ goes back to the conversation (Esc
+closes the view first, even during a reply). Watching does not take the
+output away from the agent's `BashOutput` reads.
 
 When a job finishes on its own, the agent is told at once, even when the
 prompt is idle. All jobs are stopped when you exit.
@@ -757,7 +790,7 @@ picture to the tool result, so "what does ~/Pictures/bug.png show?" works.
 
 Attach screenshots or photos with `/image path.png` or `/image` (clipboard).
 PNG, JPEG, GIF and WebP are supported; the model must accept images (the
-local `qwen36-35b-a3b` does, through its `mmproj` vision file).
+local `cybertiel-35b-a3b` does, through its `mmproj` vision file).
 
 In kitty and Ghostty, images in replies (`![alt](url)`: web URLs, local
 paths, PNG/JPEG/GIF/WebP/SVG) are drawn in the terminal, in the full-screen
@@ -765,6 +798,16 @@ and the inline view, up to 80 columns by 24 rows. SVG is drawn on white. The
 model is told it can show pictures this way. Elsewhere, and inside tmux, the
 reply shows `[image:url]`. `CLAW_INLINE_IMAGES=0` turns this off, `=1` forces
 it on.
+
+Mermaid diagrams: a ```` ```mermaid ```` block in a reply (flowchart,
+sequence, class, state, ER, gantt, pie and more) is drawn as a picture. In
+the terminal the block's source is printed as usual and the diagram follows
+once the block closes: as an image where inline images work (kitty, Ghostty),
+as Unicode box-drawing text elsewhere. The desktop app shows the diagram in
+place of the source (**Copy source** copies it), in the app's light or dark
+theme; source that does not parse yet, as mid-stream, stays a code block.
+Rendering is built in (no browser or `mmdc`). `CLAW_MERMAID=0` turns it off
+in the terminal, `=text` always draws text.
 
 The **Download** tool saves a file for you: ask "download that image" or
 "save the PDF you found", and the agent fetches the URL (or copies a local
@@ -780,7 +823,7 @@ close, move or resize windows, type text, press keys (`ctrl+s`, `Return`,
 `alt+Tab`), click, double-click, drag and scroll, read and set the
 clipboard, and take screenshots. Screenshots go to `$TMPDIR/claw-x11/` and
 are shown to the model, so a vision model (like the local
-`qwen36-35b-a3b`) can check what happened; only the newest two screenshots
+`cybertiel-35b-a3b`) can check what happened; only the newest two screenshots
 stay in the conversation. It uses `xdotool`, `wmctrl`, `ffmpeg` and `xclip`,
 which must be installed. Ask for things like "open firefox and search for
 X", "close the calculator window", or "screenshot the terminal and tell me
@@ -863,6 +906,57 @@ Besides reading, editing, shell and web tools, the agent has:
 - **GoogleDork:** searches with operators (`site:`, `filetype:`, `intitle:`,
   `inurl:`, exact phrases, exclusions, dates) and gives a Google link for the
   same query.
+- **HawkScan:** StackHawk's DAST scanner, as the HawkScan plugin gives it to
+  Claude Code: ask for a security scan of a running app or API. `status`
+  says what is missing (the `hawk` CLI, or else docker/podman with the
+  `stackhawk/hawkscan` image; an API key in `HAWK_API_KEY` or from
+  `hawk init --browser`; a `stackhawk.yml`). `guide` serves the HawkScan
+  playbook and its references from the Claude Code plugin or
+  `~/.claw/skills/hawkscan`. `validate`, `scan` (findings worst first) and
+  `rescan` (only the checks that fired, to verify fixes) run in the sandbox
+  like Bash; when it blocks the scanner, the result gives the command to rerun
+  outside it, which you approve. Unlike Claude Code's plugin, claw does not
+  scan on its own after every change.
+- **Custom agents:** an agent definition in `.claw/agents/`,
+  `.claude/agents/` (in the project or above it), `~/.claw/agents/` or
+  `~/.claude/agents/` (Claude Code's Markdown format, or Codex's TOML) is a
+  sub-agent the model can run: its name is the Agent tool's `subagent_type`,
+  its body is the sub-agent's instructions, and its `tools:` list (Claude Code
+  names such as `Read`, `Grep`, `Bash`, or claw's) limits what it may use.
+  `model:` is used only when it is a `provider/model` claw can route;
+  Claude Code's `sonnet`/`opus`/`inherit` mean the session's model. They are
+  listed in the system prompt, and `/agents` shows them. An unknown
+  `subagent_type` is an error that names the available agents (before, it
+  quietly ran a general-purpose agent).
+- **Agent `fork`:** besides Explore, Plan, Verification and general-purpose
+  sub-agents, the model can start a `fork`: a sub-agent that starts with the
+  whole conversation so far (the finished turns) and the same system prompt,
+  so its task can be one line. Like `/fork <prompt>`, but the model decides.
+- **ExternalAgent:** hands a self-contained task to another agent CLI
+  installed here, `claude` (Claude Code, `claude -p`) or `codex` (`codex
+  exec`), and returns its final answer, so a local model can pass a hard
+  subtask to a stronger one. It runs in the working directory with its own
+  model, quota, sandbox and permissions (Claude Code with
+  `--permission-mode acceptEdits`, Codex with its `workspace-write` sandbox),
+  outside claw's sandbox, so the call asks for approval unless claw has
+  full access. Esc and the timeout (30 minutes) stop it. Change the command
+  lines with `"externalAgents": {"claude": {"args": [...]}, "codex":
+  {"args": [...]}}` in `~/.claw/settings.json` (`{prompt}` and `{output}`
+  are filled in).
+- **apply_patch:** edits in Codex's patch format (`*** Begin Patch`, `***
+  Update File:`, `@@`, `-`/`+` lines), several files in one call, all or
+  nothing. The same rules as `edit_file` apply: files must have been read,
+  and unchanged since. For models trained on that format (gpt-oss, Codex).
+- **ExecuteCode:** the agent writes one Python script that calls claw's
+  read-only tools as functions (`read_file`, `glob_search`, `grep_search`,
+  `code_search`, `web_search`, `web_fetch`, the git tools,
+  `session_search`), so ten searches and reads take one step instead of ten,
+  and only what the script prints comes back. The script runs like a bash
+  command (same sandbox and approval, Esc stops it, 300 s by default), with a
+  limit of 100 tool calls. `agent(prompt, subagent_type=None)` in the script
+  runs a sub-agent and returns its report; several, from threads, run in
+  parallel (on a one-slot local server they take turns). On local models
+  this saves the most time, so the launcher loads it with the core tools.
 - **WebFetch** reads Wikipedia, arXiv, GitHub (repositories, files,
   folders, issues, pull requests) and Semantic Scholar/DOI links through
   their APIs instead of scraping the page; the result starts with a short
@@ -879,6 +973,62 @@ Besides reading, editing, shell and web tools, the agent has:
   `OPENAI_API_KEY`), or locally stable-diffusion.cpp's `sd` with
   `CLAW_SD_MODEL`, and piper (`CLAW_PIPER_MODEL`) or espeak-ng for speech.
   Images go to `~/Pictures/claw/`, audio to `~/Music/claw/`.
+
+### How claw keeps a turn on track
+
+These run on every turn without settings, and are mostly for the habits
+of smaller local models:
+
+- **Tool input repaired:** a tool call with small JSON mistakes (a code fence
+  around it, trailing commas, `True`/`None`, single quotes, raw newlines in
+  strings) is repaired instead of failing, and values of the wrong type
+  (`"40"` for a number, `"true"` for a yes/no, one path where a list is
+  expected) are converted to what the tool asks for. A call cut off at the
+  output limit is never completed.
+- **Reasoning in the text:** `<think>…</think>` blocks a model writes into
+  its reply are moved to the thinking block instead of being shown as the
+  answer.
+- **Loops stopped:** a reply stuck repeating one passage is not continued
+  ("the reply got stuck repeating itself"), and its text is not sent back. A
+  call that fails twice the same way gets a note to change approach and is
+  not run after four failures; a tool that fails eight times in a row is not
+  run again that turn. (A call that keeps returning the same result was
+  already stopped after three.)
+- **Check before finishing:** when a turn edited code and is about to end
+  without having run anything since, the model is reminded once to build,
+  test or run it, or to say it is not verified. Edits to docs and data
+  files do not count. `"verifyOnStop": false` or `CLAW_VERIFY_ON_STOP=0`
+  turns it off.
+- **Instructions where the work is:** the first time the model reads, edits
+  or `cd`s into a subdirectory, that directory's `AGENTS.md`, `CLAUDE.md`,
+  `CLAW.md`, `.cursorrules` or `.clinerules` (and those of the directories
+  between) come with the tool result, once a session. The system prompt
+  only holds the ones from the working directory up.
+- **Prompt injection noted:** results of WebFetch, WebSearch, Browser,
+  SocialMedia, Download, GoogleDork and MCP tools that contain text aimed at
+  the model ("ignore previous instructions", hidden HTML, commands that send
+  secrets away, …) get a note telling the model it is data, not a request.
+- **No whole-disk searches:** a recursive `grep`, `rg`, `find`, `fd` or `du`
+  across the home directory or `/` is not run the first time: the model is
+  told it takes minutes and reads unrelated private files (other projects,
+  chat transcripts, keys), and to search the project instead. The same call
+  made again runs. (In a test, a goal round spent 12 minutes grepping `~`
+  and came back with lines of Claude Code's transcripts.)
+- **Instruction edits seen:** when `CLAUDE.md`, `AGENTS.md` or another
+  instruction file changes, is added or is removed during a session, the next
+  message tells the model the new version (the system prompt is built once,
+  so before this an edit only applied after a restart).
+- **The time:** each message carries the current time and how long since
+  the previous message, at most every 10 minutes, so "earlier" and
+  "yesterday" make sense and the model can tell how long a background job
+  has run.
+- **Images within budget:** a tool result's text and the images it attaches
+  share one budget (about 25,000 tokens; a quarter of
+  `CLAW_TOOL_RESULT_MAX_CHARS` when set). Images over it are named, with
+  their paths, instead of attached.
+- **Long output kept:** bash output over 16 KiB keeps its start and its end
+  (where errors and test summaries are), and the whole of it is saved under
+  `~/.claw/tool-output/` for the model to read or grep.
 
 #### LeanGate
 
@@ -916,7 +1066,7 @@ Manage it with `systemctl --user status|restart|stop searxng`; update it with
 
 The `claw` launcher offers a `local/` model a core set of tools to save
 context (`CodeSearch`, `Pty`, `Checkpoint`, `Diagnostics`, `GoogleDork`,
-`vision_analyze`, `RepoSignals` and `Trail` are in it); `CLAW_ALL_TOOLS=1 claw` offers all of them.
+`vision_analyze`, `RepoSignals`, `Trail`, `HawkScan` and `ExecuteCode` are in it); `CLAW_ALL_TOOLS=1 claw` offers all of them.
 When claw starts with a hosted model (`--model`, else `model` in settings, aliases
 resolved), it gets every tool. A `/model` switch later keeps the starting set.
 
@@ -1004,11 +1154,15 @@ folder and format: when `~/.claude` exists the folder is
 what they learn; otherwise it is under `~/.claw`. The index is loaded into every session; the model
 opens a memory file when it is relevant.
 
-The model saves a memory when you correct it or state a preference, when it
-learns something about the project that will matter later, or when you say
-"remember …". Say "forget …" to have it delete one. It is told not to save
+With the [learning loop](#learning-loop) on (the default), a review after
+each turn that taught something saves memories, so the model does not stop
+its work to save passing facts; it saves one itself when you say "remember
+…". Say "forget …" to have it delete one. With the loop off, the model saves
+a memory when you correct it, state a preference, or it learns something
+about the project that will matter later. It is told not to save
 what the code or git history already shows, or secrets. Writing in the memory
-folder never asks for permission.
+folder never asks for permission. claw creates the folder when a session
+starts (the index appears with the first memory).
 
 `/memory` lists the saved memories and the folder; edit or delete the files to
 change them. Turn it off with `"autoMemoryEnabled": false` in settings or
@@ -1035,6 +1189,55 @@ Claude Code still reads the same folder):
   duplicates, at most five. It also runs on `/exit` after a session of five
   or more turns; Esc skips it, and `"memoryReflectOnExit": false` or
   `CLAW_MEMORY_REFLECT=0` turns that off.
+
+### Learning loop
+
+After a turn that taught something, claw reviews it in the background and
+saves what will help next time:
+
+- **Skills** are procedures: how to do a kind of task in this setup (the
+  commands that work, the steps, the pitfalls hit, how to check the result).
+  They go to `~/.claw/skills/<name>/SKILL.md`, marked `source: learned`, and
+  are listed in every session's system prompt with the other skills (the
+  project's `.claw/skills/` and `.claude/skills/`, and Claude Code's
+  `~/.claude/skills/`), so the model loads one with the Skill tool when a
+  task matches.
+- **Memories** are facts, saved in the [auto memory](#auto-memory) folder.
+
+Every review is logged with its outcome (saved, nothing worth saving,
+cancelled by your next prompt, or failed) in `~/.claw/learning/reviews.log`;
+`/learn` shows the latest ones.
+
+Which turns are reviewed: one where you corrected claw or said how to work
+("don't …", "always …", "from now on …"), where a failure was then overcome,
+with ten or more tool calls, or where a learned skill was used and something
+failed. At most one review every two turns, unless you corrected it. Other
+turns cost nothing.
+
+The review is the conversation plus one instruction. It goes to
+`auxiliaryModel` when set, else to the main model with the turn's own
+request, so a local server reuses the prompt it already processed. Sending a
+new prompt cancels a review still running, so a one-slot local server is
+never busy with it when you need it. The model answers with a list of
+changes and claw applies them itself after checking each one: a skill you
+wrote is never changed, text that looks like prompt injection, a backdoor or
+a hardcoded secret is refused, and the instruction holds it to a high bar
+(would it still help a month from now; is it already saved; did you say it,
+or only not object). What was saved is shown as a dim `✎ learned: …` line.
+
+Skills improve with use: each load is counted, and a learned skill used in a
+turn that had failures is shown to the review with its text, to be fixed or
+extended. A curator keeps the set small: a learned skill unused for 12
+sessions is shown as stale, and one unused for 40 sessions is archived to
+`~/.claw/skills/.archive/` (pinned skills never are). Look-alike skills are
+offered to the review to merge. Only sessions count, not time away.
+
+`/learn` shows the learned skills with their use and the latest changes;
+`/learn undo` reverts the last review or curator pass (every change is
+journaled with what it replaced, in `~/.claw/learning/`); `/learn now`
+reviews the conversation at once; `/learn pin <skill>` keeps a skill from
+being archived; `/learn off` turns the loop off (`"learningLoop": false`,
+`CLAW_LEARNING=0`, or the older `"learning": "off"`).
 
 `CodeSearch` answers structural questions about the code as well:
 `kind: "callers"` lists where a function is called from (with the function
@@ -1090,7 +1293,9 @@ file works as a template.
 | `rulesImport` | `"auto"` \| `"none"` \| `[framework]` | Import Cursor/Copilot/… rule files |
 | `autoMemoryEnabled` | bool (true) | Memory files in the prompt |
 | `memoryReflectOnExit` | bool (true) | Save what the session learned when it ends |
-| `learning` | `"on"` \| `"off"` | Background memory/skill reviews and the skill curator |
+| `learningLoop` | bool (true) | The [learning loop](#learning-loop): background reviews that save skills and memories, and the skill curator (`"learning": "off"` also turns it off) |
+| `verifyOnStop` | bool (true) | Remind the model once to check code it edited before a turn ends |
+| `externalAgents` | `{claude: {args}, codex: {args}}` | Command lines for the ExternalAgent tool (`{prompt}`, `{output}` filled in) |
 | `leanGate` | bool (true) | Lean checks after edits |
 | `theme` | theme name | `/theme` saves it |
 | `editorMode` | `"normal"` \| `"vim"` | Input editor keys (`/vim`) |
@@ -1141,6 +1346,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_REASONING_REPLAY_MAX_CHARS` | How much of each earlier step's thinking (its end) goes back to a `local/` model within a turn; default 4000, `0` for all of it. Hosted models always get all of it |
 | `CLAW_THINKING_BUDGET` | Most tokens a `local/` model may think per reply (llama-server's `thinking_budget_tokens`); default half the reply budget, never more than the reply budget minus 1024; `-1` sends none |
 | `WGPU_POWER_PREF` | Which GPU the desktop app draws on: `low` (its default, a laptop's integrated GPU, leaving the discrete GPU's memory to a local model) or `high`. `ICED_BACKEND=tiny-skia` draws on the CPU instead |
+| `WINIT_X11_SCALE_FACTOR` | UI scale of the desktop app on X11. claw-desktop sets `1` when it is unset, so the window is the same size on a high-DPI laptop panel as on an external monitor; set e.g. `1.5` to scale it up (Settings → Text size changes only the text) |
 | `CLAW_DEFER_TOOLS` | `0` sends every tool's full description, instead of listing the specialised tools by name in `ToolSearch` |
 | `CLAW_TOOL_RESULT_MAX_CHARS` | Cap on what one tool call sends to a local model (the launcher sets 12000). Hosted models get a quarter of their context window instead (4k–100k characters). A cut result is saved whole under `~/.claw/tool-output/` (kept a week) and the note tells the model where to read the rest |
 | `CLAW_MODELS_CATALOG=0` | Don't look up hosted models' context and output limits in the models.dev catalog |
@@ -1149,8 +1355,11 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_THEME` | Theme, overriding the saved one |
 | `CLAW_DIFF_PANEL=0` | No diff panel this run (`/diffpanel off` saves it) |
 | `CLAW_FULLSCREEN=0` | Inline view instead of the full-screen window (output stays in the terminal's history) |
+| `CLAW_MERMAID` | `0` prints ```` ```mermaid ```` blocks as code only, `text` always draws them as box-drawing text (default: an image where inline images work, text elsewhere) |
 | `CLAW_INLINE_IMAGES` | `0` never draws reply images in the terminal, `1` always does (default: kitty and Ghostty, not inside tmux) |
 | `CLAW_AUTO_MEMORY=0` | Turn off auto memory for this run |
+| `CLAW_LEARNING=0` | Turn off the learning loop for this run |
+| `CLAW_VERIFY_ON_STOP=0` | Do not remind the model to check edited code before a turn ends |
 | `CLAW_OVERFLOW_TOOL_RESULT_CHARS` | When a request overflows the context window, longest a tool result may stay (`64k`; at least 1k), or `off` to never cut. Default: about a quarter of the model's window. Also `overflowToolResultChars` in `~/.claw/settings.json` |
 | `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` | Context size (input tokens of the last request) at which the session is compacted automatically; default 100000 |
 | `NO_COLOR` | No colours |
@@ -1164,9 +1373,9 @@ These settings in `~/.claw/settings.json` keep a session going and let claw
 learn across sessions:
 
 ```json
-"providerFallbacks": { "fallbacks": ["local/qwen36-35b-a3b"] },
+"providerFallbacks": { "fallbacks": ["local/cybertiel-35b-a3b"] },
 "auxiliaryModel": "nvidia/nvidia/nemotron-3-super-120b-a12b",
-"learning": "on"
+"learningLoop": true
 ```
 
 - **`providerFallbacks.fallbacks`** (set it with `/fallback`): when the model in use is rate-limited
@@ -1181,7 +1390,7 @@ learn across sessions:
   only afford N") is first retried with that smaller reply budget, which
   then holds for that model until claw exits.
 - **`visionModel`**: a model that reads images, e.g. the local
-  `"local/qwen36-35b-a3b"` (llama-gpu loads its `mmproj`, as for the desktop's
+  `"local/cybertiel-35b-a3b"` (llama-gpu loads its `mmproj`, as for the desktop's
   Attach) or `"openrouter/nvidia/nemotron-3.5-super-vl:free"`. When the model in use
   takes no images (screenshots from `Browser` or `X11`, `vision_analyze`),
   claw sends it this model's description of each image instead. Unset, such
@@ -1191,13 +1400,9 @@ learn across sessions:
   `/btw`, `/recap`, learning), so they do not spend the main model's quota and
   keep working while it is limited. Unset, the main model does them (a local
   main model keeps the summary built from the messages, which costs nothing).
-- **`learning`**: after a turn with four or more tool calls, a background
-  request decides whether to save a memory or a skill
-  (`~/.claw/skills/<name>/SKILL.md`, marked `learned-by: claw`); what it saved is
-  shown at the next prompt. Once a week, while idle, the learned skills are
-  merged or archived (`~/.claw/skills/.archive/`; never deleted, and skills you
-  wrote are never touched). `"off"` turns it off. It needs `auxiliaryModel` or a
-  hosted main model.
+- **`learningLoop`**: reviews turns that taught something and saves skills
+  and memories; see [Learning loop](#learning-loop). With `auxiliaryModel`
+  set, reviews go there instead of to the main model.
 - **`SessionSearch`** (tool): the model can search every past claw session
   for words, to recall earlier fixes and decisions.
 

@@ -7,8 +7,9 @@
 //! is the same folder and format Claude Code uses (under `~/.claude`), so the
 //! two share what they learn; without `~/.claude` it lives under `~/.claw`. The index and the instructions for keeping memories are added to
 //! the system prompt; the model reads a memory file when it is relevant and
-//! writes memories with the ordinary file tools. Nothing is created until
-//! the model saves its first memory.
+//! writes memories with the ordinary file tools. The folder is created
+//! when the prompt is built (so the model can write to it, or read from it,
+//! without checking first); the index is created with the first memory.
 //!
 //! On by default; `"autoMemoryEnabled": false` in settings or
 //! `CLAW_AUTO_MEMORY=0` turns it off.
@@ -35,6 +36,11 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{claude_config_home, default_config_home, RuntimeConfig};
+
+/// When the model should save, in the memory section.
+pub const WHEN_TO_SAVE: &str = "When to save: when the user corrects you or states a preference, when you learn something about the project that will matter later, and when a task failed for a reason worth avoiding next time. Save it right away, with write_file or edit_file.";
+/// The same with the learning loop on ([`crate::learning`]).
+pub const WHEN_TO_SAVE_WITH_REVIEW: &str = "When to save: a review after each turn that taught something files the durable memories and skills itself, so do not break off your work to save passing facts. Save yourself, right away, only when the user asks you to remember, update or forget something (and say so plainly if that write fails).";
 
 /// The index file inside the memory folder.
 pub const MEMORY_INDEX: &str = "MEMORY.md";
@@ -126,6 +132,9 @@ pub fn is_memory_path(path: &str) -> bool {
 #[must_use]
 pub fn render_memory_section_for(cwd: &Path) -> String {
     let dir = memory_dir(cwd);
+    // The prompt says the folder exists: make it so, or a brand-new
+    // project's first read or write of it starts with "no such file".
+    let _ = fs::create_dir_all(&dir);
     let root = project_root(cwd);
     render_with(&dir, Some(&root))
 }
@@ -147,7 +156,7 @@ fn render_with(dir: &Path, root: Option<&Path>) -> String {
     let mut section = format!(
         "# Memory
 
-You have a persistent, file-based memory at `{dir_display}/`. It carries what you learn about this user and project from one session to the next. The folder may not exist yet; writing a file creates it.
+You have a persistent, file-based memory at `{dir_display}/`. It carries what you learn about this user and project from one session to the next. The folder already exists: write to it directly, without checking for it or creating it. Its index, `{MEMORY_INDEX}`, is shown at the end of this section, so do not read it before saving; if it does not exist yet, create it with write_file when you save the first memory.
 
 Each memory is one markdown file holding one fact, with frontmatter:
 
@@ -173,7 +182,7 @@ Types:
 
 After writing a memory file, add one line for it to `{dir_display}/{MEMORY_INDEX}`: `- [Title](file.md) — short hook`. The index is loaded into every session; keep it to one line per memory and never put memory content in it.
 
-When to save: when the user corrects you or states a preference, when you learn something about the project that will matter later, and when a task failed for a reason worth avoiding next time. Save it right away, with write_file or edit_file.
+{WHEN_TO_SAVE}
 What not to save: what the code, git history or instruction files already record; details that only matter to the current task; secrets such as API keys, passwords or tokens.
 Before saving, check whether an existing memory covers it, and update that file instead of adding a duplicate. Delete memories that turn out to be wrong.
 Memories are what was true when they were written. If one names a file, function or flag, check that it still exists before relying on it.

@@ -112,7 +112,15 @@ Key points:
   the conversation (anchored while scrolled up). Mode and query sequences
   (bracketed paste, kitty keyboard, OSC 52) are passed to the terminal. On
   exit the conversation is printed to the normal screen; a panic hook puts
-  the terminal back.
+  the terminal back. Collapsible output (a long tool call or result, a
+  thinking block) is printed between `screen::fold_begin`/`fold_full`/
+  `fold_end` marks: the short form goes into the conversation, the
+  untruncated one (rendered with the CLI's display limits off) is kept
+  aside, and a click on it or Ctrl+O splices one for the other. The
+  background-task view (`screen::open_tasks_view`, opened by clicking the
+  footer's "N shells" or a job's start line, or `/tasks view`) draws a job's
+  output tail (`BackgroundJobs::peek`, which leaves the model's read offset
+  alone) in place of the conversation, redrawn while it is open.
 - **Images from tools.** Tool results are text; a tool names a picture with
   an output line `claw-image: /path.png` (`runtime::tool_images`), and the
   conversation loop attaches it to the tool result message as an image
@@ -140,6 +148,14 @@ Key points:
   full-screen emulator, which keeps one combining mark per cell and passes
   `ESC _ G` through. The alternate screen holds its own images, so the
   graphics commands are replayed before the conversation is printed on exit.
+- **Mermaid.** ```` ```mermaid ```` blocks are rendered in-process:
+  `mermaid-rs-renderer` lays the diagram out to SVG. The CLI
+  (`rusty-claude-cli/src/mermaid.rs`, called from `render.rs` when a fence
+  closes, streamed or not) sends that SVG through `term_image::show_bytes`,
+  or uses `mermaid-text` for box-drawing text when the terminal has no
+  graphics. claw-desktop (`markdown_view.rs`) hands the SVG to iced's `svg`
+  widget, cached by source and theme, and falls back to the highlighted code
+  block while the source does not parse.
 - **Diffs and the diff panel.** Write and edit tools report unified-diff
   hunks with 3 context lines (`runtime::line_diff`, Myers' algorithm after
   trimming the common start and end; past 4,000 differing lines the middle is
@@ -237,8 +253,14 @@ Key points:
 - **Side questions during a turn.** `/btw` typed while a turn runs goes to
   `turn_keys::set_side_question_handler`: the CLI answers it on a thread from
   the last request sent to the model (`SIDE_CONTEXT`) and the answer is printed
-  between steps (`turn_keys::print_side_answers`). claw desktop's agent queues
-  prompts that arrive during a turn with `turn_keys::queue_for_running_turn`.
+  as soon as it arrives (`turn_keys::push_side_answer`). Other slash commands
+  go to `turn_keys::set_command_handler` (`run_command_during_turn`): the ones
+  that need no `LiveCli` run on the key watcher's thread, the rest stay queued
+  for the REPL loop and are never passed to the model. Typed messages reach the
+  model after a tool step or, when the step was the final reply, continue the
+  turn (`ConversationRuntime::pass_queued_to_running_turn`). claw desktop's
+  agent queues prompts that arrive during a turn with
+  `turn_keys::queue_for_running_turn`.
 - **Reasoning across a turn's steps.** The OpenAI-compatible request sends
   each assistant message's thinking back as `reasoning_content` for the running
   turn (after the last user request) to local models and to models models.dev
@@ -459,8 +481,82 @@ destructive commands.
   the memory folder as inside the workspace, so changing a memory never asks.
   Off with `autoMemoryEnabled: false` or `CLAW_AUTO_MEMORY=0`.
 
+- the skills list (`learning::skills_section`): every skill the Skill tool
+  can load, learned ones marked.
+
+With the learning loop on, the memory section tells the model to save only
+on explicit requests (`memory::WHEN_TO_SAVE_WITH_REVIEW`), since the review
+files the rest.
+
 Plan mode (`/plan`) appends a "read-only investigation, reply with a plan"
 section and switches the permission mode to read-only until `/plan off`.
+
+### Learning loop
+
+`runtime/src/learning.rs` holds the deterministic part: which turns are worth
+reviewing (`TurnSignals::from_messages`, `should_review`), the review
+instruction (`review_prompt`), parsing the model's JSON (`parse_review`),
+applying it with validation and a strict-scope `threats::scan`
+(`apply_review`), the journal behind `/learn undo` and the ledger of skill
+use and sessions behind the curator (`record_session_start` archives learned
+skills unused for 40 sessions; `record_skill_use` is called by the Skill
+tool). `rusty-claude-cli/src/learning.rs` runs the review in a background
+thread after `run_turn` (`after_turn`): it takes the last request from
+`SIDE_CONTEXT` (its model, tools and system prompt, so a local server's
+prompt cache is reused), sets its messages to the whole conversation plus the
+instruction, sends it to `auxiliaryModel`
+or the main client, and is cancelled by the next `run_turn`
+(`learning::cancel`). Results are queued as notices and printed before the
+next prompt (at once in full-screen mode).
+
+### Goals, forks and per-turn context
+
+`/goal` (`claude_commands.rs::pursue_goal`) saves the goal in
+`~/.claw/goals/<session>.txt` (`[fresh] ` marks `--fresh`), loads it when the
+session changes (`sync_goal_with_session`), and stops on `GOAL MET` or on two
+`GOAL BLOCKED:` rounds in a row; `--fresh` rounds switch to a new session
+first (`start_goal_round_session`). `with_job_notices` prefixes each user
+message with background-job notices, `prompt::InstructionWatch::changes`
+(instruction files edited since the system prompt was built) and
+`prompt::time_reminder` (every 10 minutes). `run_turn` hands the finished
+conversation and system prompt to `tools::set_fork_seed`, which a `fork`
+Agent starts from; it also calls `step_stats::begin_turn`, and
+`stream_once`/the tool executor feed `step_stats` for `/stats`. Tools added
+here: `ExternalAgent` (`tools/src/external_agent.rs`, a `claude -p` or `codex
+exec` child in its own process group, stopped through `runtime::turn_aborted`)
+and `apply_patch` (`tools/src/apply_patch.rs` parses and applies hunks;
+`lib.rs::run_apply_patch` checks every file before writing any).
+`tool_images::attach_tool_images` keeps a result's text and images within one
+token budget.
+
+Custom agent definitions: `commands::custom_agents`/`find_custom_agent`
+read them (body, `tools:`, `model:`) from the roots `/agents` uses;
+`tools::execute_agent_with_spawn` treats any `subagent_type` outside
+`BUILTIN_SUBAGENT_TYPES` as one, building its system prompt with
+`build_agent_system_prompt_with_role` and its tool set with
+`custom_agent_tools` (Claude Code names mapped to claw's). The CLI lists them
+in the system prompt (`custom_agents_section`).
+
+### Turn guards
+
+Inside `ConversationRuntime::drive_turn`, besides the repeated-result check:
+`turn_guards::FailureGuard` notes and then blocks calls that keep failing;
+`turn_guards::is_repetition_dominated`/`is_runaway_repetition` replace a
+looped reply's text with `REPETITION_NOTE` and end the turn instead of
+continuing it; `turn_guards::VerifyGuard` pushes one reminder before a turn
+that edited code ends unchecked (`set_verify_on_stop`). `annotate_tool_result`
+appends the failure notes, `threats::tool_result_warning` for web/MCP tools,
+and `context_hints::ContextHints` (subdirectory instruction files, shared
+across a session's turns through an `Arc<Mutex<…>>` the CLI keeps). Before
+the loop, tool input is repaired in the CLI (`repaired_tool_input` →
+`api::repair_json`) and coerced to the tool's schema in
+`tools::coerce_tool_input`; `api::providers::think_scrubber` moves inline
+`<think>` blocks of OpenAI-compatible streams to thinking. `tool_spill`
+saves long output (bash over 16 KiB, capped results) under
+`~/.claw/tool-output/`, which `classify_read_path_permission` treats like the
+workspace. `ExecuteCode` (`tools/src/code_exec.rs`) serves read-only tools to
+a Python script over a Unix socket in a temporary folder of the working
+directory, the only place the sandbox lets the script reach.
 
 ## State on disk
 

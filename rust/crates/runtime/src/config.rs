@@ -1337,6 +1337,17 @@ pub fn save_user_setting(key: &str, value: Option<&str>) -> Result<(), ConfigErr
     write_settings_root(&settings_path, &root)
 }
 
+/// Set one top-level key in `~/.claw/settings.json` to any JSON value,
+/// preserving every other key.
+pub fn save_user_setting_value(key: &str, value: serde_json::Value) -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+    let mut root = read_settings_root(&settings_path);
+    root.insert(key.to_string(), value);
+    write_settings_root(&settings_path, &root)
+}
+
 /// `key` from `~/.claw/settings.json` as any JSON value.
 #[must_use]
 pub fn read_user_setting_value(key: &str) -> Option<serde_json::Value> {

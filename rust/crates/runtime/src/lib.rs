@@ -14,6 +14,7 @@ pub mod branch_lock;
 mod compact;
 mod config;
 pub mod config_validate;
+pub mod context_hints;
 mod conversation;
 mod file_ops;
 pub mod g004_conformance;
@@ -22,6 +23,7 @@ pub mod green_contract;
 mod hooks;
 mod json;
 mod lane_events;
+pub mod learning;
 pub mod line_diff;
 pub mod lsp_client;
 mod mcp;
@@ -57,9 +59,12 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+pub mod threats;
 pub mod tool_images;
+pub mod tool_spill;
 #[cfg(test)]
 mod trust_resolver;
+pub mod turn_guards;
 mod usage;
 pub mod worker_boot;
 
@@ -84,7 +89,7 @@ pub use approval_tokens::{
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
 pub use background_jobs::{global_background_jobs, BackgroundJobs, JobRead, JobState, JobSummary};
-pub use bash::{execute_bash, shell_program, BashCommandInput, BashCommandOutput};
+pub use bash::{execute_bash, shell_program, turn_aborted, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
@@ -95,8 +100,8 @@ pub use compact::{
 pub use config::{
     claude_config_home, clear_user_provider_settings, default_config_home, read_user_setting,
     read_user_setting_value, save_user_provider_settings, save_user_setting,
-    suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry, ConfigError,
-    ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
+    save_user_setting_value, suppress_config_warnings_for_json_mode, ApiTimeoutConfig, ConfigEntry,
+    ConfigError, ConfigFileReport, ConfigFileStatus, ConfigInspection, ConfigLoader, ConfigSource,
     McpConfigCollection, McpInvalidServerConfig, McpManagedProxyServerConfig, McpOAuthConfig,
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
@@ -181,9 +186,9 @@ pub use policy_engine::{
 };
 pub use project_trust::trust_store_path;
 pub use prompt::{
-    load_system_prompt, load_system_prompt_with_context, prepend_bullets, ContextFile,
-    ModelFamilyIdentity, ProjectContext, PromptBuildError, SystemPromptBuilder,
-    FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, load_system_prompt_with_context, prepend_bullets, time_reminder,
+    ContextFile, InstructionWatch, ModelFamilyIdentity, ProjectContext, PromptBuildError,
+    SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, TIME_REMINDER_EVERY,
 };
 pub use recovery_recipes::{
     attempt_recovery, recipe_for, EscalationPolicy, FailureScenario, RecoveryAttemptState,
@@ -226,6 +231,7 @@ pub use task_packet::{
     validate_packet, TaskPacket, TaskPacketValidationError, TaskResource, ValidatedPacket,
 };
 pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat};
+pub use tool_spill::is_spill_path;
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{

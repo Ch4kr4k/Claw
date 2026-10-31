@@ -1,7 +1,8 @@
 //! How replies are drawn: iced's Markdown with code blocks that are syntax
 //! highlighted (Solarized), wrapped instead of overflowing, and carry a
-//! language label and a Copy button; paragraphs that break long words; and
-//! images loaded from the web or from disk.
+//! language label and a Copy button; ```mermaid blocks drawn as diagrams;
+//! paragraphs that break long words; and images loaded from the web or from
+//! disk.
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
@@ -34,6 +35,9 @@ type Line = Arc<[Span<'static, markdown::Uri>]>;
 #[derive(Default)]
 pub struct HighlightCache {
     blocks: HashMap<u64, Arc<[Line]>>,
+    /// Mermaid diagrams, keyed by source and theme; an error while the
+    /// source does not parse (as it often does mid-stream).
+    diagrams: HashMap<u64, Result<svg::Handle, String>>,
 }
 
 impl HighlightCache {
@@ -51,6 +55,41 @@ impl HighlightCache {
         self.blocks.insert(key, lines.clone());
         lines
     }
+
+    fn diagram(&mut self, code: &str, light: bool) -> Result<svg::Handle, String> {
+        let mut hasher = DefaultHasher::new();
+        (code, light).hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(diagram) = self.diagrams.get(&key) {
+            return diagram.clone();
+        }
+        if self.diagrams.len() > 100 {
+            self.diagrams.clear();
+        }
+        let options = mermaid_rs_renderer::RenderOptions {
+            theme: if light {
+                mermaid_rs_renderer::Theme::modern()
+            } else {
+                mermaid_rs_renderer::Theme::dark()
+            },
+            ..mermaid_rs_renderer::RenderOptions::default()
+        };
+        let diagram = mermaid_rs_renderer::render_with_options(code, options)
+            .map(|svg| svg::Handle::from_memory(svg.into_bytes()))
+            .map_err(|error| {
+                let error = error.to_string();
+                error.lines().next().unwrap_or_default().to_string()
+            });
+        self.diagrams.insert(key, diagram.clone());
+        diagram
+    }
+}
+
+fn is_mermaid(language: &str) -> bool {
+    language
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("mermaid"))
 }
 
 fn highlight(language: &str, code: &str, theme: iced::highlighter::Theme) -> Arc<[Line]> {
@@ -105,6 +144,30 @@ pub struct Viewer<'a> {
     pub light: bool,
 }
 
+impl<'a> Viewer<'a> {
+    /// A drawn Mermaid diagram with the block's label and a Copy button
+    /// (for the source). Unparsable source falls back to a code block.
+    fn diagram_block(&self, handle: svg::Handle, code: &str) -> Element<'a, Message> {
+        let header = row![
+            text("mermaid").size(12).style(theme::muted),
+            space::horizontal(),
+            button(text("Copy source").size(12))
+                .style(theme::ghost)
+                .padding([2, 8])
+                .on_press(Message::Copy(code.to_string())),
+        ]
+        .align_y(iced::Alignment::Center);
+        let picture = container(svg(handle).width(Length::Shrink).height(Length::Shrink))
+            .max_width(900)
+            .max_height(700);
+        container(column![header, picture].spacing(4))
+            .padding([8, 12])
+            .width(Length::Fill)
+            .style(theme::code_box)
+            .into()
+    }
+}
+
 impl<'a> markdown::Viewer<'a, Message> for Viewer<'a> {
     fn on_link_click(url: markdown::Uri) -> Message {
         Message::Link(url)
@@ -130,6 +193,12 @@ impl<'a> markdown::Viewer<'a, Message> for Viewer<'a> {
         _lines: &'a [markdown::Text],
     ) -> Element<'a, Message> {
         let language = language.unwrap_or_default();
+        if is_mermaid(language) && !code.trim().is_empty() {
+            let diagram = self.highlights.borrow_mut().diagram(code, self.light);
+            if let Ok(handle) = diagram {
+                return self.diagram_block(handle, code);
+            }
+        }
         let lines = self.highlights.borrow_mut().get(
             language,
             code,
@@ -367,5 +436,20 @@ fn image_state(url: &str, bytes: Vec<u8>, kind: &str) -> Result<ImageState, Stri
         Err("not an image".to_string())
     } else {
         Ok(ImageState::Raster(image::Handle::from_bytes(bytes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_mermaid, HighlightCache};
+
+    #[test]
+    fn mermaid_blocks_become_diagrams_and_bad_source_does_not() {
+        assert!(is_mermaid("mermaid"));
+        assert!(!is_mermaid("rust"));
+        let mut cache = HighlightCache::default();
+        assert!(cache.diagram("flowchart LR\n  A --> B\n", false).is_ok());
+        assert!(cache.diagram("flowchart LR\n  A --> B\n", true).is_ok());
+        assert!(cache.diagram("not a diagram {{{", true).is_err());
     }
 }

@@ -556,6 +556,8 @@ struct StreamState {
     tool_calls: BTreeMap<u32, ToolCallState>,
     thinking_started: bool,
     thinking_finished: bool,
+    /// Moves `<think>` blocks in the reply text to the thinking block.
+    scrubber: super::think_scrubber::ThinkScrubber,
 }
 
 impl StreamState {
@@ -571,6 +573,7 @@ impl StreamState {
             tool_calls: BTreeMap::new(),
             thinking_started: false,
             thinking_finished: false,
+            scrubber: super::think_scrubber::ThinkScrubber::new(),
         }
     }
 
@@ -619,41 +622,22 @@ impl StreamState {
                     .and_then(|t| t.content)
                     .filter(|value| !value.is_empty()))
             {
-                if !self.thinking_started {
-                    self.thinking_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
-                        content_block: OutputContentBlock::Thinking {
-                            thinking: String::new(),
-                            signature: None,
-                        },
-                    }));
-                }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
-                    delta: ContentBlockDelta::ThinkingDelta {
-                        thinking: reasoning,
-                    },
-                }));
+                self.push_thinking(&mut events, reasoning);
             }
 
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                self.close_thinking(&mut events);
-                if !self.text_started {
-                    self.text_started = true;
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: self.text_block_index(),
-                        content_block: OutputContentBlock::Text {
-                            text: String::new(),
-                        },
-                    }));
+                for piece in self.scrubber.feed(&content) {
+                    self.push_piece(&mut events, piece);
                 }
-                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: self.text_block_index(),
-                    delta: ContentBlockDelta::TextDelta { text: content },
-                }));
             }
 
+            if !choice.delta.tool_calls.is_empty() {
+                // Text held back as a possible tag start goes out before
+                // the tool calls' blocks open.
+                for piece in self.scrubber.flush() {
+                    self.push_piece(&mut events, piece);
+                }
+            }
             for tool_call in choice.delta.tool_calls {
                 self.close_thinking(&mut events);
                 let tool_index_offset = self.tool_index_offset();
@@ -705,6 +689,9 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        for piece in self.scrubber.flush() {
+            self.push_piece(&mut events, piece);
+        }
         self.close_thinking(&mut events);
         if self.text_started && !self.text_finished {
             self.text_finished = true;
@@ -752,6 +739,52 @@ impl StreamState {
             events.push(StreamEvent::MessageStop(MessageStopEvent {}));
         }
         Ok(events)
+    }
+
+    fn push_thinking(&mut self, events: &mut Vec<StreamEvent>, thinking: String) {
+        if !self.thinking_started {
+            self.thinking_started = true;
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: 0,
+                content_block: OutputContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: None,
+                },
+            }));
+        }
+        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { thinking },
+        }));
+    }
+
+    fn push_piece(&mut self, events: &mut Vec<StreamEvent>, piece: super::think_scrubber::Piece) {
+        match piece {
+            // Thinking goes first, in block 0; a `<think>` block after the
+            // text has started (or after the reasoning block was closed)
+            // is dropped rather than shown.
+            super::think_scrubber::Piece::Thinking(thinking) => {
+                if !self.text_started && !self.thinking_finished {
+                    self.push_thinking(events, thinking);
+                }
+            }
+            super::think_scrubber::Piece::Text(content) => {
+                self.close_thinking(events);
+                if !self.text_started {
+                    self.text_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: self.text_block_index(),
+                        content_block: OutputContentBlock::Text {
+                            text: String::new(),
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: self.text_block_index(),
+                    delta: ContentBlockDelta::TextDelta { text: content },
+                }));
+            }
+        }
     }
 
     fn close_thinking(&mut self, events: &mut Vec<StreamEvent>) {
@@ -1731,18 +1764,25 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    let (inline_thinking, text) = choice
+        .message
+        .content
+        .as_deref()
+        .map(super::think_scrubber::split_think_blocks)
+        .unwrap_or_default();
     if let Some(thinking) = choice
         .message
         .reasoning_content
         .filter(|value| !value.is_empty())
         .or(choice.message.reasoning.filter(|value| !value.is_empty()))
+        .or((!inline_thinking.is_empty()).then_some(inline_thinking))
     {
         content.push(OutputContentBlock::Thinking {
             thinking,
             signature: None,
         });
     }
-    if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
+    if !text.is_empty() {
         content.push(OutputContentBlock::Text { text });
     }
     for tool_call in choice.message.tool_calls {
@@ -1772,7 +1812,10 @@ fn normalize_response(
 }
 
 fn parse_tool_arguments(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| json!({ "raw": arguments }))
+    serde_json::from_str(arguments)
+        .ok()
+        .or_else(|| crate::repair_json(arguments))
+        .unwrap_or_else(|| json!({ "raw": arguments }))
 }
 
 fn next_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {

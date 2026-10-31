@@ -168,6 +168,8 @@ impl LineEditor {
     pub fn set_completions(&mut self, completions: Vec<String>) {
         self.completions = normalize_completions(completions);
         self.commands = menu_commands(&self.completions);
+        // The same `/` menu while typing during a reply.
+        runtime::turn_keys::set_command_menu(self.commands.clone());
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -236,6 +238,24 @@ impl LineEditor {
     }
 
     fn handle_event(&mut self, event: Event) -> io::Result<KeyAction> {
+        // The background-task view takes Esc and ←/→ while it is open.
+        if self.pane && screen::tasks_view_open() {
+            if let Event::Key(key) = &event {
+                if key.kind != KeyEventKind::Release && key.modifiers.is_empty() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            screen::close_tasks_view();
+                            return Ok(KeyAction::Continue);
+                        }
+                        KeyCode::Left | KeyCode::Right => {
+                            screen::tasks_view_step(if key.code == KeyCode::Left { -1 } else { 1 });
+                            return Ok(KeyAction::Continue);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         if self.pane {
             if let Some(scroll) = scroll_for(&event) {
                 // The wheel scrolls whatever is under the pointer.
@@ -569,6 +589,9 @@ impl LineEditor {
                 state.buf.drain(state.pos..end);
             }
             KeyCode::Char('l') if ctrl => state.clear_screen = true,
+            // Expands or collapses the tool calls, results and thinking cut
+            // short in the conversation (full-screen mode).
+            KeyCode::Char('o') if ctrl => screen::toggle_all_folds(),
             KeyCode::Up if !state.menu.is_empty() => {
                 state.menu_index = (state.menu_index + state.menu.len() - 1) % state.menu.len();
             }

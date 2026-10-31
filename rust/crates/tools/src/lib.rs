@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -487,7 +487,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean", "description": "Request explicit approval to execute this exact command on the host outside the sandbox. Use for necessary host administration; never set for package searches. Ordinary Bash approval does not grant host access." },
+                    "dangerouslyDisableSandbox": { "type": "boolean", "description": "Request explicit approval to execute this exact command on the host outside the sandbox. Use for necessary host administration: sudo, su, doas and pkexec cannot gain root inside the sandbox, and only the workspace is writable there, so set it for commands that need root (installing or updating packages, editing /etc, system services). Never set it for package searches. Ordinary Bash approval does not grant host access." },
                     "namespaceRestrictions": { "type": "boolean" },
                     "isolateNetwork": { "type": "boolean" },
                     "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
@@ -546,7 +546,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Create a text file in the workspace, or replace one completely. To change part of an existing file use edit_file: it sends only the change, while rewriting resends the whole file and can drop code that was there. An existing file must be read with read_file first.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -624,7 +624,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace old_string with new_string in a workspace file. new_string replaces only the matched text, not the whole file; use write_file to rewrite a whole file.",
+            description: "Replace old_string with new_string in a workspace file: the way to change an existing file, including fixing compiler errors one at a time. new_string replaces only the matched text, not the whole file. Use write_file only for new files or when nearly every line changes. Read the file with read_file first.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -872,7 +872,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Agent",
-            description: "Launch a sub-agent that works on a delegated task with its own tools and context, and return its final result. Give it a complete, self-contained prompt. subagent_type: Explore (read-only search), Plan (read-only planning), Verification (can run commands), or omit for a general-purpose agent that can edit files and run commands. Set run_in_background to true to keep working while it runs: you are notified with its result when it finishes, so do not poll or sleep for it.",
+            description: "Launch a sub-agent that works on a delegated task with its own tools and context, and return its final result. Give it a complete, self-contained prompt. subagent_type: Explore (read-only search), Plan (read-only planning), Verification (can run commands), fork (a copy of you that starts with this whole conversation, so its prompt only needs the task; for side work that needs the context), the name of a custom agent listed in the system prompt, or omit for a general-purpose agent that can edit files and run commands. Set run_in_background to true to keep working while it runs: you are notified with its result when it finishes, so do not poll or sleep for it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1582,6 +1582,10 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     .chain(pty_tool::specs())
     .chain(code_search::specs())
     .chain(dev_tools::specs())
+    .chain(hawkscan::specs())
+    .chain(code_exec_specs())
+    .chain(external_agent::specs())
+    .chain(apply_patch::specs())
     .chain(media::specs())
     .chain(signals::specs())
     .chain(session_search::specs())
@@ -1603,6 +1607,43 @@ pub fn enforce_permission_check(
     }
 }
 
+/// `input` with its values coerced to the types the built-in tool `name`
+/// declares (see [`arg_coercion`]); other tools' input is returned as it is.
+#[must_use]
+pub fn coerce_tool_input(name: &str, input: &Value) -> Value {
+    static SCHEMAS: std::sync::OnceLock<BTreeMap<&'static str, Value>> = std::sync::OnceLock::new();
+    let schemas = SCHEMAS.get_or_init(|| {
+        mvp_tool_specs()
+            .into_iter()
+            .map(|spec| (spec.name, spec.input_schema))
+            .collect()
+    });
+    schemas.get(name).map_or_else(
+        || input.clone(),
+        |schema| arg_coercion::coerce_to_schema(input, schema),
+    )
+}
+
+#[cfg(unix)]
+fn code_exec_specs() -> Vec<ToolSpec> {
+    code_exec::specs()
+}
+
+#[cfg(not(unix))]
+fn code_exec_specs() -> Vec<ToolSpec> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn code_exec_execute(name: &str, input: &Value) -> Option<Result<String, String>> {
+    code_exec::execute(name, input)
+}
+
+#[cfg(not(unix))]
+fn code_exec_execute(_name: &str, _input: &Value) -> Option<Result<String, String>> {
+    None
+}
+
 pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
@@ -1613,7 +1654,7 @@ fn execute_tool_with_enforcer(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
-    let input = &expand_home_in_paths(input);
+    let input = &expand_home_in_paths(&coerce_tool_input(name, input));
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
@@ -1678,6 +1719,7 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_write_xlsx(&xlsx_input)
         }
+        "apply_patch" => run_apply_patch(enforcer, input),
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
@@ -1850,6 +1892,9 @@ fn execute_tool_with_enforcer(
             .or_else(|| pty_tool::execute(name, input))
             .or_else(|| code_search::execute(name, input))
             .or_else(|| dev_tools::execute(name, input))
+            .or_else(|| hawkscan::execute(name, input))
+            .or_else(|| code_exec_execute(name, input))
+            .or_else(|| external_agent::execute(name, input))
             .or_else(|| media::execute(name, input))
             .or_else(|| signals::execute(name, input))
             .or_else(|| session_search::execute(name, input))
@@ -2887,12 +2932,13 @@ fn branch_divergence_output(
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     let workspace = tool_workspace(&input.path, false)?;
     if let Some(output) = read_document_file(&input, &workspace)? {
+        note_file_seen(&input.path);
         return to_pretty_json(output);
     }
-    to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
-            .map_err(io_to_string)?,
-    )
+    let output = read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
+        .map_err(io_to_string)?;
+    note_file_seen(&input.path);
+    to_pretty_json(output)
 }
 
 /// Largest document `read_file` will open.
@@ -3095,24 +3141,180 @@ fn run_write_xlsx(input: &WriteXlsxInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
     let workspace = tool_workspace(&input.path, true)?;
-    to_pretty_json(
-        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?,
-    )
+    require_file_seen(&input.path)?;
+    let output =
+        write_file_in_workspace(&input.path, &input.content, &workspace).map_err(io_to_string)?;
+    note_file_seen(&input.path);
+    to_pretty_json(output)
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
     let workspace = tool_workspace(&input.path, false)?;
-    to_pretty_json(
-        edit_file_in_workspace(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-            &workspace,
-        )
-        .map_err(io_to_string)?,
+    require_file_seen(&input.path)?;
+    let output = edit_file_in_workspace(
+        &input.path,
+        &input.old_string,
+        &input.new_string,
+        input.replace_all.unwrap_or(false),
+        &workspace,
     )
+    .map_err(io_to_string)?;
+    note_file_seen(&input.path);
+    to_pretty_json(output)
+}
+
+/// A file's size and modification time when the model last saw it.
+type FileStamp = (u64, Option<std::time::SystemTime>);
+
+/// Files the model has read (or written) in this process, keyed by
+/// canonical path, as Claude Code does: `write_file` and `edit_file` refuse
+/// an existing file it has not read, or one that changed since, so it does
+/// not rewrite code it has not seen or clobber the user's changes.
+fn seen_files() -> &'static Mutex<HashMap<PathBuf, FileStamp>> {
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, FileStamp>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The canonical path and stamp of an existing file; `None` when `path` is
+/// not a file (a new one may be created without reading anything).
+fn file_stamp(path: &str) -> Option<(PathBuf, FileStamp)> {
+    let path = runtime::expand_home(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let path = path.canonicalize().ok()?;
+    let meta = std::fs::metadata(&path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
+    Some((path, (meta.len(), meta.modified().ok())))
+}
+
+fn note_file_seen(path: &str) {
+    if let Some((path, stamp)) = file_stamp(path) {
+        seen_files()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path, stamp);
+    }
+}
+
+/// `apply_patch`: every file is checked (permission, read before change,
+/// the hunks match) before any is written, so a patch applies whole or not
+/// at all.
+fn run_apply_patch(enforcer: Option<&PermissionEnforcer>, input: &Value) -> Result<String, String> {
+    use apply_patch::PatchOp;
+    let patch = input
+        .get("patch")
+        .or_else(|| input.get("input"))
+        .and_then(Value::as_str)
+        .ok_or("apply_patch needs `patch`: the text from *** Begin Patch to *** End Patch")?;
+    let ops = apply_patch::parse_patch(patch)?;
+    let paths = ops
+        .iter()
+        .flat_map(|op| match op {
+            PatchOp::Add { path, .. } | PatchOp::Delete { path } => vec![path.as_str()],
+            PatchOp::Update { path, move_to, .. } => std::iter::once(path.as_str())
+                .chain(move_to.as_deref())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let required_mode = paths
+        .iter()
+        .map(|path| classify_file_path_permission(path, true))
+        .max()
+        .unwrap_or(PermissionMode::WorkspaceWrite);
+    maybe_enforce_permission_check_with_mode(enforcer, "apply_patch", input, required_mode)?;
+
+    let mut writes: Vec<(String, Option<String>)> = Vec::new();
+    let mut summary = Vec::new();
+    for op in &ops {
+        match op {
+            PatchOp::Add { path, content } => {
+                if runtime::expand_home(path).exists() {
+                    require_file_seen(path)?;
+                }
+                writes.push((path.clone(), Some(content.clone())));
+                summary.push(format!("A {path} (+{})", content.lines().count()));
+            }
+            PatchOp::Delete { path } => {
+                require_file_seen(path)?;
+                writes.push((path.clone(), None));
+                summary.push(format!("D {path}"));
+            }
+            PatchOp::Update {
+                path,
+                move_to,
+                hunks,
+            } => {
+                require_file_seen(path)?;
+                let old = std::fs::read_to_string(runtime::expand_home(path))
+                    .map_err(|error| format!("{path}: {error}"))?;
+                let new = apply_patch::apply_hunks(&old, hunks)
+                    .map_err(|error| format!("{path}: {error}"))?;
+                let (added, removed) = line_delta(&old, &new);
+                let target = move_to.clone().unwrap_or_else(|| path.clone());
+                writes.push((target.clone(), Some(new)));
+                if move_to.is_some() {
+                    writes.push((path.clone(), None));
+                    summary.push(format!("R {path} -> {target} (+{added} -{removed})"));
+                } else {
+                    summary.push(format!("M {path} (+{added} -{removed})"));
+                }
+            }
+        }
+    }
+    for (path, content) in writes {
+        match content {
+            Some(content) => {
+                let workspace = tool_workspace(&path, true)?;
+                write_file_in_workspace(&path, &content, &workspace).map_err(io_to_string)?;
+                note_file_seen(&path);
+                leangate::record_edit(&path);
+                runtime::touch_memory(&path);
+            }
+            None => std::fs::remove_file(runtime::expand_home(&path))
+                .map_err(|error| format!("{path}: {error}"))?,
+        }
+    }
+    Ok(format!("Applied the patch:\n{}", summary.join("\n")))
+}
+
+/// Lines added and removed between two versions of a file.
+fn line_delta(old: &str, new: &str) -> (usize, usize) {
+    let mut old_lines = old.lines().collect::<Vec<_>>();
+    let mut added = 0;
+    for line in new.lines() {
+        if let Some(at) = old_lines.iter().position(|old| *old == line) {
+            old_lines.swap_remove(at);
+        } else {
+            added += 1;
+        }
+    }
+    (added, old_lines.len())
+}
+
+fn require_file_seen(path: &str) -> Result<(), String> {
+    let Some((canonical, stamp)) = file_stamp(path) else {
+        return Ok(());
+    };
+    match seen_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&canonical)
+    {
+        Some(seen) if *seen == stamp => Ok(()),
+        Some(_) => Err(format!(
+            "{} changed since you last read it (the user, a formatter or a command changed it). Read it again with read_file before changing it.",
+            canonical.display()
+        )),
+        None => Err(format!(
+            "{} exists but you have not read it with read_file yet. Read it first (the part you change is enough), then change it with edit_file. Output of cat or other bash commands does not count.",
+            canonical.display()
+        )),
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -3265,7 +3467,9 @@ fn classify_file_path_permission(path: &str, allow_missing: bool) -> PermissionM
 }
 
 fn classify_read_path_permission(path: &str, allow_missing: bool) -> PermissionMode {
-    if path_within_current_workspace(path, allow_missing) {
+    // Saved long tool output (see runtime::tool_spill) is read like the
+    // workspace: the model was told to read it there.
+    if path_within_current_workspace(path, allow_missing) || runtime::is_spill_path(path) {
         PermissionMode::ReadOnly
     } else {
         PermissionMode::DangerFullAccess
@@ -3286,11 +3490,9 @@ fn classify_glob_permission(input: &GlobSearchInputValue) -> PermissionMode {
 }
 
 fn classify_grep_permission(input: &GrepSearchInput) -> PermissionMode {
-    if input
-        .path
-        .as_deref()
-        .is_none_or(|path| path_within_current_workspace(path, false))
-    {
+    if input.path.as_deref().is_none_or(|path| {
+        path_within_current_workspace(path, false) || runtime::is_spill_path(path)
+    }) {
         PermissionMode::ReadOnly
     } else {
         PermissionMode::DangerFullAccess
@@ -4066,7 +4268,29 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    /// For a fork: the parent's finished conversation it starts from.
+    seed: Option<Session>,
 }
+
+/// The main conversation as of the start of the current turn, with its
+/// system prompt: what a `fork` sub-agent starts from.
+static FORK_SEED: Mutex<Option<(Session, Vec<String>)>> = Mutex::new(None);
+
+/// Records the conversation a `fork` sub-agent would start from: the
+/// finished turns (the CLI calls it as each turn starts, so a fork never
+/// sees a half-done turn) and the system prompt they were made with.
+pub fn set_fork_seed(session: Session, system_prompt: Vec<String>) {
+    *FORK_SEED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((session, system_prompt));
+}
+
+/// Said before a fork's task, so it knows it is a copy working on a side
+/// task rather than the main agent continuing.
+const FORK_NOTE: &str = "<system-reminder>You are now a fork: a sub-agent that starts with the \
+     conversation above. The main agent is still working; do only the task below, without asking \
+     the user anything, then end with a concise report of what you did and found (your last \
+     message is all the main agent receives).</system-reminder>";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ToolSearchOutput {
@@ -5070,6 +5294,8 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
 fn execute_skill(input: SkillInput) -> Result<SkillOutput, String> {
     let skill_path = resolve_skill_path(&input.skill)?;
     let prompt = std::fs::read_to_string(&skill_path).map_err(|error| error.to_string())?;
+    // Learned skills in use are kept, and shown to the next review.
+    runtime::learning::record_skill_use(&input.skill);
     let description = parse_skill_description(&prompt);
 
     Ok(SkillOutput {
@@ -5406,7 +5632,37 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    // A name that is not a built-in kind is a custom agent definition
+    // (`.claw/agents/`, `~/.claude/agents/`, …).
+    let custom = if BUILTIN_SUBAGENT_TYPES.contains(&normalized_subagent_type.as_str()) {
+        None
+    } else {
+        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        Some(
+            commands::find_custom_agent(&cwd, &normalized_subagent_type).ok_or_else(|| {
+                let custom = commands::custom_agents(&cwd)
+                    .into_iter()
+                    .map(|agent| agent.name)
+                    .collect::<Vec<_>>();
+                format!(
+                    "unknown subagent_type `{normalized_subagent_type}`: use Explore, Plan, Verification, fork, general-purpose{}",
+                    if custom.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", or a custom agent: {}", custom.join(", "))
+                    }
+                )
+            })?,
+        )
+    };
+    // A custom agent's own model is used only when claw can route it
+    // (provider/model); Claude Code's `sonnet`/`opus`/`inherit` mean this
+    // session's model here.
+    let custom_model = custom
+        .as_ref()
+        .and_then(|agent| agent.model.clone())
+        .filter(|model| model.contains('/'));
+    let model = resolve_agent_model(input.model.as_deref().or(custom_model.as_deref()));
     let agent_name = input
         .name
         .as_deref()
@@ -5414,8 +5670,33 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type, &model)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let fork_seed = (normalized_subagent_type == "fork")
+        .then(|| {
+            FORK_SEED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+        .flatten();
+    let (system_prompt, seed) = match (fork_seed, &custom) {
+        // The parent's own system prompt, so the conversation reads as it
+        // was written (and a local server can reuse its cached prefix).
+        (Some((session, system_prompt)), _) => (system_prompt, Some(session)),
+        (None, Some(agent)) => (
+            build_agent_system_prompt_with_role(&agent.name, &model, &agent.prompt)?,
+            None,
+        ),
+        (None, None) => (
+            build_agent_system_prompt(&normalized_subagent_type, &model)?,
+            None,
+        ),
+    };
+    let allowed_tools = custom
+        .as_ref()
+        .and_then(|agent| agent.tools.as_deref())
+        .map(custom_agent_tools)
+        .filter(|tools| !tools.is_empty())
+        .unwrap_or_else(|| allowed_tools_for_subagent(&normalized_subagent_type));
 
     let output_contents = format!(
         "# Agent Task
@@ -5454,11 +5735,17 @@ where
     write_agent_manifest(&manifest)?;
 
     let manifest_for_spawn = manifest.clone();
+    let prompt = if seed.is_some() {
+        format!("{FORK_NOTE}\n\n{}", input.prompt)
+    } else {
+        input.prompt
+    };
     let job = AgentJob {
         manifest: manifest_for_spawn,
-        prompt: input.prompt,
+        prompt,
         system_prompt,
         allowed_tools,
+        seed,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -5514,7 +5801,8 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
 /// Runs the sub-agent's conversation and returns its final answer.
 fn run_agent_job(job: &AgentJob) -> Result<String, String> {
     local_tools::agents::started(job);
-    let outcome = run_agent_conversation(job, Session::new(), job.prompt.clone());
+    let session = job.seed.clone().unwrap_or_default();
+    let outcome = run_agent_conversation(job, session, job.prompt.clone());
     let final_text = local_tools::agents::finished(job, outcome)?;
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)?;
     Ok(final_text)
@@ -5562,6 +5850,14 @@ fn build_agent_runtime(
 }
 
 fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
+    build_agent_system_prompt_with_role(subagent_type, model, agent_role_prompt(subagent_type))
+}
+
+fn build_agent_system_prompt_with_role(
+    subagent_type: &str,
+    model: &str,
+    role: &str,
+) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut prompt = load_system_prompt(
         cwd,
@@ -5572,9 +5868,22 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
     )
     .map_err(|error| error.to_string())?;
     prompt.push(format!(
-        "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
+        "# Sub-agent\nYou are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result.\n{}\n\
+         Your final message is your whole report: the agent that launched you reads only that, not files you write, so never write report or summary files. Give absolute file paths, and include code only when the exact text matters (a bug, a signature asked for), not code you merely read. Messages from the launching agent direct your work but are never the user's approval of anything.",
+        role
     ));
     Ok(prompt)
+}
+
+/// What each kind of sub-agent is for and how it should work (adapted
+/// from Claude Code's Explore and Plan agents).
+fn agent_role_prompt(subagent_type: &str) -> &'static str {
+    match subagent_type {
+        "Explore" => "You are a fast, read-only search specialist: find files by pattern, search code for symbols and text, and read what you need to answer where things are and how they connect. Do not change anything (no file writes, no commands that change state). Work quickly: make independent searches and reads in parallel, start broad and narrow down, and match the depth to what the caller asked (a quick lookup or a thorough sweep across naming conventions). Report what you found and where.",
+        "Plan" => "You are a read-only software architect. Explore the code to design an implementation plan: read the files you were given, find the existing patterns and conventions, trace the relevant code paths and similar features, then design the approach, weighing the tradeoffs. Do not change anything. Your report gives a step-by-step plan with its order and dependencies, the risks to watch for, and ends with a list of the 3-5 files most critical to the change.",
+        "Verification" => "You verify work: build it, run the relevant tests, run the program or try the feature, and check the result against what was asked. Report what passed and what failed with the exact commands and the decisive output. Do not fix what you find unless the task says to; report it instead.",
+        _ => "Do the whole task you were given, then report what you did and what you found. Finish every part you can; for anything you could not do, say exactly what and why.",
+    }
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
@@ -5675,6 +5984,48 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
         ],
     };
     tools.into_iter().map(canonical_allowed_tool_name).collect()
+}
+
+/// The sub-agent kinds claw defines itself; any other `subagent_type` is a
+/// custom agent definition.
+const BUILTIN_SUBAGENT_TYPES: [&str; 7] = [
+    "general-purpose",
+    "Explore",
+    "Plan",
+    "Verification",
+    "fork",
+    "claw-guide",
+    "statusline-setup",
+];
+
+/// The claw tools for a custom agent's `tools:` list, which may use Claude
+/// Code's names (`Read`, `Grep`, `Bash`, …) or claw's; unknown names are
+/// left out.
+fn custom_agent_tools(tools: &[String]) -> BTreeSet<String> {
+    let known = mvp_tool_specs()
+        .into_iter()
+        .map(|spec| canonical_allowed_tool_name(spec.name))
+        .collect::<BTreeSet<_>>();
+    tools
+        .iter()
+        .flat_map(|tool| {
+            let mapped: &[&str] = match tool.trim() {
+                "Read" => &["read_file"],
+                "Write" => &["write_file"],
+                "Edit" | "MultiEdit" => &["edit_file"],
+                "Glob" | "LS" => &["glob_search"],
+                "Grep" => &["grep_search"],
+                "Bash" => &["bash", "bash_output", "kill_shell"],
+                "Task" => &["Agent"],
+                other => return vec![canonical_allowed_tool_name(other)],
+            };
+            mapped
+                .iter()
+                .map(|name| canonical_allowed_tool_name(name))
+                .collect()
+        })
+        .filter(|tool| known.contains(tool))
+        .collect()
 }
 
 fn agent_permission_policy() -> PermissionPolicy {
@@ -7077,6 +7428,7 @@ fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
         "verification" | "verificationagent" | "verify" | "verifier" => {
             String::from("Verification")
         }
+        "fork" | "forked" | "forkagent" => String::from("fork"),
         "clawguide" | "clawguideagent" | "guide" => String::from("claw-guide"),
         "statusline" | "statuslinesetup" => String::from("statusline-setup"),
         _ => trimmed.to_string(),
@@ -8197,11 +8549,17 @@ fn parse_skill_description(contents: &str) -> Option<String> {
     None
 }
 
+mod apply_patch;
+mod arg_coercion;
 mod browser;
+#[cfg(unix)]
+mod code_exec;
 mod code_search;
 mod com;
 mod dev_tools;
 mod download;
+mod external_agent;
+mod hawkscan;
 pub mod lane_completion;
 pub mod leangate;
 pub mod local_tools;
@@ -8307,6 +8665,57 @@ mod tests {
         assert!(poisoned.is_err(), "poisoning thread should panic");
 
         let _guard = env_guard();
+    }
+
+    #[test]
+    fn existing_files_must_be_read_before_they_are_changed() {
+        let root = temp_path("read-before-write");
+        fs::create_dir_all(&root).expect("create root");
+        let file = root.join("main.rs");
+        let path = file.to_str().expect("utf-8 path");
+        fs::write(&file, "fn main() {}\n").expect("seed file");
+
+        let unread = execute_tool("write_file", &json!({ "path": path, "content": "x\n" }))
+            .expect_err("an unread file is refused");
+        assert!(
+            unread.contains("have not read it with read_file"),
+            "{unread}"
+        );
+        let unread_edit = execute_tool(
+            "edit_file",
+            &json!({ "path": path, "old_string": "main", "new_string": "start" }),
+        )
+        .expect_err("edit_file is refused too");
+        assert!(unread_edit.contains("have not read it"), "{unread_edit}");
+
+        execute_tool("read_file", &json!({ "path": path })).expect("read");
+        execute_tool(
+            "edit_file",
+            &json!({ "path": path, "old_string": "main", "new_string": "start" }),
+        )
+        .expect("edit after read");
+        // Its own change counts as read: a second edit needs no re-read.
+        execute_tool(
+            "edit_file",
+            &json!({ "path": path, "old_string": "start", "new_string": "run" }),
+        )
+        .expect("second edit");
+
+        // Someone else changes it: read it again first.
+        fs::write(&file, "fn main() { changed(); }\n").expect("outside change");
+        let stale = execute_tool("write_file", &json!({ "path": path, "content": "x\n" }))
+            .expect_err("a file changed since the read is refused");
+        assert!(stale.contains("changed since you last read it"), "{stale}");
+
+        // New files need no read.
+        let new_file = root.join("new.rs");
+        execute_tool(
+            "write_file",
+            &json!({ "path": new_file.to_str().expect("utf-8"), "content": "x\n" }),
+        )
+        .expect("a new file is created without a read");
+
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -10231,6 +10640,109 @@ mod tests {
             serde_json::from_str(&selected_with_alias).expect("valid json");
         assert_eq!(selected_with_alias_output["matches"][0], "Agent");
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
+    }
+
+    #[test]
+    fn a_custom_agent_runs_with_its_own_instructions_and_tools() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("custom-agent");
+        let agents = root.join(".claw").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("rust-reviewer.md"),
+            "---\nname: rust-reviewer\ndescription: Reviews Rust code\ntools: Read, Grep, Glob, Bash\nmodel: sonnet\n---\n\nYou review Rust for ownership bugs.\n",
+        )
+        .unwrap();
+        let store = root.join("store");
+        std::env::set_var("CLAWD_AGENT_STORE", &store);
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        let spawn = move |job| {
+            *captured_for_spawn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+            Ok(())
+        };
+        let input = |kind: &str| AgentInput {
+            description: "Review".to_string(),
+            prompt: "Review src/lib.rs".to_string(),
+            subagent_type: Some(kind.to_string()),
+            name: None,
+            model: None,
+            run_in_background: false,
+        };
+        let result = execute_agent_with_spawn(input("rust-reviewer"), spawn);
+        let unknown = execute_agent_with_spawn(input("no-such-agent"), |_| Ok(()));
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        result.expect("custom agent spawns");
+        let error = unknown.expect_err("unknown agents are refused");
+        assert!(error.contains("rust-reviewer"), "{error}");
+        let job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("job");
+        assert!(job
+            .system_prompt
+            .last()
+            .is_some_and(|section| section.contains("You review Rust for ownership bugs.")));
+        let tools = job.allowed_tools.iter().cloned().collect::<Vec<_>>();
+        assert!(tools.contains(&"read_file".to_string()) && tools.contains(&"bash".to_string()));
+        assert!(!tools.contains(&"write_file".to_string()), "{tools:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_fork_starts_from_the_parents_conversation_and_system_prompt() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-fork");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        let mut parent = Session::new();
+        parent
+            .push_message(runtime::ConversationMessage::user_text(
+                "the parent's request",
+            ))
+            .unwrap();
+        super::set_fork_seed(parent, vec!["parent system prompt".to_string()]);
+        let captured = Arc::new(Mutex::new(None::<AgentJob>));
+        let captured_for_spawn = Arc::clone(&captured);
+        execute_agent_with_spawn(
+            AgentInput {
+                description: "Check the other file".to_string(),
+                prompt: "Look at b.rs the same way.".to_string(),
+                subagent_type: Some("fork".to_string()),
+                name: None,
+                model: None,
+                run_in_background: false,
+            },
+            move |job| {
+                *captured_for_spawn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job);
+                Ok(())
+            },
+        )
+        .expect("fork spawns");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+        let job = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("job");
+        assert_eq!(job.system_prompt, vec!["parent system prompt".to_string()]);
+        assert_eq!(job.seed.expect("seeded").messages.len(), 1);
+        assert!(job
+            .prompt
+            .starts_with("<system-reminder>You are now a fork"));
+        assert!(job.prompt.ends_with("Look at b.rs the same way."));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

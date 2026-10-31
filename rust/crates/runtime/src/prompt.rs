@@ -233,6 +233,8 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
+        sections.push(get_communicating_section());
+        sections.push(get_looking_things_up_section());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
@@ -243,6 +245,13 @@ impl SystemPromptBuilder {
         }
         if let Some(config) = &self.config {
             sections.push(render_config_section(config));
+            let cwd = self
+                .project_context
+                .as_ref()
+                .map(|context| context.cwd.as_path());
+            if let Some(section) = render_sandbox_section(config, cwd) {
+                sections.push(section);
+            }
         }
         sections.extend(self.append_sections.iter().cloned());
         sections
@@ -812,10 +821,140 @@ pub fn load_system_prompt_with_context(
         .with_model_family(model_family)
         .with_project_context(project_context.clone());
     if crate::memory::memory_enabled(&config) {
-        builder = builder.append_section(crate::memory::render_memory_section_for(&cwd));
+        let mut section = crate::memory::render_memory_section_for(&cwd);
+        if crate::learning::learning_enabled() {
+            // A review after the turn files what is durable, so the model
+            // does not break off its work to save passing facts.
+            section = section.replace(
+                crate::memory::WHEN_TO_SAVE,
+                crate::memory::WHEN_TO_SAVE_WITH_REVIEW,
+            );
+        }
+        builder = builder.append_section(section);
+    }
+    if let Some(section) = crate::learning::skills_section(&cwd) {
+        builder = builder.append_section(section);
     }
     let sections = builder.with_runtime_config(config).build();
     Ok((sections, project_context))
+}
+
+/// The instruction files the system prompt was built from, to tell when
+/// one is edited, added or removed during the session. The system prompt
+/// stays as it was (so the prompt cache keeps working); the change is told
+/// to the model in the next user message instead.
+#[derive(Debug, Clone, Default)]
+pub struct InstructionWatch {
+    files: Vec<(PathBuf, String)>,
+}
+
+/// Longest an instruction file is shown in a change notice.
+const MAX_CHANGED_INSTRUCTION_CHARS: usize = 12_000;
+
+impl InstructionWatch {
+    /// The instruction files for `cwd` as they are now.
+    #[must_use]
+    pub fn new(cwd: &Path) -> Self {
+        Self {
+            files: current_instruction_files(cwd),
+        }
+    }
+
+    /// A reminder describing the instruction files that changed since the
+    /// last call (or since [`Self::new`]); `None` when none did.
+    pub fn changes(&mut self, cwd: &Path) -> Option<String> {
+        let now = current_instruction_files(cwd);
+        let mut sections = Vec::new();
+        for (path, content) in &now {
+            let before = self.files.iter().find(|(old, _)| old == path);
+            if before.is_some_and(|(_, old)| old == content) {
+                continue;
+            }
+            let verb = if before.is_some() { "changed" } else { "added" };
+            let shown = if content.len() > MAX_CHANGED_INSTRUCTION_CHARS {
+                let mut end = MAX_CHANGED_INSTRUCTION_CHARS;
+                while !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}\n[… cut; read the file for the rest]", &content[..end])
+            } else {
+                content.clone()
+            };
+            sections.push(format!(
+                "## {} ({verb}; this replaces what you had for it)\n{}",
+                display_context_path(path),
+                shown.trim()
+            ));
+        }
+        for (path, _) in &self.files {
+            if !now.iter().any(|(new, _)| new == path) {
+                sections.push(format!(
+                    "## {} (removed: its instructions no longer apply)",
+                    display_context_path(path)
+                ));
+            }
+        }
+        self.files = now;
+        (!sections.is_empty()).then(|| {
+            format!(
+                "<system-reminder>\nProject instruction files changed during this session. \
+                 Follow the current versions:\n\n{}\n</system-reminder>",
+                sections.join("\n\n")
+            )
+        })
+    }
+}
+
+/// How often the time is told to the model at most (dsh's time context).
+pub const TIME_REMINDER_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The current local time, and how long it has been since `last_message`
+/// (the end of the previous turn), for the start of a user message: the
+/// system prompt only has the date, so the model could not tell "earlier"
+/// from "yesterday", or how long a background job has been running.
+#[must_use]
+pub fn time_reminder(last_message: Option<std::time::SystemTime>) -> String {
+    let now = chrono::Local::now();
+    let mut text = format!(
+        "<system-reminder>Current time: {}",
+        now.format("%Y-%m-%d %H:%M (%a, UTC%:z)")
+    );
+    if let Some(elapsed) = last_message.and_then(|last| last.elapsed().ok()) {
+        text.push_str(&format!(
+            "; {} since the previous message.",
+            compact_duration(elapsed)
+        ));
+    } else {
+        text.push('.');
+    }
+    text.push_str("</system-reminder>");
+    text
+}
+
+fn compact_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    let (days, hours, minutes) = (secs / 86_400, secs / 3_600 % 24, secs / 60 % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn current_instruction_files(cwd: &Path) -> Vec<(PathBuf, String)> {
+    let rules_import = ConfigLoader::default_for(cwd)
+        .load()
+        .map(|config| config.rules_import().clone())
+        .unwrap_or_default();
+    discover_instruction_files(cwd, &rules_import)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| (file.path, file.content))
+        .collect()
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
@@ -839,6 +978,41 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     // every request (a 32k local window felt it). The files are named, so
     // the model can read them when a task is about the settings.
     lines.join("\n")
+}
+
+/// What the shell sandbox lets bash commands write, so the model plans for
+/// it instead of finding out from "Read-only file system" errors (and
+/// probing with `touch`/`rm`, which asks the user). `None` when the sandbox
+/// or its filesystem isolation is off.
+fn render_sandbox_section(config: &RuntimeConfig, cwd: Option<&Path>) -> Option<String> {
+    let request = config
+        .sandbox()
+        .resolve_request(None, None, None, None, None);
+    if !request.enabled || request.filesystem_mode == crate::FilesystemIsolationMode::Off {
+        return None;
+    }
+    let mut writable = vec![cwd.map_or_else(
+        || "the working directory".to_string(),
+        |cwd| format!("{} (the working directory)", cwd.display()),
+    )];
+    if request.filesystem_mode == crate::FilesystemIsolationMode::AllowList {
+        writable.extend(request.allowed_mounts.iter().cloned());
+    }
+    let mut items = vec![
+        format!(
+            "Bash commands run in a sandbox where only {} is writable. Everything else is read-only, including the home directory, ~/.cache, and virtualenvs or tool installs outside the working directory: installing into them fails with \"Read-only file system\". Expect that rather than probing for it.",
+            writable.join(", ")
+        ),
+        "/tmp is private to each command and empty at the start of the next one; keep anything you need later in the working directory.".to_string(),
+        "To install Python packages, create a project virtualenv (`python3 -m venv .venv`) unless the user asked for another one. pip's cache is read-only, so it builds packages without a wheel for this Python from source every time.".to_string(),
+        "When a command really must write outside (a shared virtualenv, system packages, sudo), set dangerouslyDisableSandbox=true on that bash call; the user is asked to approve it.".to_string(),
+    ];
+    if request.network_isolation {
+        items.push("Network access is disabled inside the sandbox.".to_string());
+    }
+    let mut lines = vec!["# Shell sandbox".to_string()];
+    lines.extend(prepend_bullets(items));
+    Some(lines.join("\n"))
 }
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
@@ -879,6 +1053,16 @@ fn get_simple_doing_tasks_section() -> String {
         "Do what was asked and stop there. Building and running tests to check your work is fine; installing, deploying, publishing or pushing is not, unless the user asked for it.".to_string(),
         "Before you name the cause of a bug, quote the exact lines that show it, with file:line. Do not say something is missing, unset or never called without having read the code that proves it.".to_string(),
         "Before your final summary, look at what you actually changed (the diff, or the edited lines again) and describe only that.".to_string(),
+        "Read an unclear or generic instruction in the context of software work in this directory: asked to make `methodName` snake case, find the method and change the code rather than replying `method_name`.".to_string(),
+        "The requested scope is the deliverable: do not quietly narrow, widen or transform it. Make routine judgment calls yourself and check in only when different readings lead to materially different work. Finish the whole task, not just the easy parts; if part is blocked, finish everything else and say exactly what was left out and why.".to_string(),
+        "When something is uncertain mid-task, first do all the work that does not depend on it, then state your assumption or ask. If you raised a concern and the user reaffirms the request, treat it as their decision and do it.".to_string(),
+        "When the user describes a problem, asks a question or thinks out loud, the deliverable is your assessment: report it and stop, without applying a fix until asked. For exploratory questions (\"what could we do about X?\") answer in a few sentences with a recommendation and the main tradeoff.".to_string(),
+        "When you have enough information to act, act. Do not re-derive what the conversation already established or reopen a decision the user made. When weighing a choice, give a recommendation, not a survey. Long context is compacted automatically, so there is no need to wrap up early.".to_string(),
+        "Prefer editing existing files to creating new ones. Write no comments unless the why is non-obvious (a hidden constraint, a workaround); never comments that narrate the code or mention the current task. Do not add error handling for cases that cannot happen, or compatibility shims when the code can simply change.".to_string(),
+        "Before a command that changes system state (restart, delete, config edit), check that the evidence supports that specific action; a symptom that looks like a known failure can have another cause. A denied tool call means the user declined it: adjust, do not retry it unchanged.".to_string(),
+        "Keep searches (grep, rg, find) inside the project and the folders the task names. Never search recursively across the home directory or the whole filesystem: it takes minutes and reads unrelated private files.".to_string(),
+        "For UI changes, run the app and try the feature (golden path and edge cases) before calling it done; type checks and tests do not show the feature works. If you cannot try it, say so.".to_string(),
+        "Before ending your turn, read your last paragraph. If it is a plan, a list of next steps or a promise (\"I'll…\"), do that work now. End the turn only when the task is done or you need input only the user can give.".to_string(),
     ]);
 
     std::iter::once("# Doing tasks".to_string())
@@ -895,6 +1079,83 @@ fn get_actions_section() -> String {
         "Never put a password or passphrase the user gives you into a command line, file or script, and do not start `ssh-agent` or feed `ssh-add` yourself. When `ssh` or `git` needs a key passphrase, claw asks the user on the terminal.".to_string(),
     ]
     .join("\n")
+}
+
+/// How replies read: adapted from Claude's own behaviour guidance (tone,
+/// replying after tool calls, owning mistakes, calibrated claims), kept
+/// short because it is sent with every request.
+fn get_communicating_section() -> String {
+    let items = prepend_bullets(vec![
+        "The user may not see your tool calls or the text between them; your final message must stand on its own for a reader who knows the field but did not watch you work.".to_string(),
+        "Lead with the answer or outcome; if something could not be verified, say that first. After your last tool call, state the result in a sentence or two (\"Done.\" alone is not a reply), and do not repeat what you wrote before the tool calls. Stop when the content stops: no closing offer, no recap.".to_string(),
+        "Be concise by leaving things out, not by packing them in: one idea per sentence, full sentences rather than clipped labels. Summarize at a high level unless detail is asked for; keep caveats brief.".to_string(),
+        "Use the least formatting that keeps it clear: a bulleted list for parallel items (findings, steps, options), prose for an argument, no headers in a short reply, none at all if the user asks. Put commands, code and error text in fenced code blocks, not in sentences, and reference code as `path:line`. No emojis unless asked.".to_string(),
+        "Before your first tool call, say in one sentence what you are about to do; during long work, add a one-line update when you find something, change direction or hit a blocker. Do not narrate your deliberation.".to_string(),
+        "Do not quote or paraphrase the user's message back to them, do not refer to things by names you made up during the session, and do not use \"genuinely\", \"honestly\" or \"straightforward\". Use they/them for anyone whose pronouns you have not been told.".to_string(),
+        "When a request is ambiguous, make a reasonable attempt first, then ask about what is still unclear. Do not ask what the code or a quick check could answer; if a message implies a file exists, check for it yourself.".to_string(),
+        "When you are wrong, say so plainly and fix it: no excessive apology, and no caving on a correct point because the user pushes back. Push back yourself, kindly, when a plan has a problem.".to_string(),
+        "Match confidence to evidence. If you could not verify a fact, path, figure, URL or name, say so when you state it; with no basis, say you do not know rather than guess. Do not call someone by a name they have not given you.".to_string(),
+    ]);
+    std::iter::once("# Communicating".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// When and how to look things up on the web, adapted from Claude's search
+/// guidance: libraries, tools and models change faster than any snapshot.
+fn get_looking_things_up_section() -> String {
+    let items = prepend_bullets(vec![
+        "What you remember about a named library, tool, model, API or version is a snapshot that may be out of date, however familiar it feels. When an answer depends on its current state (latest version, flags, deprecations, how it compares), check: the installed version or docs on disk first, then WebSearch. Settled facts and fundamentals need no search.".to_string(),
+        "Search with short queries (1-6 words), broad first, then narrower; do not repeat near-identical queries. Read the best result with WebFetch, since snippets are thin. Fetch only URLs that appeared in the conversation or in search results, never ones built from memory.".to_string(),
+        "Prefer original sources (official docs, changelogs, the project's repository, papers) over aggregators and forums. Believe results even when surprising, but be wary of SEO-ranked advice; when sources conflict, search further and say they disagree.".to_string(),
+    ]);
+    std::iter::once("# Looking things up".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod instruction_watch_tests {
+    use super::{time_reminder, InstructionWatch};
+
+    #[test]
+    fn the_time_reminder_says_how_long_since_the_last_message() {
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600 + 120);
+        let text = time_reminder(Some(earlier));
+        assert!(
+            text.starts_with("<system-reminder>Current time: 20"),
+            "{text}"
+        );
+        assert!(
+            text.contains("; 3h 2m since the previous message."),
+            "{text}"
+        );
+        assert!(time_reminder(None).ends_with(".</system-reminder>"));
+    }
+
+    #[test]
+    fn edited_added_and_removed_instruction_files_are_reported_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "Use tabs.").unwrap();
+        let mut watch = InstructionWatch::new(root.path());
+        assert_eq!(watch.changes(root.path()), None);
+
+        std::fs::write(root.path().join("AGENTS.md"), "Use four spaces.").unwrap();
+        std::fs::write(root.path().join("CLAUDE.md"), "Run fmt.sh.").unwrap();
+        let notice = watch.changes(root.path()).expect("changes");
+        assert!(notice.contains("AGENTS.md (changed") && notice.contains("Use four spaces."));
+        assert!(notice.contains("CLAUDE.md (added") && notice.contains("Run fmt.sh."));
+        assert_eq!(watch.changes(root.path()), None, "reported once");
+
+        std::fs::remove_file(root.path().join("CLAUDE.md")).unwrap();
+        assert!(watch
+            .changes(root.path())
+            .expect("removal")
+            .contains("CLAUDE.md (removed"));
+    }
 }
 
 #[cfg(test)]
@@ -1709,6 +1970,45 @@ mod tests {
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("# Runtime config") && !prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn sandbox_section_names_writable_roots_and_disappears_when_off() {
+        let root = temp_dir();
+        // User settings: a project's sandbox settings need `claw trust`.
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home dir");
+        let prompt_with = |settings: &str| {
+            fs::write(home.join("settings.json"), settings).expect("settings");
+            let config = ConfigLoader::new(&root, &home)
+                .load()
+                .expect("config should load");
+            SystemPromptBuilder::new()
+                .with_project_context(
+                    ProjectContext::discover(&root, "2026-10-27").expect("context should load"),
+                )
+                .with_runtime_config(config)
+                .render()
+        };
+
+        let prompt = prompt_with(
+            r#"{"sandbox":{"filesystemMode":"allow-list","allowedMounts":["/srv/cache"]}}"#,
+        );
+        assert!(prompt.contains("# Shell sandbox"));
+        assert!(prompt.contains(&format!(
+            "only {} (the working directory), /srv/cache is writable",
+            root.display()
+        )));
+        assert!(prompt.contains("/tmp is private to each command"));
+        assert!(prompt.contains("dangerouslyDisableSandbox=true"));
+        assert!(!prompt.contains("Network access is disabled"));
+
+        assert!(prompt_with(r#"{"sandbox":{"networkIsolation":true}}"#)
+            .contains("Network access is disabled"));
+        assert!(!prompt_with(r#"{"sandbox":{"enabled":false}}"#).contains("# Shell sandbox"));
+        assert!(!prompt_with(r#"{"sandbox":{"filesystemMode":"off"}}"#).contains("# Shell sandbox"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

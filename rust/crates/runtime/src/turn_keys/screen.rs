@@ -69,6 +69,39 @@ struct Panel {
     scroll: usize,
 }
 
+/// Output with a short and a full form (a tool call, its result, a
+/// thinking block): the conversation holds one, the other waits here until
+/// a click on it or Ctrl+O swaps them.
+struct Fold {
+    /// Its first conversation line and how many lines it takes now.
+    start: usize,
+    len: usize,
+    /// The form not shown.
+    other: Vec<vt::Line>,
+    open: bool,
+}
+
+/// The background-task view: one shell's live output in place of the
+/// conversation (see [`open_tasks_view`]).
+struct TasksView {
+    id: String,
+    /// Rows scrolled up from the end; 0 follows new output.
+    scroll: usize,
+}
+
+/// Output of a task kept for the view: its last part is enough.
+const TASK_VIEW_BYTES: usize = 64 * 1024;
+/// The footer's count of running shells, which a click opens the view on.
+const FOOTER_SHELLS: &str = " shell";
+
+/// A fold being received (between the `fold` and `fold-end` marks).
+struct FoldBuild {
+    start: usize,
+    /// Where the short form ended; set once the full form is arriving.
+    brief_end: Option<usize>,
+    full: Buffer,
+}
+
 /// Where the last frame put things, for mouse hits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Layout {
@@ -84,6 +117,11 @@ struct Layout {
     notice_close: Option<(usize, usize)>,
     /// The "Jump to bottom" hint, as (row, first col, past last col).
     jump_hint: Option<(usize, usize, usize)>,
+    /// The footer's "N shells", as (row, first col, past last col).
+    footer_shells: Option<(usize, usize, usize)>,
+    /// The task view's ✕ and stop button, as (row, first col, past last col).
+    view_close: Option<(usize, usize, usize)>,
+    view_stop: Option<(usize, usize, usize)>,
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -184,6 +222,10 @@ struct State {
     /// The user dismissed the "too narrow for the panel" notice.
     narrow_notice_dismissed: bool,
     layout: Layout,
+    /// Collapsible output, in conversation order.
+    folds: Vec<Fold>,
+    fold_build: Option<FoldBuild>,
+    tasks_view: Option<TasksView>,
 }
 
 /// Whether full-screen mode is wanted: `CLAW_FULLSCREEN=0` turns it off,
@@ -442,6 +484,8 @@ pub fn clear_conversation() {
         state.anchor = None;
         state.selection = None;
         state.selecting = false;
+        state.folds.clear();
+        state.fold_build = None;
     });
 }
 
@@ -553,6 +597,71 @@ pub fn focus() -> bool {
     shared().is_some_and(|shared| lock(&shared.state).focus_mode)
 }
 
+/// Starts collapsible output: what is printed next is its short form,
+/// up to [`fold_full`]. Print whole lines (end with a newline).
+pub fn fold_begin() {
+    if active() {
+        mark(b"fold");
+    }
+}
+
+/// What is printed next, up to [`fold_end`], is the full form: kept aside
+/// and shown instead of the short form on a click or Ctrl+O.
+pub fn fold_full() {
+    if active() {
+        mark(b"fold-full");
+    }
+}
+
+pub fn fold_end() {
+    if active() {
+        mark(b"fold-end");
+    }
+}
+
+/// Ctrl+O: expands every fold, or collapses them all when all are open.
+pub fn toggle_all_folds() {
+    with_state(State::toggle_all_folds);
+}
+
+/// Shows background task `id`'s output, live, in place of the
+/// conversation; without an id the first running task, else the newest.
+/// Returns false when there is no such task.
+pub fn open_tasks_view(id: Option<&str>) -> bool {
+    let Some(id) = pick_task(id) else {
+        return false;
+    };
+    with_state(|state| state.tasks_view = Some(TasksView { id, scroll: 0 }));
+    true
+}
+
+fn pick_task(id: Option<&str>) -> Option<String> {
+    let jobs = crate::global_background_jobs().list();
+    match id {
+        Some(id) => jobs.iter().any(|job| job.id == id).then(|| id.to_string()),
+        None => jobs
+            .iter()
+            .find(|job| job.state == crate::JobState::Running)
+            .or_else(|| jobs.last())
+            .map(|job| job.id.clone()),
+    }
+}
+
+pub fn close_tasks_view() {
+    with_state(|state| state.tasks_view = None);
+}
+
+/// Whether the background-task view is shown.
+#[must_use]
+pub fn tasks_view_open() -> bool {
+    shared().is_some_and(|shared| lock(&shared.state).tasks_view.is_some())
+}
+
+/// Shows the next (`1`) or previous (`-1`) background task in the view.
+pub fn tasks_view_step(step: isize) {
+    with_state(|state| state.step_task(step));
+}
+
 /// Sets what copies a finished mouse selection to the clipboard.
 pub fn set_copy_handler(handler: CopyHandler) {
     *lock(&COPY_HANDLER) = Some(handler);
@@ -646,6 +755,7 @@ fn relay(shared: &Shared, mut pipe: impl Read) {
                     b"f" => state.in_focus = false,
                     b"begin" | b"clear" => state.reset_pane(),
                     b"commit" => state.commit_pane(),
+                    b"fold" | b"fold-full" | b"fold-end" => state.fold_mark(&name),
                     b"sync" => {
                         shared.handled.fetch_add(1, Ordering::SeqCst);
                     }
@@ -668,7 +778,8 @@ fn draw_loop(shared: &Shared, mut tty: File) {
     while !shared.stop.load(Ordering::SeqCst) {
         let mut state = lock(&shared.state);
         if !state.dirty {
-            let wait = if state.block { ANIMATION } else { IDLE_CHECK };
+            let live = state.block || state.tasks_view.is_some();
+            let wait = if live { ANIMATION } else { IDLE_CHECK };
             state = shared
                 .wake
                 .wait_timeout(state, wait)
@@ -679,7 +790,8 @@ fn draw_loop(shared: &Shared, mut tty: File) {
             break;
         }
         let size = super::terminal_size().unwrap_or((24, 80));
-        let animate = state.block && last_animation.elapsed() >= ANIMATION;
+        let animate =
+            (state.block || state.tasks_view.is_some()) && last_animation.elapsed() >= ANIMATION;
         if !state.dirty && !animate && size == shown_size {
             continue;
         }
@@ -734,6 +846,60 @@ fn draw_loop(shared: &Shared, mut tty: File) {
     let _ = tty.flush();
 }
 
+/// `text` without escape sequences.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_some() {
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    out
+}
+
+/// The id in a "background job bg3" line, when that job exists.
+fn background_job_named(line: &str) -> Option<String> {
+    let at = line.find("background job ")? + "background job ".len();
+    let id: String = line[at..]
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    crate::global_background_jobs()
+        .list()
+        .iter()
+        .any(|job| job.id == id)
+        .then_some(id)
+}
+
+/// Where the footer's "N shells" is in a plain row, in columns.
+fn footer_shells_span(row: &str) -> Option<(usize, usize)> {
+    let at = row.find(FOOTER_SHELLS)?;
+    let digits = row[..at]
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    let tail = &row[at + FOOTER_SHELLS.len()..];
+    let end = at + FOOTER_SHELLS.len() + usize::from(tail.starts_with('s'));
+    let from = row[..at - digits].chars().count();
+    let to = row[..end].chars().count();
+    Some((from, to))
+}
+
 impl State {
     fn new() -> Self {
         Self {
@@ -757,6 +923,9 @@ impl State {
             panel_closed: false,
             narrow_notice_dismissed: false,
             layout: Layout::default(),
+            folds: Vec::new(),
+            fold_build: None,
+            tasks_view: None,
         }
     }
 
@@ -768,6 +937,13 @@ impl State {
         } else if self.in_focus {
             self.focus.feed(bytes);
             self.focus.passthrough.clear();
+        } else if let Some(build) = self
+            .fold_build
+            .as_mut()
+            .filter(|build| build.brief_end.is_some())
+        {
+            build.full.feed(bytes);
+            self.passthrough.append(&mut build.full.passthrough);
         } else {
             self.conversation.feed(bytes);
             self.passthrough.append(&mut self.conversation.passthrough);
@@ -788,8 +964,252 @@ impl State {
                         Some(line) => (line, sub),
                         None => (0, 0),
                     });
+                self.folds.retain_mut(|fold| {
+                    fold.start
+                        .checked_sub(dropped)
+                        .map(|start| fold.start = start)
+                        .is_some()
+                });
+                if let Some(build) = &mut self.fold_build {
+                    build.start = build.start.saturating_sub(dropped);
+                }
             }
         }
+    }
+
+    /// The conversation line the next output starts on.
+    fn next_line(&self) -> usize {
+        let buffer = &self.conversation;
+        if buffer.col == 0 {
+            buffer.row
+        } else {
+            buffer.row + 1
+        }
+    }
+
+    fn fold_mark(&mut self, name: &[u8]) {
+        match name {
+            b"fold" => {
+                self.fold_build = Some(FoldBuild {
+                    start: self.next_line(),
+                    brief_end: None,
+                    full: Buffer::new(None),
+                });
+            }
+            b"fold-full" => {
+                let end = self.next_line();
+                if let Some(build) = &mut self.fold_build {
+                    build.brief_end = Some(end);
+                }
+            }
+            _ => {
+                let Some(build) = self.fold_build.take() else {
+                    return;
+                };
+                let Some(end) = build.brief_end else {
+                    return;
+                };
+                let rows = if build.full.col == 0 {
+                    build.full.row
+                } else {
+                    build.full.row + 1
+                };
+                let full = build.full.take_lines(rows);
+                if end > build.start && !full.is_empty() {
+                    self.folds.push(Fold {
+                        start: build.start,
+                        len: end - build.start,
+                        other: full,
+                        open: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Swaps fold `index`'s two forms; what is below moves with it.
+    fn toggle_fold(&mut self, index: usize) {
+        let fold = &mut self.folds[index];
+        let (start, old_len) = (fold.start, fold.len);
+        let other = std::mem::take(&mut fold.other);
+        let new_len = other.len();
+        fold.other = self.conversation.splice_lines(start, old_len, other);
+        fold.len = new_len;
+        fold.open = !fold.open;
+        let end = start + old_len;
+        let shift = |line: usize| {
+            if line >= end {
+                line - old_len + new_len
+            } else {
+                line
+            }
+        };
+        for later in &mut self.folds[index + 1..] {
+            later.start = shift(later.start);
+        }
+        if let Some(build) = &mut self.fold_build {
+            build.start = shift(build.start);
+            build.brief_end = build.brief_end.map(shift);
+        }
+        self.anchor = self.anchor.map(|(line, sub)| {
+            if line >= end {
+                (shift(line), sub)
+            } else if line >= start {
+                (start, 0)
+            } else {
+                (line, sub)
+            }
+        });
+        self.selection = None;
+        self.selecting = false;
+    }
+
+    /// A click on conversation line `line`: opens or closes the fold it is
+    /// in, keeping the fold's first row where it was on screen.
+    fn click_fold(&mut self, line: usize) -> bool {
+        let Some(index) = self
+            .folds
+            .iter()
+            .position(|fold| (fold.start..fold.start + fold.len).contains(&line))
+        else {
+            return false;
+        };
+        let start = self.folds[index].start;
+        let screen_row = self
+            .shown_rows
+            .iter()
+            .position(|&(shown, _, _)| shown == start)
+            .unwrap_or(0);
+        self.toggle_fold(index);
+        let (height, cols) = (self.view.0, self.view.1.max(1));
+        // An opened fold moves up as far as it must for its end to show,
+        // but never past the top of the window.
+        let fold = &self.folds[index];
+        let rows: usize = self.conversation.lines[fold.start..fold.start + fold.len]
+            .iter()
+            .map(|line| vt::row_count(line, cols))
+            .sum();
+        let top_row = if fold.open {
+            screen_row.min(height.saturating_sub(rows + 1))
+        } else {
+            screen_row
+        };
+        self.anchor = Some(self.step_back((start, 0), top_row, cols));
+        true
+    }
+
+    fn toggle_all_folds(&mut self) {
+        if self.focus_mode {
+            return;
+        }
+        let open = self.folds.iter().any(|fold| !fold.open);
+        // Last first: toggling a fold moves only the folds below it.
+        for index in (0..self.folds.len()).rev() {
+            if self.folds[index].open != open {
+                self.toggle_fold(index);
+            }
+        }
+    }
+
+    fn step_task(&mut self, step: isize) {
+        let Some(view) = &mut self.tasks_view else {
+            return;
+        };
+        let jobs = crate::global_background_jobs().list();
+        if jobs.is_empty() {
+            return;
+        }
+        let at = jobs.iter().position(|job| job.id == view.id).unwrap_or(0);
+        let next = (at as isize + step).rem_euclid(jobs.len() as isize) as usize;
+        view.id = jobs[next].id.clone();
+        view.scroll = 0;
+    }
+
+    /// The task view, `height` rows `cols` wide: a header with the task and
+    /// its buttons, a rule, the end of its output, and a row of keys.
+    fn tasks_view_rows(&mut self, height: usize, cols: usize) -> Vec<String> {
+        let Some(view) = self.tasks_view.as_mut() else {
+            return Vec::new();
+        };
+        let jobs = crate::global_background_jobs().list();
+        let position = jobs.iter().position(|job| job.id == view.id);
+        let Some((job, output)) = crate::global_background_jobs().peek(&view.id, TASK_VIEW_BYTES)
+        else {
+            self.tasks_view = None;
+            return self.conversation_rows(height, cols);
+        };
+        let running = job.state == crate::JobState::Running;
+        // Header: what runs, then the buttons at the right edge.
+        let close = " ✕ ";
+        let stop = if running { " stop " } else { "" };
+        let buttons = stop.chars().count() + 1 + close.chars().count();
+        let state = if running {
+            format!("running {}s", job.elapsed_secs)
+        } else {
+            job.state.to_string()
+        };
+        let title: String = format!(" {} · {}", job.id, job.command)
+            .replace('\n', " ")
+            .chars()
+            .take(cols.saturating_sub(buttons + 1))
+            .collect();
+        let pad = cols.saturating_sub(title.chars().count() + buttons);
+        let stop_col = title.chars().count() + pad;
+        let header = format!(
+            "\x1b[1m{title}\x1b[0m{}{}{}\x1b[7m{close}\x1b[0m",
+            " ".repeat(pad),
+            if running {
+                format!("\x1b[7m{stop}\x1b[0m")
+            } else {
+                String::new()
+            },
+            if running { " " } else { "" },
+        );
+        self.layout.view_stop = running.then(|| (0, stop_col, stop_col + stop.chars().count()));
+        let close_col = cols.saturating_sub(close.chars().count());
+        self.layout.view_close = Some((0, close_col, cols));
+        let rule = format!("\x1b[2m{}\x1b[0m", "─".repeat(cols));
+        let keys = match position {
+            Some(index) if jobs.len() > 1 => format!(
+                " {state} · ←/→ task {} of {} · PgUp/PgDn, wheel: scroll · Esc: back",
+                index + 1,
+                jobs.len()
+            ),
+            _ => format!(" {state} · PgUp/PgDn, wheel: scroll · Esc: back"),
+        };
+        let keys = format!(
+            "\x1b[2m{}\x1b[0m",
+            keys.chars().take(cols).collect::<String>()
+        );
+
+        // The output, through the terminal emulator so colours and
+        // carriage-return progress bars come out as a terminal shows them.
+        let mut buffer = Buffer::new(None);
+        buffer.feed(output.replace('\n', "\r\n").as_bytes());
+        let mut rows: Vec<String> = Vec::new();
+        for line in &buffer.lines {
+            for (start, end) in vt::wrap_ranges(line, cols) {
+                rows.push(vt::render_cells(&line[start..end]));
+            }
+        }
+        while rows.last().is_some_and(String::is_empty) {
+            rows.pop();
+        }
+        if rows.is_empty() {
+            rows.push("\x1b[2m(no output yet)\x1b[0m".to_string());
+        }
+        let body = height.saturating_sub(3);
+        let max_scroll = rows.len().saturating_sub(body);
+        view.scroll = view.scroll.min(max_scroll);
+        let end = rows.len() - view.scroll;
+        let start = end.saturating_sub(body);
+        let mut frame = vec![header, rule];
+        frame.extend(rows[start..end].iter().cloned());
+        frame.resize(height.saturating_sub(1), String::new());
+        frame.push(keys);
+        frame.truncate(height);
+        self.shown_rows.clear();
+        frame
     }
 
     fn reset_pane(&mut self) {
@@ -861,7 +1281,11 @@ impl State {
         self.layout.conversation_cols = conversation_cols;
         self.layout.height = height;
         self.view = (height, conversation_cols);
-        let mut frame = self.conversation_rows(height, conversation_cols);
+        let mut frame = if self.tasks_view.is_some() {
+            self.tasks_view_rows(height, conversation_cols)
+        } else {
+            self.conversation_rows(height, conversation_cols)
+        };
         if self
             .notice
             .as_ref()
@@ -886,6 +1310,11 @@ impl State {
             self.add_panel(&mut frame, conversation_cols, width);
         }
         let cursor = cursor.map(|(row, col)| (height + notice_rows.len() + row, col));
+        let pane_top = height + notice_rows.len();
+        self.layout.footer_shells = pane_rows.iter().enumerate().find_map(|(index, row)| {
+            let (from, to) = footer_shells_span(&strip_escapes(row))?;
+            Some((pane_top + index, from, to))
+        });
         frame.extend(notice_rows);
         frame.extend(pane_rows);
         (frame, cursor)
@@ -1133,6 +1562,26 @@ impl State {
             if self.click_close(row, col) || self.over_panel(row, col) {
                 return None;
             }
+            let hit = |target: Option<(usize, usize, usize)>| {
+                target.is_some_and(|(r, from, to)| r == row && (from..to).contains(&col))
+            };
+            if hit(self.layout.footer_shells) {
+                if let Some(id) = pick_task(None) {
+                    self.tasks_view = Some(TasksView { id, scroll: 0 });
+                }
+                return None;
+            }
+            if self.tasks_view.is_some() {
+                if hit(self.layout.view_close) {
+                    self.tasks_view = None;
+                } else if hit(self.layout.view_stop) {
+                    if let Some(view) = &self.tasks_view {
+                        let _ = crate::global_background_jobs().kill(&view.id);
+                    }
+                }
+                // The view's text is not selectable.
+                return None;
+            }
             // A click on "Jump to bottom" does what Ctrl+End does.
             if let Some((hint_row, from, to)) = self.layout.jump_hint {
                 if row == hint_row && (from..to).contains(&col) {
@@ -1191,8 +1640,19 @@ impl State {
                 }
                 let selection = self.selection?;
                 if selection.anchor == selection.head {
-                    // A click, not a drag: nothing is selected.
+                    // A click, not a drag: nothing is selected, and a
+                    // click on collapsible output opens or closes it.
                     self.selection = None;
+                    // (Not below it: that is the input box.)
+                    if !self.focus_mode && row < self.shown_rows.len() {
+                        // "Started background job bg3" opens that job's view.
+                        let line = vt::plain(&self.shown()[selection.anchor.0]);
+                        if let Some(id) = background_job_named(&line) {
+                            self.tasks_view = Some(TasksView { id, scroll: 0 });
+                            return None;
+                        }
+                        self.click_fold(selection.anchor.0);
+                    }
                     return None;
                 }
                 let text = self.selected_text();
@@ -1289,6 +1749,18 @@ impl State {
     fn scroll(&mut self, scroll: Scroll) {
         let (height, cols) = self.view;
         if height == 0 {
+            return;
+        }
+        if let Some(view) = &mut self.tasks_view {
+            let page = height.saturating_sub(4).max(1);
+            view.scroll = match scroll {
+                Scroll::Up(rows) => view.scroll + rows,
+                Scroll::PageUp => view.scroll + page,
+                Scroll::Down(rows) => view.scroll.saturating_sub(rows),
+                Scroll::PageDown => view.scroll.saturating_sub(page),
+                Scroll::Top => usize::MAX / 2,
+                Scroll::Bottom => 0,
+            };
             return;
         }
         let page = height.saturating_sub(1).max(1);
@@ -1584,6 +2056,154 @@ mod tests {
         assert_eq!(plain(&frame[2]), "x".repeat(10));
         let (frame, _) = state.compose(6, 60);
         assert_eq!(plain(&frame[0]), "x".repeat(50));
+    }
+
+    /// "before", a fold (short: one line; full: three), "after".
+    fn state_with_fold() -> State {
+        let mut state = State::new();
+        state.feed(b"before\n");
+        state.fold_mark(b"fold");
+        state.feed(b"short +2 lines\n");
+        state.fold_mark(b"fold-full");
+        state.feed(b"full 1\nfull 2\nfull 3\n");
+        state.fold_mark(b"fold-end");
+        state.feed(b"after\n");
+        state
+    }
+
+    fn rows(state: &mut State, height: usize) -> Vec<String> {
+        let (frame, _) = state.compose(height, 40);
+        frame.iter().map(|row| plain(row)).collect()
+    }
+
+    fn click(state: &mut State, row: usize) {
+        state.mouse(Mouse::Press { row, col: 2 });
+        state.mouse(Mouse::Release { row, col: 2 });
+    }
+
+    #[test]
+    fn a_fold_shows_its_short_form_until_clicked() {
+        let mut state = state_with_fold();
+        assert_eq!(
+            &rows(&mut state, 8)[..3],
+            ["before", "short +2 lines", "after"]
+        );
+        click(&mut state, 1);
+        assert_eq!(
+            &rows(&mut state, 8)[..5],
+            ["before", "full 1", "full 2", "full 3", "after"]
+        );
+        // Opened low in a short window, it moves up so its end shows.
+        let mut low = state_with(12);
+        low.fold_mark(b"fold");
+        low.feed(b"short\n");
+        low.fold_mark(b"fold-full");
+        low.feed(b"long 1\nlong 2\nlong 3\nlong 4\n");
+        low.fold_mark(b"fold-end");
+        let shown = rows(&mut low, 6);
+        let at = shown
+            .iter()
+            .position(|row| row == "short")
+            .expect("short form shown");
+        assert_eq!(at + 1, low.shown_rows.len(), "at the bottom: {shown:?}");
+        click(&mut low, at);
+        let shown = rows(&mut low, 6);
+        assert!(shown.contains(&"long 1".to_string()), "{shown:?}");
+        assert!(shown.contains(&"long 4".to_string()), "{shown:?}");
+        // A click anywhere in the full form collapses it again.
+        click(&mut state, 3);
+        assert_eq!(
+            &rows(&mut state, 8)[..3],
+            ["before", "short +2 lines", "after"]
+        );
+        // Clicks elsewhere do nothing.
+        click(&mut state, 0);
+        click(&mut state, 2);
+        assert_eq!(
+            &rows(&mut state, 8)[..3],
+            ["before", "short +2 lines", "after"]
+        );
+    }
+
+    #[test]
+    fn ctrl_o_opens_every_fold_then_closes_them() {
+        let mut state = state_with_fold();
+        state.fold_mark(b"fold");
+        state.feed(b"second short\n");
+        state.fold_mark(b"fold-full");
+        state.feed(b"second full 1\nsecond full 2\n");
+        state.fold_mark(b"fold-end");
+        state.feed(b"end\n");
+        state.toggle_all_folds();
+        assert_eq!(
+            &rows(&mut state, 12)[..8],
+            [
+                "before",
+                "full 1",
+                "full 2",
+                "full 3",
+                "after",
+                "second full 1",
+                "second full 2",
+                "end"
+            ]
+        );
+        state.toggle_all_folds();
+        assert_eq!(
+            &rows(&mut state, 12)[..5],
+            ["before", "short +2 lines", "after", "second short", "end"]
+        );
+        // Output after a toggle still lands at the end.
+        state.toggle_all_folds();
+        state.feed(b"more\n");
+        assert_eq!(rows(&mut state, 12)[8], "more");
+    }
+
+    #[test]
+    fn the_footer_shell_count_is_found_in_its_row() {
+        use super::footer_shells_span;
+        assert_eq!(
+            footer_shells_span("  auto · ctx 12% · 2 shells"),
+            Some((19, 27))
+        );
+        assert_eq!(footer_shells_span("plan · 1 shell"), Some((7, 14)));
+        assert_eq!(footer_shells_span("a shell"), None);
+    }
+
+    #[test]
+    fn the_tasks_view_shows_a_jobs_output_until_closed() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "echo first line; echo second line"]);
+        let id = crate::global_background_jobs()
+            .start(command, "echo two lines")
+            .expect("job starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::global_background_jobs()
+            .peek(&id, 1000)
+            .is_some_and(|(_, output)| !output.contains("second line"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let mut state = state_with(3);
+        state.tasks_view = Some(super::TasksView {
+            id: id.clone(),
+            scroll: 0,
+        });
+        let shown = rows(&mut state, 10);
+        assert!(shown[0].contains(&id) && shown[0].contains("echo two lines"));
+        assert!(shown.iter().any(|row| row == "first line"));
+        assert!(shown.iter().any(|row| row == "second line"));
+        assert!(
+            !shown.iter().any(|row| row == "line 0"),
+            "conversation hidden"
+        );
+        // Its ✕ closes it and the conversation is back.
+        let (row, from, _) = state.layout.view_close.expect("close button");
+        state.mouse(Mouse::Press { row, col: from + 1 });
+        assert!(state.tasks_view.is_none());
+        assert_eq!(rows(&mut state, 10)[0], "line 0");
     }
 
     #[test]

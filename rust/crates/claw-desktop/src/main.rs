@@ -44,6 +44,13 @@ pub fn main() -> iced::Result {
     if std::env::var_os("WGPU_POWER_PREF").is_none() {
         std::env::set_var("WGPU_POWER_PREF", "low");
     }
+    // Without Xft.dpi, winit scales X11 windows by the monitor's physical DPI,
+    // so a 14" 1080p panel drew the whole UI 1.5x larger than an external
+    // monitor did. Keep it 1x everywhere (Settings has the text size);
+    // WINIT_X11_SCALE_FACTOR set by the user still wins.
+    if std::env::var_os("WINIT_X11_SCALE_FACTOR").is_none() {
+        std::env::set_var("WINIT_X11_SCALE_FACTOR", "1");
+    }
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)

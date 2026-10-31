@@ -296,6 +296,13 @@ pub struct ConversationRuntime<C, T> {
     /// between steps. Only the interactive main runtime sets this, so
     /// sub-agents running in other threads do not take its notices.
     deliver_job_notices: bool,
+    /// Instruction files of subdirectories, added to the first tool result
+    /// that touches them (see [`crate::context_hints`]).
+    /// Shared with the caller, which keeps it across turns.
+    context_hints: Option<std::sync::Arc<std::sync::Mutex<crate::context_hints::ContextHints>>>,
+    /// Remind the model once to check code it edited before ending a turn
+    /// (see [`crate::turn_guards::VerifyGuard`]).
+    verify_on_stop: bool,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -346,7 +353,25 @@ where
             hook_progress_reporter: None,
             session_tracer: None,
             deliver_job_notices: false,
+            context_hints: None,
+            verify_on_stop: false,
         }
+    }
+
+    /// Loads subdirectories' instruction files (`AGENTS.md`, …) as the
+    /// model first works in them. `hints` is kept by the caller across
+    /// turns, so each directory's files come once a session.
+    pub fn set_context_hints(
+        &mut self,
+        hints: std::sync::Arc<std::sync::Mutex<crate::context_hints::ContextHints>>,
+    ) {
+        self.context_hints = Some(hints);
+    }
+
+    /// Whether a turn that edited code is reminded to check it before it
+    /// ends.
+    pub fn set_verify_on_stop(&mut self, on: bool) {
+        self.verify_on_stop = on;
     }
 
     #[must_use]
@@ -641,6 +666,11 @@ where
         let mut cut_off_continuations = 0;
         // (tool, input) -> (hash of its last result, times in a row it was that).
         let mut repeated_calls: BTreeMap<(String, String), (u64, u32)> = BTreeMap::new();
+        let mut failures = crate::turn_guards::FailureGuard::default();
+        let mut verify = crate::turn_guards::VerifyGuard::default();
+        // Broad searches the model was already warned about once this turn.
+        let mut broad_searches_warned: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
 
         loop {
             iterations += 1;
@@ -666,7 +696,7 @@ where
             let reply_cut_off = events
                 .iter()
                 .any(|event| matches!(event, AssistantEvent::OutputLimitReached));
-            let (assistant_message, usage, turn_prompt_cache_events) =
+            let (mut assistant_message, usage, turn_prompt_cache_events) =
                 match build_assistant_message(events) {
                     Ok(result) => result,
                     Err(error) => {
@@ -674,6 +704,15 @@ where
                         return Err(error);
                     }
                 };
+            // A reply stuck repeating itself is not continued (that fed the
+            // loop) and its text is not kept (sent back, it starts the loop
+            // again on the next request).
+            let looped = replace_looped_text(&mut assistant_message, reply_cut_off);
+            if looped {
+                eprintln!(
+                    "\n\x1b[2m(the reply got stuck repeating itself, so it was stopped)\x1b[0m"
+                );
+            }
             if let Some(usage) = usage {
                 self.usage_tracker.record(usage);
             }
@@ -732,6 +771,9 @@ where
             }
 
             if pending_tool_uses.is_empty() && cut_off_tool_use.is_none() {
+                if looped {
+                    break;
+                }
                 if reply_cut_off && cut_off_continuations < MAX_CUT_OFF_CONTINUATIONS {
                     cut_off_continuations += 1;
                     // After a cut-off in the middle of thinking, a bare "continue"
@@ -739,7 +781,15 @@ where
                     // not shown back to them), so they ran into the limit again.
                     let prompt = cut_off_thinking.as_deref().map_or_else(
                         || CUT_OFF_CONTINUE_PROMPT.to_string(),
-                        |tail| {
+                        |tail| if crate::turn_guards::is_repetition_dominated(tail) {
+                            // Its tail is a loop: quoting it would restart it.
+                            format!(
+                                "{THINKING_CUT_OFF_PROMPT}, without an answer or a tool call: your \
+                                 thinking got stuck repeating the same passage. Do not think it over \
+                                 again. Act now: call the next tool or give the answer, with at most \
+                                 a sentence of thought first.\n</system-reminder>"
+                            )
+                        } else {
                             format!(
                                 "{THINKING_CUT_OFF_PROMPT}, without an answer or a tool call: nothing \
                                  was shown or done. Your thinking \
@@ -753,6 +803,19 @@ where
                         .push_message(crate::session::ConversationMessage::user_text(prompt))
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     continue;
+                }
+                // Messages typed while the final reply streamed go to the
+                // model now, in this turn, as they would after a tool step.
+                if self.pass_queued_to_running_turn()? {
+                    continue;
+                }
+                if self.verify_on_stop && !reply_cut_off {
+                    if let Some(reminder) = verify.reminder() {
+                        self.session
+                            .push_message(crate::session::ConversationMessage::user_text(reminder))
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        continue;
+                    }
                 }
                 break;
             }
@@ -782,6 +845,31 @@ where
                         outcome = PermissionOutcome::Deny {
                             reason: REPEATED_CALL_NOTE.to_string(),
                         };
+                    }
+                    if outcome == PermissionOutcome::Allow {
+                        if let crate::turn_guards::CallVerdict::Block(reason) =
+                            failures.check(&tool_name, &effective_input)
+                        {
+                            outcome = PermissionOutcome::Deny { reason };
+                        }
+                    }
+                    if outcome == PermissionOutcome::Allow && tool_name.eq_ignore_ascii_case("bash")
+                    {
+                        let target = serde_json::from_str::<serde_json::Value>(&effective_input)
+                            .ok()
+                            .and_then(|input| {
+                                input
+                                    .get("command")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(crate::turn_guards::broad_search_target)
+                            });
+                        if let Some(target) = target {
+                            if broad_searches_warned.insert(effective_input.clone()) {
+                                outcome = PermissionOutcome::Deny {
+                                    reason: crate::turn_guards::broad_search_note(&target),
+                                };
+                            }
+                        }
                     }
                     prepared.push(PreparedToolUse {
                         tool_use_id,
@@ -825,8 +913,14 @@ where
                             });
                             let key = (call.tool_name.clone(), call.effective_input.clone());
                             let mut message = self.finish_tool_use(call, result);
-                            note_repeated_call(&mut repeated_calls, key, &message);
+                            note_repeated_call(&mut repeated_calls, key.clone(), &message);
                             self.note_unchanged_read(&mut message);
+                            self.annotate_tool_result(
+                                &mut message,
+                                &key,
+                                &mut failures,
+                                &mut verify,
+                            );
                             message
                         }
                         PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
@@ -879,12 +973,7 @@ where
             crate::turn_keys::print_side_answers();
             // Prompts the user queued while the tools ran are passed to the
             // model before its next step, so a running task can be steered.
-            for text in crate::turn_keys::take_queued_for_running_turn() {
-                crate::turn_keys::announce_sent_to_running_turn(&text);
-                self.session
-                    .push_message(crate::session::ConversationMessage::user_text(text))
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-            }
+            self.pass_queued_to_running_turn()?;
         }
 
         let summary = TurnSummary {
@@ -898,6 +987,64 @@ where
         self.record_turn_completed(&summary);
 
         Ok(summary)
+    }
+
+    /// Adds what the turn's guards have to say to a finished call's result:
+    /// a note after repeated failures, a security note for injected
+    /// instructions, and instruction files of a newly entered directory.
+    fn annotate_tool_result(
+        &mut self,
+        message: &mut ConversationMessage,
+        (tool_name, input): &(String, String),
+        failures: &mut crate::turn_guards::FailureGuard,
+        verify: &mut crate::turn_guards::VerifyGuard,
+    ) {
+        let Some(ContentBlock::ToolResult {
+            output, is_error, ..
+        }) = message
+            .blocks
+            .iter_mut()
+            .find(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        else {
+            return;
+        };
+        let mut notes = Vec::new();
+        if let Some(note) = failures.record(tool_name, input, *is_error) {
+            notes.push(note);
+        }
+        if !*is_error {
+            verify.record(tool_name, input);
+            if let Some(warning) = crate::threats::tool_result_warning(tool_name, output) {
+                notes.push(warning);
+            }
+            if let Some(hints) = self.context_hints.as_ref() {
+                let hint = hints
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .for_call(tool_name, input);
+                if let Some(hint) = hint {
+                    notes.push(hint);
+                }
+            }
+        }
+        for note in notes {
+            output.push_str("\n\n");
+            output.push_str(&note);
+        }
+    }
+
+    /// Adds the messages the user typed during the turn to the session;
+    /// returns whether there were any.
+    fn pass_queued_to_running_turn(&mut self) -> Result<bool, RuntimeError> {
+        let queued = crate::turn_keys::take_queued_for_running_turn();
+        let any = !queued.is_empty();
+        for text in queued {
+            crate::turn_keys::announce_sent_to_running_turn(&text);
+            self.session
+                .push_message(crate::session::ConversationMessage::user_text(text))
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        Ok(any)
     }
 
     #[must_use]
@@ -1365,6 +1512,41 @@ fn build_assistant_message(
     ))
 }
 
+/// Replaces the text of a reply stuck in a repetition loop with a short
+/// note; returns whether it was one. A cut-off reply is judged on the usual
+/// threshold, a finished one only at runaway size.
+fn replace_looped_text(message: &mut ConversationMessage, cut_off: bool) -> bool {
+    let text = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    let looped = if cut_off {
+        crate::turn_guards::is_repetition_dominated(&text)
+    } else {
+        crate::turn_guards::is_runaway_repetition(&text)
+    };
+    if !looped {
+        return false;
+    }
+    let mut replaced = false;
+    message.blocks.retain_mut(|block| match block {
+        ContentBlock::Text { text } => {
+            if replaced {
+                return false;
+            }
+            replaced = true;
+            *text = crate::turn_guards::REPETITION_NOTE.to_string();
+            true
+        }
+        _ => true,
+    });
+    true
+}
+
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -1784,6 +1966,62 @@ mod tests {
                 MessageRole::User,
                 MessageRole::Assistant,
                 MessageRole::Tool,
+                MessageRole::User,
+                MessageRole::Assistant
+            ]
+        );
+    }
+
+    /// Answers at once; checks that a prompt queued meanwhile reached the
+    /// model in the same turn.
+    struct SteeredAfterReplyClient {
+        call_count: usize,
+    }
+
+    impl ApiClient for SteeredAfterReplyClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.call_count += 1;
+            if self.call_count == 2 {
+                let last = request.messages.last().expect("messages");
+                assert!(matches!(
+                    &last.blocks[0],
+                    ContentBlock::Text { text } if text == "and in French"
+                ));
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta(format!("reply {}", self.call_count)),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn prompts_queued_during_the_final_reply_continue_the_turn() {
+        let _turn = crate::turn_keys::simulate_queued_during_turn("and in French");
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SteeredAfterReplyClient { call_count: 0 },
+            RecordingExecutor::default(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("say hi", None)
+            .expect("conversation loop should succeed");
+
+        assert_eq!(runtime.api_client.call_count, 2);
+        let roles = runtime
+            .session()
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::User,
+                MessageRole::Assistant,
                 MessageRole::User,
                 MessageRole::Assistant
             ]
@@ -2321,6 +2559,85 @@ mod tests {
             })
         });
         assert!(stopped);
+    }
+
+    #[test]
+    fn edited_code_is_checked_before_the_turn_ends_and_failing_calls_stop() {
+        let call = |id: &str, name: &str, input: &str| {
+            vec![
+                AssistantEvent::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: input.to_string(),
+                },
+                AssistantEvent::MessageStop,
+            ]
+        };
+        let text = |text: &str| {
+            vec![
+                AssistantEvent::TextDelta(text.to_string()),
+                AssistantEvent::MessageStop,
+            ]
+        };
+        // A call that fails differently each time (so it is not caught as a
+        // repeated result) five times, an edit, an answer, then a test run
+        // after the reminder.
+        let mut replies: Vec<_> = (0..5)
+            .map(|i| call(&format!("f{i}"), "bash", r#"{"command":"make"}"#))
+            .collect();
+        replies.push(call("e", "edit_file", r#"{"path":"src/lib.rs"}"#));
+        replies.push(text("done"));
+        replies.push(call("t", "bash", r#"{"command":"cargo test"}"#));
+        replies.push(text("done, tests pass"));
+        let runs = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let seen = runs.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CutOffApi {
+                replies,
+                requests: Vec::new(),
+            },
+            StaticToolExecutor::new()
+                .register("bash", move |input| {
+                    *seen.borrow_mut() += 1;
+                    if input.contains("make") {
+                        Err(ToolError::new(format!(
+                            "make failed (run {})",
+                            seen.borrow()
+                        )))
+                    } else {
+                        Ok("ok".to_string())
+                    }
+                })
+                .register("edit_file", |_| Ok("edited".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime.set_verify_on_stop(true);
+
+        let summary = runtime.run_turn("fix it", None).expect("turn runs");
+
+        let outputs = summary
+            .tool_results
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(outputs[1].contains("this exact call has now failed 2 times"));
+        assert!(outputs[4].starts_with("Not run: this exact bash call has already failed 4"));
+        // Four `make` runs and the test run.
+        assert_eq!(*runs.borrow(), 5);
+        let reminded = runtime.session().messages.iter().any(|message| {
+            message.role == MessageRole::User
+                && message.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text.contains("You changed code (src/lib.rs)"))
+                })
+        });
+        assert!(reminded);
+        assert_eq!(summary.iterations, 9);
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Minimal Model Context Protocol (MCP) server.
 //!
-//! Implements a newline-safe, LSP-framed JSON-RPC server over stdio that
-//! answers `initialize`, `tools/list`, and `tools/call` requests. The framing
-//! matches the client transport implemented in [`crate::mcp_stdio`] so this
-//! server can be driven by either an external MCP client (e.g. Claude
-//! Desktop) or `claw`'s own [`McpServerManager`](crate::McpServerManager).
+//! Implements a JSON-RPC server over stdio that answers `initialize`,
+//! `tools/list`, and `tools/call` requests. It reads both newline-delimited
+//! JSON (the MCP stdio spec) and legacy LSP-style `Content-Length` frames, and
+//! replies in whichever framing the client used, so it can be driven by an
+//! external MCP client (e.g. Claude Desktop) or `claw`'s own
+//! [`McpServerManager`](crate::McpServerManager).
 //!
 //! The server is intentionally small: it exposes a list of pre-built
 //! [`McpTool`] descriptors and delegates `tools/call` to a caller-supplied
@@ -67,6 +68,14 @@ pub struct McpServer {
     spec: McpServerSpec,
     stdin: BufReader<Stdin>,
     stdout: Stdout,
+    framing: Framing,
+}
+
+/// Wire framing of a stdio message; replies mirror the client's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    Lines,
+    ContentLength,
 }
 
 impl McpServer {
@@ -76,6 +85,7 @@ impl McpServer {
             spec,
             stdin: BufReader::new(stdin()),
             stdout: stdout(),
+            framing: Framing::Lines,
         }
     }
 
@@ -85,9 +95,10 @@ impl McpServer {
     /// callers can log and exit non-zero.
     pub async fn run(&mut self) -> io::Result<()> {
         loop {
-            let Some(payload) = read_frame(&mut self.stdin).await? else {
+            let Some((payload, framing)) = read_frame(&mut self.stdin).await? else {
                 return Ok(());
             };
+            self.framing = framing;
 
             // Requests and notifications share a wire format; the absence of
             // `id` distinguishes notifications, which must never receive a
@@ -106,7 +117,7 @@ impl McpServer {
                             data: None,
                         }),
                     };
-                    write_response(&mut self.stdout, &response).await?;
+                    write_response(&mut self.stdout, &response, self.framing).await?;
                     continue;
                 }
             };
@@ -130,13 +141,13 @@ impl McpServer {
                             data: None,
                         }),
                     };
-                    write_response(&mut self.stdout, &response).await?;
+                    write_response(&mut self.stdout, &response, self.framing).await?;
                     continue;
                 }
             };
 
             let response = self.dispatch(request);
-            write_response(&mut self.stdout, &response).await?;
+            write_response(&mut self.stdout, &response, self.framing).await?;
         }
     }
 
@@ -242,11 +253,12 @@ fn invalid_params_response(id: JsonRpcId, message: &str) -> JsonRpcResponse<Json
     }
 }
 
-/// Reads a single LSP-framed JSON-RPC payload from `reader`.
+/// Reads a single JSON-RPC payload from `reader`, either one JSON line or an
+/// LSP-style `Content-Length` frame, and reports which framing was used.
 ///
 /// Returns `Ok(None)` on clean EOF before any header bytes have been read,
 /// matching how [`crate::mcp_stdio::McpStdioProcess`] treats stream closure.
-async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>> {
+async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<(Vec<u8>, Framing)>> {
     let mut content_length: Option<usize> = None;
     let mut first_header = true;
     loop {
@@ -261,10 +273,16 @@ async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>
                 "MCP stdio stream closed while reading headers",
             ));
         }
-        first_header = false;
+        if first_header && line.trim_start().starts_with(['{', '[']) {
+            return Ok(Some((line.trim_end().as_bytes().to_vec(), Framing::Lines)));
+        }
         if line == "\r\n" || line == "\n" {
+            if first_header {
+                continue;
+            }
             break;
         }
+        first_header = false;
         let header = line.trim_end_matches(['\r', '\n']);
         if let Some((name, value)) = header.split_once(':') {
             if name.trim().eq_ignore_ascii_case("Content-Length") {
@@ -282,17 +300,23 @@ async fn read_frame(reader: &mut BufReader<Stdin>) -> io::Result<Option<Vec<u8>>
     })?;
     let mut payload = vec![0_u8; content_length];
     reader.read_exact(&mut payload).await?;
-    Ok(Some(payload))
+    Ok(Some((payload, Framing::ContentLength)))
 }
 
 async fn write_response(
     stdout: &mut Stdout,
     response: &JsonRpcResponse<JsonValue>,
+    framing: Framing,
 ) -> io::Result<()> {
-    let body = serde_json::to_vec(response)
+    let mut body = serde_json::to_vec(response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    stdout.write_all(header.as_bytes()).await?;
+    match framing {
+        Framing::Lines => body.push(b'\n'),
+        Framing::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+            stdout.write_all(header.as_bytes()).await?;
+        }
+    }
     stdout.write_all(&body).await?;
     stdout.flush().await
 }
@@ -312,6 +336,7 @@ mod tests {
             },
             stdin: BufReader::new(stdin()),
             stdout: stdout(),
+            framing: Framing::Lines,
         };
         let request = JsonRpcRequest::<JsonValue> {
             jsonrpc: "2.0".to_string(),
@@ -346,6 +371,7 @@ mod tests {
             },
             stdin: BufReader::new(stdin()),
             stdout: stdout(),
+            framing: Framing::Lines,
         };
         let request = JsonRpcRequest::<JsonValue> {
             jsonrpc: "2.0".to_string(),
@@ -370,6 +396,7 @@ mod tests {
             },
             stdin: BufReader::new(stdin()),
             stdout: stdout(),
+            framing: Framing::Lines,
         };
         let request = JsonRpcRequest::<JsonValue> {
             jsonrpc: "2.0".to_string(),
@@ -402,6 +429,7 @@ mod tests {
             },
             stdin: BufReader::new(stdin()),
             stdout: stdout(),
+            framing: Framing::Lines,
         };
         let request = JsonRpcRequest::<JsonValue> {
             jsonrpc: "2.0".to_string(),
@@ -426,6 +454,7 @@ mod tests {
             },
             stdin: BufReader::new(stdin()),
             stdout: stdout(),
+            framing: Framing::Lines,
         };
         let request = JsonRpcRequest::<JsonValue> {
             jsonrpc: "2.0".to_string(),

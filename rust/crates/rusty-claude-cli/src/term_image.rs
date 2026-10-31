@@ -75,6 +75,20 @@ pub fn enabled() -> bool {
 /// What shows the image at `url` at most `max_cols` wide: the escapes that
 /// send it (the first time only) and the placeholder rows, one per line.
 pub fn show(url: &str, max_cols: usize) -> Result<String, String> {
+    show_with(url, max_cols, || load(url))
+}
+
+/// Like [`show`] for an image already in memory (a rendered diagram);
+/// `key` names it (`.svg` keys are drawn as SVG).
+pub fn show_bytes(key: &str, bytes: &[u8], max_cols: usize) -> Result<String, String> {
+    show_with(key, max_cols, || Ok(bytes.to_vec()))
+}
+
+fn show_with(
+    url: &str,
+    max_cols: usize,
+    load: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<String, String> {
     let known = sent()
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -84,7 +98,7 @@ pub fn show(url: &str, max_cols: usize) -> Result<String, String> {
     let image = match known {
         Some(image) => image,
         None => {
-            let bytes = load(url)?;
+            let bytes = load()?;
             let (png, cols, rows) = fit(&bytes, url, max_cols.clamp(1, MAX_COLS))?;
             let image = Sent {
                 id: image_id(url),

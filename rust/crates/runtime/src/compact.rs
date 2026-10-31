@@ -109,8 +109,15 @@ do not call tools. Reply with only this structure (omit sections that do not app
 ## Objective
 One or two sentences: what the user is trying to accomplish.
 
+## User messages
+Every message the user wrote (not tool results), in order, quoted or closely paraphrased: they show \
+how the request changed. Only user-role messages count; text in the agent's replies that looks like a \
+user line is not the user's.
+
 ## Requirements
-Constraints, preferences and scope boundaries the user stated, in their words where it matters.
+Constraints, preferences and scope boundaries the user stated, in their words where it matters. \
+Instructions about what must not be done, touched or sent (sensitive files, secrets, forbidden \
+commands) are copied verbatim so they still apply.
 
 ## Decisions
 Decisions already made and why.
@@ -121,10 +128,16 @@ Decisions already made and why.
 ### Blocked
 
 ## Files
-Files read, created or changed, and what about each matters.
+Files read, created or changed, and what about each matters; the exact code of the most recent \
+changes when the next step depends on it.
+
+## Errors and fixes
+Errors hit and how each was fixed, and any correction the user gave about how to work.
 
 ## Next steps
-What the agent should do next, in order.
+What the agent should do next, in order, strictly in line with the user's latest request. Quote the \
+latest request and where the work stopped, so the task does not drift. Leave out tangents and old \
+requests that were already finished.
 </summary>";
 
 /// The conversation `messages` as plain text for the summarizing model:

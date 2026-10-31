@@ -28,6 +28,54 @@ type CommandResult = Result<bool, Box<dyn std::error::Error>>;
 const MAX_GOAL_ROUNDS: usize = 20;
 /// The first line of a reply that ends a goal.
 const GOAL_MET: &str = "GOAL MET";
+/// The start of a reply that says the goal cannot be reached for now.
+const GOAL_BLOCKED: &str = "GOAL BLOCKED";
+/// Blocked rounds in a row that pause the goal: one could be the model
+/// giving up early, so it is asked once more to check.
+const BLOCKED_ROUNDS_TO_PAUSE: usize = 2;
+
+/// Where the active goal of session `id` is kept, so it survives a restart
+/// and `/resume`.
+fn goal_file(id: &str) -> std::path::PathBuf {
+    runtime::default_config_home()
+        .join("goals")
+        .join(format!("{id}.txt"))
+}
+
+/// Marks a saved goal that runs in fresh-context rounds.
+const FRESH_MARK: &str = "[fresh] ";
+/// Where fresh rounds keep the notes the next round starts from.
+const GOAL_PROGRESS_FILE: &str = ".claw/goal-progress.md";
+/// Longest round report passed to the next fresh round.
+const MAX_ROUND_REPORT: usize = 3_000;
+
+fn save_goal(id: &str, goal: Option<&str>, fresh: bool) {
+    let path = goal_file(id);
+    match goal {
+        Some(goal) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let mark = if fresh { FRESH_MARK } else { "" };
+            let _ = std::fs::write(path, format!("{mark}{goal}"));
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The reason in a `GOAL BLOCKED: <reason>` reply, if it is one.
+fn goal_blocker(reply: &str) -> Option<String> {
+    let first = reply.trim_start().lines().next()?;
+    let rest = first.strip_prefix(GOAL_BLOCKED)?;
+    let reason = rest.trim_start_matches([':', ' ', '-', '—']).trim();
+    Some(if reason.is_empty() {
+        "no reason given".to_string()
+    } else {
+        reason.to_string()
+    })
+}
 /// `/loop` without an interval.
 const DEFAULT_LOOP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// What a turn stopped with Esc leaves as the last message.
@@ -377,8 +425,34 @@ impl LiveCli {
         Ok(false)
     }
 
+    /// Loads the saved goal when the session changed (at startup, after
+    /// `/resume`, `/clear` or a branch switch), and says so.
+    pub(crate) fn sync_goal_with_session(&mut self) {
+        if self.goal_session == self.session.id {
+            return;
+        }
+        self.goal_session.clone_from(&self.session.id);
+        let saved = std::fs::read_to_string(goal_file(&self.session.id)).unwrap_or_default();
+        let saved = saved.trim();
+        self.goal_fresh = saved.starts_with(FRESH_MARK);
+        self.goal = Some(saved.trim_start_matches(FRESH_MARK).trim().to_string())
+            .filter(|goal| !goal.is_empty());
+        if let Some(goal) = &self.goal {
+            println!(
+                "{DIM}Goal of this session still open: {goal}\n  Your next prompt continues it; /goal clear drops it.{RESET}"
+            );
+        }
+    }
+
+    fn set_goal(&mut self, goal: Option<String>) {
+        self.goal_session.clone_from(&self.session.id);
+        save_goal(&self.session.id, goal.as_deref(), self.goal_fresh);
+        self.goal = goal;
+    }
+
     /// `/goal [condition|clear]`.
     pub(crate) fn run_goal(&mut self, condition: Option<&str>) -> CommandResult {
+        self.sync_goal_with_session();
         match condition.map(str::trim).filter(|c| !c.is_empty()) {
             None => {
                 match (&self.goal, &self.last_goal_met) {
@@ -391,14 +465,29 @@ impl LiveCli {
                 Ok(false)
             }
             Some("clear" | "stop" | "off" | "reset" | "none" | "cancel") => {
-                match self.goal.take() {
+                match self.goal.clone() {
                     Some(goal) => println!("Goal cleared: {goal}"),
                     None => println!("No goal was set."),
                 }
+                self.set_goal(None);
                 Ok(false)
             }
             Some(condition) => {
-                self.goal = Some(condition.to_string());
+                let (fresh, condition) = match condition.strip_prefix("--fresh") {
+                    Some(rest) if rest.trim().is_empty() => {
+                        println!("usage: /goal --fresh <objective>");
+                        return Ok(false);
+                    }
+                    Some(rest) => (true, rest.trim()),
+                    None => (false, condition),
+                };
+                self.goal_fresh = fresh;
+                if fresh {
+                    println!(
+                        "{DIM}Fresh rounds: each round starts a new session with only the goal, the last round's report and {GOAL_PROGRESS_FILE}; earlier rounds stay saved (/resume).{RESET}"
+                    );
+                }
+                self.set_goal(Some(condition.to_string()));
                 println!("Goal set: {condition}\n  claw keeps working until it holds (up to {MAX_GOAL_ROUNDS} rounds; Esc pauses, /goal clear drops it).");
                 self.pursue_goal();
                 Ok(true)
@@ -409,13 +498,51 @@ impl LiveCli {
     /// Keeps running turns toward the active goal until the model reports
     /// it met, the user stops a turn, a turn fails, or the rounds run out.
     pub(crate) fn pursue_goal(&mut self) {
-        for _ in 0..MAX_GOAL_ROUNDS {
+        let mut blocked_rounds = 0;
+        let mut report: Option<String> = None;
+        for round in 0..MAX_GOAL_ROUNDS {
             let Some(goal) = self.goal.clone() else {
                 return;
             };
+            if self.goal_fresh {
+                // A new session for the round; the goal moves with it.
+                let previous = match self.start_goal_round_session() {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        println!("{DIM}Goal paused: could not start a fresh round: {error}{RESET}");
+                        return;
+                    }
+                };
+                save_goal(&previous, None, false);
+                self.set_goal(Some(goal.clone()));
+                println!(
+                    "{DIM}Goal round {} in a fresh session ({}).{RESET}",
+                    round + 1,
+                    self.session.id
+                );
+            }
+            let recheck = if blocked_rounds > 0 {
+                "You reported it blocked last round. Check whether that condition still holds and whether any other way around it exists; work on whatever does not depend on it. "
+            } else {
+                ""
+            };
+            let fresh = if self.goal_fresh {
+                format!(
+                    "This goal runs in rounds that each start with a fresh context: you know only what is written here and in the files. \
+                     Read {GOAL_PROGRESS_FILE} first if it exists, and keep it up to date as you go (what is done, what is next, what failed and why), so the next round can carry on. \
+                     End the round with a short report: done, next, blockers; it is all the next round receives.\nReport from the previous round: {}\n",
+                    report.as_deref().unwrap_or("(none: this is the first round)")
+                )
+            } else {
+                String::new()
+            };
             let prompt = format!(
-                "<system-reminder>Active goal, set by the user with /goal: {goal}\n\
+                "<system-reminder>Active goal, set by the user with /goal: {goal}\n{fresh}{recheck}\
                  If the goal is fully met now, reply with `{GOAL_MET}` on its own first line, then one line saying how you know, and do nothing else. \
+                 If it cannot be reached without the user (a missing credential or file, a decision only they can make, a failure outside the project you cannot fix), \
+                 reply with `{GOAL_BLOCKED}: <the concrete condition>` on its first line, then what you need from them. \
+                 When the goal itself says something is unavailable, or a quick look at the project shows it is missing, report that at once: \
+                 do not hunt for credentials or access through the home directory or system folders, and do not invent them. Do all the work that does not depend on it first. \
                  Otherwise keep working toward it; you will be prompted again after this turn.</system-reminder>"
             );
             if self.run_turn(&prompt).is_err() {
@@ -426,10 +553,22 @@ impl LiveCli {
                 println!("{DIM}Goal paused. /goal clear drops it; any prompt continues it.{RESET}");
                 return;
             }
-            if last_assistant_text(self).trim_start().starts_with(GOAL_MET) {
+            let reply = last_assistant_text(self);
+            report = Some(reply.chars().take(MAX_ROUND_REPORT).collect());
+            if reply.trim_start().starts_with(GOAL_MET) {
                 println!("{DIM}Goal met: {goal}{RESET}");
-                self.last_goal_met = self.goal.take();
+                self.set_goal(None);
+                self.last_goal_met = Some(goal);
                 return;
+            }
+            if let Some(reason) = goal_blocker(&reply) {
+                blocked_rounds += 1;
+                if blocked_rounds >= BLOCKED_ROUNDS_TO_PAUSE {
+                    println!("{DIM}Goal paused, blocked: {reason}\n  Sort that out and send a prompt to continue, or /goal clear.{RESET}");
+                    return;
+                }
+            } else {
+                blocked_rounds = 0;
             }
         }
         println!("{DIM}Goal still open after {MAX_GOAL_ROUNDS} rounds; send a prompt to keep going or /goal clear.{RESET}");
@@ -1195,14 +1334,30 @@ fn wait_unless_key(interval: Duration) -> io::Result<bool> {
 /// The message for `/btw`: a quick answer from what is already known.
 pub(crate) fn btw_prompt(question: &str) -> String {
     format!(
-        "<system-reminder>The user is asking a quick side question (/btw). Answer it briefly from what this conversation already contains. You have no tools for this answer. If the conversation does not contain the answer, say so in one sentence. This exchange is not kept in the conversation.</system-reminder>\n\n{question}"
+        "<system-reminder>The user is asking a quick side question (/btw). Answer only this question, briefly, from what this conversation already contains or what you know. Do not continue the task above and do not call or write out any tool call: you have no tools for this answer. If you cannot answer it, say so in one sentence. This exchange is not kept in the conversation.</system-reminder>\n\n{question}"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_interval, parse_interval, parse_style_file, parse_token_count};
+    use super::{
+        format_interval, goal_blocker, parse_interval, parse_style_file, parse_token_count,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn a_blocked_goal_reply_gives_its_reason() {
+        assert_eq!(
+            goal_blocker("GOAL BLOCKED: HAWK_API_KEY is not set\nPlease export it.").as_deref(),
+            Some("HAWK_API_KEY is not set")
+        );
+        assert_eq!(
+            goal_blocker("GOAL BLOCKED").as_deref(),
+            Some("no reason given")
+        );
+        assert_eq!(goal_blocker("Still working; GOAL BLOCKED later"), None);
+        assert_eq!(goal_blocker("GOAL MET\nall tests pass"), None);
+    }
 
     #[test]
     fn skill_uses_are_counted_from_transcripts() {

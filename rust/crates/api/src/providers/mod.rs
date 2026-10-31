@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod hosted;
 pub mod local_window;
 pub mod openai_compat;
+pub mod think_scrubber;
 
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;

@@ -291,6 +291,21 @@ impl BackgroundJobs {
         Ok(take_new(&job))
     }
 
+    /// The job and up to the last `max_bytes` of its output, without
+    /// marking anything read (the model's `BashOutput` reads are separate).
+    #[must_use]
+    pub fn peek(&self, id: &str, max_bytes: usize) -> Option<(JobSummary, String)> {
+        let job = self.get(id)?;
+        let buffer = job.output.lock().unwrap_or_else(|e| e.into_inner());
+        let mut start = buffer.text.len().saturating_sub(max_bytes);
+        while !buffer.text.is_char_boundary(start) {
+            start += 1;
+        }
+        let output = buffer.text[start..].to_string();
+        drop(buffer);
+        Some((summarize(&job), output))
+    }
+
     /// Kills a job (and its process group) and returns its final output.
     pub fn kill(&self, id: &str) -> Result<JobRead, String> {
         let job = self.get(id).ok_or_else(|| self.unknown_job(id))?;

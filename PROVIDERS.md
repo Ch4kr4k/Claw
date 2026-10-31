@@ -281,8 +281,7 @@ Inside the REPL, `/model <name>` switches models, and providers, for the rest
 of the session; the history carries over. Under the `claw` wrapper:
 
 ```text
-/model coder          # local/qwen36-35b-a3b on llama-gpu (alias; the default)
-/model uncensored     # local/qwen35-4b-uncensored on llama-gpu (alias)
+/model local/cybertiel-35b-a3b   # llama-gpu's default model
 /model sonnet         # Anthropic, needs ANTHROPIC_API_KEY
 /model gpt-4.1        # OpenAI, needs OPENAI_API_KEY
 ```

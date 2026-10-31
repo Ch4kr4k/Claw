@@ -175,6 +175,18 @@ impl Drop for TurnAbortScope {
     }
 }
 
+/// Whether the turn running tools on this thread was stopped (Esc,
+/// Ctrl+C, Stop), for tools that run long processes of their own.
+#[must_use]
+pub fn turn_aborted() -> bool {
+    TURN_ABORT.with(|signal| {
+        signal
+            .borrow()
+            .as_ref()
+            .is_some_and(crate::HookAbortSignal::is_aborted)
+    })
+}
+
 /// Why a command was ended early.
 enum Ended {
     Timeout,
@@ -967,6 +979,21 @@ fn hidden_device_note(command: &str) -> Option<String> {
 /// instead of working around it or giving up.
 fn sandbox_block_note(stderr: &str) -> Option<&'static str> {
     let lower = stderr.to_lowercase();
+    // sudo, su, doas and pkexec cannot gain root in the sandbox (no new
+    // privileges), and the user namespace shows root's files as owned by
+    // nobody, which reads like a broken install.
+    const NO_ROOT_SIGNS: [&str; 5] = [
+        "\"no new privileges\" flag",
+        "owned by uid 65534",
+        "effective uid is not 0",
+        "must be setuid root",
+        "not installed setuid",
+    ];
+    if NO_ROOT_SIGNS.iter().any(|sign| lower.contains(sign)) {
+        return Some(
+            "[sandbox] This command ran in claw's sandbox, where sudo, su, doas and pkexec cannot gain root (the sandbox sets \"no new privileges\" and shows root's files as owned by nobody, uid 65534). sudo is not broken on the machine. If the command is needed, rerun the same command with dangerouslyDisableSandbox=true: the user is asked to approve running it on the host, where sudo works.",
+        );
+    }
     let blocked = lower.contains("read-only file system")
         || lower.contains("operation not permitted")
         || (lower.contains("permission denied") && !lower.contains("permission denied (publickey"));
@@ -1002,19 +1029,11 @@ fn no_terminal_note(stdout: &str, stderr: &str) -> Option<&'static str> {
 
 const MAX_OUTPUT_BYTES: usize = 16_384;
 
-/// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
+/// Output over `MAX_OUTPUT_BYTES` keeps its start and end, and the whole of
+/// it is saved to a file named in the note between them (see
+/// [`crate::tool_spill`]).
 fn truncate_output(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_BYTES {
-        return s.to_string();
-    }
-    // Find the last valid UTF-8 boundary at or before MAX_OUTPUT_BYTES
-    let mut end = MAX_OUTPUT_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = s[..end].to_string();
-    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
-    truncated
+    crate::tool_spill::spill_long(s, MAX_OUTPUT_BYTES, "bash")
 }
 
 #[cfg(test)]
@@ -1058,6 +1077,18 @@ mod truncation_tests {
             super::sandbox_block_note("git@github.com: Permission denied (publickey).").is_none()
         );
         assert!(super::sandbox_block_note("error[E0425]: cannot find value").is_none());
+        // What sudo prints inside bwrap: not a broken install, the sandbox.
+        let note = super::sandbox_block_note(
+            "sudo: /etc/sudo.conf is owned by uid 65534, should be 0\nsudo: The \"no new privileges\" flag is set, which prevents sudo from running as root.",
+        )
+        .expect("sudo failure gets a note");
+        assert!(note.contains("sudo is not broken"));
+        assert!(note.contains("dangerouslyDisableSandbox=true"));
+        assert_eq!(
+            super::sandbox_block_note("pkexec must be setuid root"),
+            Some(note),
+            "pkexec gets the same note"
+        );
         assert_eq!(
             super::hidden_device_note("head -c8 /dev/urandom > /dev/stderr; tty </dev/pts/0"),
             None
@@ -1076,7 +1107,7 @@ mod truncation_tests {
         let s = "x".repeat(20_000);
         let result = truncate_output(&s);
         assert!(result.len() < 20_000);
-        assert!(result.ends_with("[output truncated — exceeded 16384 bytes]"));
+        assert!(result.contains("bytes omitted here"));
     }
 
     #[test]
@@ -1089,6 +1120,6 @@ mod truncation_tests {
     fn one_over_boundary_truncated() {
         let s = "a".repeat(MAX_OUTPUT_BYTES + 1);
         let result = truncate_output(&s);
-        assert!(result.contains("[output truncated"));
+        assert!(result.contains("bytes omitted here"));
     }
 }

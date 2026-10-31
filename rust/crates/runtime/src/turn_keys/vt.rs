@@ -558,6 +558,25 @@ impl Buffer {
         }
     }
 
+    /// Replaces lines `start..start + len` with `lines`, moving the cursor
+    /// along when it is below them; returns the replaced lines.
+    pub(super) fn splice_lines(&mut self, start: usize, len: usize, lines: Vec<Line>) -> Vec<Line> {
+        let start = start.min(self.lines.len());
+        let end = (start + len).min(self.lines.len());
+        let added = lines.len();
+        let removed: Vec<Line> = self.lines.splice(start..end, lines).collect();
+        let shift = |row: usize| {
+            if row >= end {
+                row - removed.len() + added
+            } else {
+                row
+            }
+        };
+        self.row = shift(self.row);
+        self.saved.0 = shift(self.saved.0);
+        removed
+    }
+
     /// Lines `0..rows` that hold anything, trailing blank ones left out.
     pub(super) fn take_lines(&self, rows: usize) -> Vec<Line> {
         let mut lines: Vec<Line> = self.lines.iter().take(rows).cloned().collect();

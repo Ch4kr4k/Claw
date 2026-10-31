@@ -1164,6 +1164,23 @@ impl TerminalRenderer {
             "╰─".bold().with(self.color_theme.code_block_border)
         );
         output.push_str("\n\n");
+        if crate::mermaid::is_mermaid(code_language) {
+            output.push_str(&self.mermaid_diagram(code_buffer));
+        }
+    }
+
+    /// The diagram drawn from a finished ```mermaid block, followed by a
+    /// blank line; empty when diagrams are off.
+    fn mermaid_diagram(&self, code: &str) -> String {
+        let cols = output_cols().map_or(80, |cols| cols.saturating_sub(2 * OUTPUT_MARGIN + 1));
+        match crate::mermaid::draw(code, cols) {
+            None => String::new(),
+            Some(Ok(diagram)) => format!("{diagram}\n\n"),
+            Some(Err(error)) => format!(
+                "{}\n\n",
+                format!("(diagram not drawn: {error})").with(self.color_theme.quote)
+            ),
+        }
     }
 
     fn push_text(
@@ -1472,8 +1489,12 @@ impl MarkdownStreamState {
             self.render_line(renderer, &pending, &mut output);
         }
         self.finish_table(renderer, &mut output);
-        if self.fence.take().is_some() {
+        if let Some(fence) = self.fence.take() {
             output.push_str(&renderer.code_block_footer());
+            if crate::mermaid::is_mermaid(&fence.language) {
+                output.push('\n');
+                output.push_str(&renderer.mermaid_diagram(&fence.code));
+            }
         }
         self.last_line_blank = false;
         self.emit(output)
@@ -1510,8 +1531,15 @@ impl MarkdownStreamState {
         }
         if let Some(fence) = &mut self.fence {
             if line_closes_fence(line, fence.marker) {
-                self.fence = None;
                 output.push_str(&renderer.code_block_footer());
+                if crate::mermaid::is_mermaid(&fence.language) {
+                    output.push('\n');
+                    output.push_str(&renderer.mermaid_diagram(&fence.code));
+                    self.last_line_blank = true;
+                    self.fence = None;
+                    return;
+                }
+                self.fence = None;
             } else {
                 fence.code.push_str(line);
                 fence.code.push('\n');
@@ -2200,6 +2228,34 @@ mod tests {
         assert!(heading.contains("Heading"));
         assert!(!heading.contains("Para"), "partial line is held back");
         assert!(plain(state.flush(&renderer)).contains("Para"));
+    }
+
+    #[test]
+    fn streaming_state_draws_mermaid_blocks_after_they_close() {
+        let renderer = TerminalRenderer::new();
+        let mut state = started_stream();
+
+        assert!(plain(state.push(&renderer, "```mermaid\n")).contains("╭─ mermaid"));
+        let _ = state.push(&renderer, "flowchart LR\n");
+        let source = plain(state.push(&renderer, "  A[Alpha] --> B[Beta]\n"));
+        assert!(source.contains("A[Alpha]"));
+        let closed = plain(state.push(&renderer, "```\n"));
+        assert!(closed.contains("╰─"));
+        assert!(
+            closed.contains("Alpha") && closed.contains("Beta"),
+            "{closed}"
+        );
+        assert!(!closed.contains("A[Alpha]"), "the diagram, not the source");
+    }
+
+    #[test]
+    fn renders_mermaid_blocks_as_diagrams() {
+        let output = strip_ansi(
+            &TerminalRenderer::new()
+                .markdown_to_ansi("```mermaid\nflowchart LR\n  A[Alpha] --> B[Beta]\n```"),
+        );
+        assert!(output.contains("A[Alpha]"), "source is kept");
+        assert!(output.matches("Alpha").count() >= 2, "{output}");
     }
 
     #[test]

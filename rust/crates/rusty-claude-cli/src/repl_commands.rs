@@ -135,14 +135,26 @@ impl LiveCli {
 
     /// Prefixes the prompt with notices about background jobs that exited.
     pub(crate) fn with_job_notices(input: &str) -> String {
-        let notices = global_background_jobs().drain_notices();
+        let mut notices = global_background_jobs().drain_notices();
+        // Instruction files edited since the system prompt was built, and
+        // the time (every 10 minutes at most): both ride on the user
+        // message, so the cached system prompt stays as it was.
+        notices.extend(crate::instruction_changes());
+        notices.extend(crate::time_notice());
         if notices.is_empty() {
             input.to_string()
         } else {
-            format!(
-                "<system-reminder>\n{}\n</system-reminder>\n\n{input}",
-                notices.join("\n")
-            )
+            let notices = notices
+                .iter()
+                .map(|notice| {
+                    if notice.starts_with("<system-reminder>") {
+                        notice.clone()
+                    } else {
+                        format!("<system-reminder>\n{notice}\n</system-reminder>")
+                    }
+                })
+                .collect::<Vec<_>>();
+            format!("{}\n\n{input}", notices.join("\n"))
         }
     }
 
@@ -408,7 +420,8 @@ impl LiveCli {
         Ok(())
     }
 
-    /// `/tasks [list|get <id>|stop <id>]`: background shell jobs.
+    /// `/tasks [list|view [id]|get <id>|stop <id>]`: background shell jobs;
+    /// `view` shows one's live output (full-screen mode).
     pub(crate) fn run_tasks(args: Option<&str>) {
         let mut parts = args.unwrap_or_default().split_whitespace();
         match (parts.next(), parts.next()) {
@@ -447,11 +460,34 @@ impl LiveCli {
                     Err(error) => eprintln!("{error}"),
                 }
             }
+            (Some("view" | "show"), id) => {
+                if runtime::turn_keys::screen::active() {
+                    if !runtime::turn_keys::screen::open_tasks_view(id) {
+                        eprintln!("No background job {}.", id.unwrap_or("to show"));
+                    }
+                    return;
+                }
+                // Without full-screen mode: the end of its output, as it is.
+                let id = id.map(str::to_string).or_else(|| {
+                    let jobs = global_background_jobs().list();
+                    jobs.iter()
+                        .find(|job| job.state == runtime::JobState::Running)
+                        .or_else(|| jobs.last())
+                        .map(|job| job.id.clone())
+                });
+                match id.and_then(|id| global_background_jobs().peek(&id, 8_000)) {
+                    Some((job, output)) => {
+                        println!("[{}: {}] {}", job.id, job.state, job.command);
+                        println!("{}", output.trim_end());
+                    }
+                    None => eprintln!("No background job to show."),
+                }
+            }
             (Some("stop" | "kill"), Some(id)) => match global_background_jobs().kill(id) {
                 Ok(read) => println!("[{}: {}]", read.id, read.state),
                 Err(error) => eprintln!("{error}"),
             },
-            _ => eprintln!("usage: /tasks [list|get <id>|stop <id>]"),
+            _ => eprintln!("usage: /tasks [list|view [id]|get <id>|stop <id>]"),
         }
     }
 

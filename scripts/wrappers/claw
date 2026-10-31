@@ -47,7 +47,7 @@ export CLAW_TOOL_RESULT_MAX_CHARS="${CLAW_TOOL_RESULT_MAX_CHARS:-12000}"
 #   export CLAW_SERVER_STOP_ON_EXIT=0   # start it, but leave it running
 #   export CLAW_MANAGE_SERVER=0         # never start or stop servers
 CLAW_BIN="${CLAW_BIN:-$HOME/.local/lib/claw/claw}"
-CORE_TOOLS="bash,bash_output,kill_shell,Agent,read_file,write_file,edit_file,glob_search,grep_search,web_fetch,web_search,download,social_media,x11,browser,todo_write,AskUserQuestion,Skill,code_search,pty,checkpoint,diagnostics,google_dork,vision_analyze,repo_signals,trail,session_search"
+CORE_TOOLS="bash,bash_output,kill_shell,Agent,read_file,write_file,edit_file,glob_search,grep_search,web_fetch,web_search,download,social_media,x11,browser,todo_write,AskUserQuestion,Skill,code_search,pty,checkpoint,diagnostics,google_dork,vision_analyze,repo_signals,trail,session_search,hawkscan,execute_code"
 
 # The model claw starts with: --model on the command line, else `model` from
 # ~/.claw/settings.json and the project's .claw/settings.json (the project

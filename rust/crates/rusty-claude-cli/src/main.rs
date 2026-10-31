@@ -26,9 +26,11 @@ mod init;
 mod input;
 mod keybindings;
 mod learning;
+mod mermaid;
 mod render;
 mod repl_commands;
 mod setup_wizard;
+mod step_stats;
 mod term_image;
 
 use std::collections::BTreeSet;
@@ -42,7 +44,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::debug;
 
@@ -990,7 +992,9 @@ fn apply_global_cwd(cwd: Option<PathBuf>) -> Result<(), Box<dyn std::error::Erro
 /// when reading fails, or when the piped content is empty after trimming.
 /// Returns `Some(raw_content)` when a pipe delivered non-empty content.
 fn read_piped_stdin() -> Option<String> {
-    if io::stdin().is_terminal() {
+    // Tests never read the real stdin: under a runner that leaves it open
+    // (a CI job, an agent's background shell) the read never ends.
+    if cfg!(test) || io::stdin().is_terminal() {
         return None;
     }
     let mut buffer = String::new();
@@ -1973,7 +1977,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // command line, read stdin as the prompt and dispatch as a one-shot Prompt
         // rather than starting the interactive REPL (which would consume the pipe and
         // print the startup banner, then exit without sending anything to the API).
-        if !stdin_is_terminal {
+        // (Not in tests: see `read_piped_stdin`.)
+        if !stdin_is_terminal && !cfg!(test) {
             let mut buf = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf);
             let piped = buf.trim().to_string();
@@ -6408,9 +6413,90 @@ fn remember_for_side_questions(client: &ApiProviderClient, request: &MessageRequ
         Some((client.clone(), request.clone()));
 }
 
+/// A slash command typed while a reply runs (like Claude Code). The ones
+/// that only show something or change the view run at once; the ones that
+/// need the session (`/model`, `/compact`, `/cost`, …) return false and run
+/// when the reply ends.
+fn run_command_during_turn(line: &str) -> bool {
+    let command = match SlashCommand::parse(line) {
+        Ok(Some(command)) => command,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!("{error}");
+            return true;
+        }
+    };
+    let result: Result<(), Box<dyn std::error::Error>> = match command {
+        SlashCommand::Help => {
+            println!("{}", render_repl_help());
+            Ok(())
+        }
+        SlashCommand::Keybindings => LiveCli::run_keybindings().map(drop),
+        SlashCommand::Focus { mode } => LiveCli::run_focus(mode.as_deref()).map(drop),
+        SlashCommand::DiffPanel { mode } => LiveCli::run_diff_panel(mode.as_deref()).map(drop),
+        SlashCommand::Color { color } => LiveCli::run_color(color.as_deref()).map(drop),
+        SlashCommand::ScrollSpeed { rows } => LiveCli::run_scroll_speed(rows.as_deref()).map(drop),
+        SlashCommand::ListAgents => LiveCli::run_list_agents().map(drop),
+        SlashCommand::Stop { id } => LiveCli::run_stop(id.as_deref()).map(drop),
+        SlashCommand::Tasks { args } => {
+            LiveCli::run_tasks(args.as_deref());
+            Ok(())
+        }
+        // `/learn now` reviews the conversation, so it waits for the reply.
+        SlashCommand::Learn { ref args }
+            if args.as_deref().is_some_and(|args| args.trim() == "now") =>
+        {
+            return false;
+        }
+        SlashCommand::Learn { args } => {
+            println!("{}", learning::run_command(args.as_deref(), &[]));
+            Ok(())
+        }
+        SlashCommand::Todos => {
+            println!("{}", tools::render_todo_list());
+            Ok(())
+        }
+        SlashCommand::Theme { name } => {
+            LiveCli::run_theme(name.as_deref());
+            Ok(())
+        }
+        SlashCommand::Hooks { .. } => LiveCli::run_hooks(),
+        SlashCommand::Config { section } => LiveCli::print_config(section.as_deref()),
+        SlashCommand::Diff => LiveCli::print_diff(),
+        SlashCommand::Version => {
+            LiveCli::print_version(CliOutputFormat::Text);
+            Ok(())
+        }
+        SlashCommand::Sandbox => {
+            LiveCli::print_sandbox_status();
+            Ok(())
+        }
+        SlashCommand::Agents { args } => {
+            LiveCli::print_agents(args.as_deref(), CliOutputFormat::Text)
+        }
+        SlashCommand::Skills { args }
+            if matches!(
+                classify_skills_slash_command(args.as_deref()),
+                SkillSlashDispatch::Local
+            ) =>
+        {
+            LiveCli::print_skills(args.as_deref(), CliOutputFormat::Text)
+        }
+        SlashCommand::Unknown(name) => {
+            eprintln!("{}", format_unknown_slash_command(&name));
+            Ok(())
+        }
+        _ => return false,
+    };
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+    }
+    true
+}
+
 /// `/btw` typed while a turn runs: answered at once on its own thread from
 /// the conversation as last sent to the model, without tools, while the
-/// task goes on (as in Claude Code). The answer is printed between steps.
+/// task goes on (as in Claude Code). The answer is printed as it arrives.
 fn answer_side_question_now(question: String) {
     std::thread::spawn(move || {
         let answer = side_answer_from_last_request(&question)
@@ -6429,22 +6515,137 @@ pub(crate) fn side_answer_from_last_request(question: &str) -> Result<String, St
     request.tool_choice = None;
     request.stream = false;
     request.max_tokens = request.max_tokens.min(8_192);
-    let prompt = InputContentBlock::Text {
-        text: claude_commands::btw_prompt(question),
-    };
-    match request.messages.last_mut() {
-        Some(last) if last.role == "user" => last.content.push(prompt),
-        _ => request.messages.push(InputMessage {
-            role: "user".to_string(),
-            content: vec![prompt],
-        }),
+    // The question goes in a message of its own, after a note that the task
+    // is under way: appended to the task's last message, local models
+    // carried on with the task (writing its tool call out as text).
+    if request
+        .messages
+        .last()
+        .is_some_and(|last| last.role == "user")
+    {
+        request.messages.push(InputMessage {
+            role: "assistant".to_string(),
+            content: vec![InputContentBlock::Text {
+                text: "(Working on the task above; it is still running.)".to_string(),
+            }],
+        });
     }
+    request.messages.push(InputMessage {
+        role: "user".to_string(),
+        content: vec![InputContentBlock::Text {
+            text: claude_commands::btw_prompt(question),
+        }],
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
     let model = request.model.clone();
-    side_task_text(&runtime, request, Some((&model, &client)))
+    let answer = side_task_text(&runtime, request, Some((&model, &client)))?;
+    let answer = without_tool_call_markup(&answer);
+    if answer.is_empty() {
+        return Err("the model did not answer it (it went on with the task instead)".to_string());
+    }
+    Ok(answer)
+}
+
+/// The instruction files as the system prompt has them, to report edits.
+static INSTRUCTION_WATCH: Mutex<Option<runtime::InstructionWatch>> = Mutex::new(None);
+
+/// Starts watching the instruction files (at REPL start, when the system
+/// prompt is built).
+fn watch_instruction_files() {
+    if let Ok(cwd) = env::current_dir() {
+        *INSTRUCTION_WATCH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(runtime::InstructionWatch::new(&cwd));
+    }
+}
+
+/// A reminder about instruction files edited since the last turn.
+pub(crate) fn instruction_changes() -> Option<String> {
+    let cwd = env::current_dir().ok()?;
+    INSTRUCTION_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()?
+        .changes(&cwd)
+}
+
+/// When the last user message was sent, and when the time was last told.
+static TIME_TOLD: Mutex<(Option<SystemTime>, Option<SystemTime>)> = Mutex::new((None, None));
+
+/// The time reminder for this user message, when the time was not told in
+/// the last [`runtime::TIME_REMINDER_EVERY`].
+pub(crate) fn time_notice() -> Option<String> {
+    let mut told = TIME_TOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = SystemTime::now();
+    let (last_message, last_told) = *told;
+    told.0 = Some(now);
+    let due = last_told
+        .and_then(|at| at.elapsed().ok())
+        .is_none_or(|since| since >= runtime::TIME_REMINDER_EVERY);
+    if !due {
+        return None;
+    }
+    told.1 = Some(now);
+    Some(runtime::time_reminder(last_message))
+}
+
+/// Which subdirectories' instruction files this session has loaded (see
+/// [`runtime::context_hints`]); kept across turns, which each get a new
+/// runtime.
+fn session_context_hints() -> Arc<Mutex<runtime::context_hints::ContextHints>> {
+    static HINTS: OnceLock<Arc<Mutex<runtime::context_hints::ContextHints>>> = OnceLock::new();
+    HINTS
+        .get_or_init(|| {
+            let cwd = env::current_dir().unwrap_or_default();
+            Arc::new(Mutex::new(runtime::context_hints::ContextHints::new(&cwd)))
+        })
+        .clone()
+}
+
+/// Setting `verifyOnStop` (default on; `CLAW_VERIFY_ON_STOP=0` turns it
+/// off): a turn that edited code is reminded once to check it before it
+/// ends.
+fn verify_on_stop_enabled() -> bool {
+    if let Ok(value) = env::var("CLAW_VERIFY_ON_STOP") {
+        return !matches!(value.trim(), "0" | "false" | "off" | "no");
+    }
+    runtime::read_user_setting_value("verifyOnStop")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+}
+
+/// A tool call's input with small JSON mistakes repaired (see
+/// [`api::repair_json`]), so the session keeps valid JSON and the call
+/// runs; unchanged when it is valid, or cut off and not repairable.
+fn repaired_tool_input(input: String) -> String {
+    if input.trim().is_empty() || serde_json::from_str::<serde_json::Value>(&input).is_ok() {
+        return input;
+    }
+    api::repair_json(&input).map_or(input, |value| value.to_string())
+}
+
+/// `text` without the tool calls a local model writes out as text
+/// (`<tool_call>…</tool_call>`, `<function=…>…</function>`), trimmed.
+fn without_tool_call_markup(text: &str) -> String {
+    let mut out = text.to_string();
+    for (open, close) in [
+        ("<tool_call>", "</tool_call>"),
+        ("<function=", "</function>"),
+    ] {
+        while let Some(start) = out.find(open) {
+            let end = out[start..]
+                .find(close)
+                .map_or(out.len(), |end| start + end + close.len());
+            out.replace_range(start..end, "");
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Hidden argument for [`print_model_list`].
@@ -7244,6 +7445,14 @@ fn run_resume_command(
             message: Some(render_memory_report()?),
             json: Some(render_memory_json()?),
         }),
+        SlashCommand::Learn { args } => {
+            let text = learning::run_command(args.as_deref(), &session.messages);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                json: Some(json!({ "kind": "learn", "text": text })),
+                message: Some(text),
+            })
+        }
         SlashCommand::Todos => {
             let text = tools::render_todo_list();
             Ok(ResumeCommandOutcome {
@@ -7853,8 +8062,10 @@ fn run_repl(
     cli.checkpoints_enabled = true;
     // Fetch the providers' model lists now, so `/model` opens at once.
     std::thread::spawn(cached_available_models);
-    // Tidy the skills claw learned, at most once a week, in the background.
-    learning::curate_in_background(cli.model.clone());
+    // Count the session for the learning loop's curator, which archives
+    // learned skills that have gone unused for many sessions.
+    runtime::learning::record_session_start();
+    watch_instruction_files();
     ignore_ctrl_c_in_repl();
     // Lets the footer shown during a turn follow terminal resizes.
     runtime::turn_keys::set_terminal_size_probe(|| {
@@ -7874,6 +8085,7 @@ fn run_repl(
     tools::local_tools::set_mcp_waiter(mcp_wait_report);
     tools::local_tools::set_background_sessions_provider(background_session_rows);
     runtime::turn_keys::set_side_question_handler(answer_side_question_now);
+    runtime::turn_keys::set_command_handler(run_command_during_turn);
     let mut editor =
         input::LineEditor::new("❯ ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -7895,10 +8107,15 @@ fn run_repl(
         }
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         claude_commands::announce_finished_background();
-        learning::announce_learned();
+        learning::print_notices();
+        // A goal saved with this session (after a restart or `/resume`).
+        cli.sync_goal_with_session();
         // `/btw` asked during the last turn: wait (briefly) for answers still
-        // on their way, then show them.
-        runtime::turn_keys::wait_for_side_answers(Duration::from_secs(60));
+        // on their way, then show them. Full-screen mode prints them
+        // whenever they arrive, so the prompt need not wait.
+        if !runtime::turn_keys::screen::active() {
+            runtime::turn_keys::wait_for_side_answers(Duration::from_secs(60));
+        }
         runtime::turn_keys::print_side_answers();
         cli.refresh_footer_status();
         // Prompts queued with Enter while the last reply ran go first.
@@ -7977,6 +8194,7 @@ fn run_repl(
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
                 let prompt = expand_at_mentions(&trimmed, &cwd);
+                cli.sync_goal_with_session();
                 report_repl_turn_error(cli.run_turn(&prompt));
                 // An active `/goal` keeps the work going after the reply.
                 if cli.goal.is_some() {
@@ -8230,6 +8448,11 @@ struct LiveCli {
     /// The `/goal` claw keeps working toward, and the last one met.
     goal: Option<String>,
     last_goal_met: Option<String>,
+    /// The session whose saved goal `goal` reflects (see
+    /// `LiveCli::sync_goal_with_session`).
+    goal_session: String,
+    /// The goal runs in fresh-context rounds (`/goal --fresh`).
+    goal_fresh: bool,
     /// The `/output-style` in use (none for the default).
     output_style: Option<claude_commands::OutputStyle>,
     /// The model `/advisor` set for the model to consult.
@@ -8878,6 +9101,8 @@ impl LiveCli {
             last_btw: None,
             goal: None,
             last_goal_met: None,
+            goal_session: String::new(),
+            goal_fresh: false,
             output_style: claude_commands::saved_output_style(),
             advisor: None,
         };
@@ -8973,6 +9198,8 @@ impl LiveCli {
             // model between steps of this turn; sub-agents without an
             // explicit model use this session's model.
             rt.set_job_notices(true);
+            rt.set_context_hints(session_context_hints());
+            rt.set_verify_on_stop(verify_on_stop_enabled());
             tools::set_default_agent_model(&self.model);
             rt.api_client_mut()
                 .set_reasoning_effort(self.reasoning_effort.clone());
@@ -8994,6 +9221,16 @@ impl LiveCli {
     /// Runs one request, wrapped in a checkpoint (REPL only) and prefixed
     /// with notices about background jobs that exited since the last turn.
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // A learning review still running would hold a one-slot local
+        // server; the user's turn comes first.
+        learning::cancel();
+        learning::print_notices();
+        step_stats::begin_turn();
+        // What a `fork` sub-agent starts from: the finished turns.
+        tools::set_fork_seed(
+            self.runtime.session().clone(),
+            self.effective_system_prompt(),
+        );
         let prompt = Self::with_job_notices(input);
         self.begin_checkpoint(input);
         let _ = tools::leangate::take_edited_files();
@@ -9168,10 +9405,7 @@ impl LiveCli {
                 // anything worth keeping (memories, skills).
                 let added = 1 + summary.assistant_messages.len() + summary.tool_results.len();
                 let messages = &self.runtime.session().messages;
-                learning::review_turn_in_background(
-                    self.model.clone(),
-                    messages[messages.len().saturating_sub(added)..].to_vec(),
-                );
+                learning::after_turn(messages, &messages[messages.len().saturating_sub(added)..]);
                 spinner.finish(
                     &format!("done in {:.1}s", turn_started.elapsed().as_secs_f64()),
                     TerminalRenderer::new().color_theme(),
@@ -9701,7 +9935,7 @@ impl LiveCli {
             }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
-                println!("{}", format_cost_report(usage));
+                println!("{}\n\n{}", format_cost_report(usage), step_stats::report());
                 false
             }
             SlashCommand::Exit => false,
@@ -9764,6 +9998,13 @@ impl LiveCli {
                 let prompt = repl_commands::prompt_for_command("pr-comments", pr.as_deref())
                     .unwrap_or_default();
                 report_repl_turn_error(self.run_turn(&prompt));
+                false
+            }
+            SlashCommand::Learn { args } => {
+                println!(
+                    "{}",
+                    learning::run_command(args.as_deref(), &self.runtime.session().messages)
+                );
                 false
             }
             SlashCommand::Todos => {
@@ -10204,6 +10445,30 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         runtime::turn_keys::screen::clear_conversation();
         Ok(())
+    }
+
+    /// Like `start_fresh_session`, for a fresh `/goal` round: the screen
+    /// keeps the earlier rounds. Returns the previous session's id.
+    pub(crate) fn start_goal_round_session(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let previous = self.session.id.clone();
+        self.persist_session()?;
+        let session_state = new_cli_session()?;
+        self.session = create_managed_session_handle(&session_state.session_id)?;
+        let runtime = build_runtime(
+            session_state.with_persistence_path(self.session.path.clone()),
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+        Ok(previous)
     }
 
     fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
@@ -13881,7 +14146,40 @@ fn build_system_prompt(model: &str) -> Result<Vec<String>, Box<dyn std::error::E
         model_family_identity_for(model),
     )?;
     prompt.push(capabilities_prompt(term_image::enabled()));
+    if let Some(section) = custom_agents_section(&env::current_dir()?) {
+        prompt.push(section);
+    }
     Ok(prompt)
+}
+
+/// The custom agent definitions the Agent tool can run, for the system
+/// prompt (the model cannot use what it is not told about).
+fn custom_agents_section(cwd: &Path) -> Option<String> {
+    const MAX_LISTED: usize = 40;
+    let agents = commands::custom_agents(cwd);
+    if agents.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "# Custom agents".to_string(),
+        "Besides Explore, Plan, Verification and fork, the Agent tool runs these specialists; pass the name as subagent_type when a task matches one:".to_string(),
+    ];
+    for agent in agents.iter().take(MAX_LISTED) {
+        let description = agent
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .replace('\n', " ");
+        let description: String = description.chars().take(160).collect();
+        lines.push(format!("- {}: {description}", agent.name));
+    }
+    if agents.len() > MAX_LISTED {
+        lines.push(format!(
+            "- … and {} more (`/agents` lists them)",
+            agents.len() - MAX_LISTED
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 /// What claw can do beyond reading and editing code, in the system prompt
@@ -13899,6 +14197,7 @@ pub(crate) fn capabilities_prompt(shows_images: bool) -> String {
     };
     format!(
         "# What you can do\n{pictures}\n\
+         - Draw a diagram (flowchart, sequence, class, state, ER, gantt, pie, …) by putting a ```mermaid code block in the reply; it is drawn as a picture. Do not write it to a file or run a renderer to show it.\n\
          - Instagram, Facebook or Pinterest post, reel or pin link: the SocialMedia tool saves its images and videos and returns `show` lines to put in your reply.\n\
          - Other pictures on the web: WebSearch, then WebFetch on a result page (it lists the page's images) and show those addresses. Never guess an image address.\n\
          - Pages that need clicks, scrolling or a login: Browser (a real Chrome window); its screenshots come back as images you can see.\n\
@@ -14921,6 +15220,11 @@ fn auxiliary_model() -> Option<(String, ApiProviderClient)> {
     Some((model, client))
 }
 
+const SIDE_TASK_TIMEOUT: Duration = Duration::from_secs(180);
+/// For a `local/` model: a llama-server with `--parallel 1` queues the side
+/// request behind the turn's running step, which can take minutes.
+const SIDE_TASK_TIMEOUT_LOCAL: Duration = Duration::from_secs(900);
+
 /// Sends a side-task `request` (no tools, not shown) to the auxiliary model
 /// when one is set, else, or when that fails, to `fallback` with its model.
 /// The reply's text, trimmed.
@@ -14930,10 +15234,15 @@ fn side_task_text(
     fallback: Option<(&str, &ApiProviderClient)>,
 ) -> Result<String, String> {
     let send = |request: &MessageRequest, client: &ApiProviderClient| {
+        // A local server with one slot answers it only after the running
+        // step, so it waits longer there.
+        let limit = if request.model.starts_with("local/") {
+            SIDE_TASK_TIMEOUT_LOCAL
+        } else {
+            SIDE_TASK_TIMEOUT
+        };
         runtime
-            .block_on(async {
-                tokio::time::timeout(Duration::from_secs(180), client.send_message(request)).await
-            })
+            .block_on(async { tokio::time::timeout(limit, client.send_message(request)).await })
             .map_err(|_| "timed out".to_string())?
             .map_err(|error| error.to_string())
             .map(|response| {
@@ -15675,6 +15984,9 @@ impl AnthropicRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        if self.emit_output {
+            step_stats::begin_step();
+        }
         // With a fallback model a silent provider is given up on quickly, so
         // the first reply is timed too, not only the one after a tool.
         let is_post_tool =
@@ -15761,6 +16073,9 @@ impl AnthropicRuntimeClient {
             }
         });
         render::stop_thinking();
+        if let Ok(events) = &result {
+            step_stats::end_step(&self.model, events);
+        }
         result
     }
 }
@@ -15826,6 +16141,9 @@ impl AnthropicRuntimeClient {
                 break;
             };
             received_any_event = true;
+            if matches!(event, ApiStreamEvent::ContentBlockDelta(_)) {
+                step_stats::mark_first_token();
+            }
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
@@ -15898,7 +16216,11 @@ impl AnthropicRuntimeClient {
                         runtime::turn_keys::note_reasoning(thinking.chars().count());
                         desktop_agent::emit_thinking(&thinking);
                         if !block_has_thinking_summary {
-                            render_thinking_block_summary(out, None, false)?;
+                            // Full-screen mode prints the block, collapsible,
+                            // once it is complete (see ContentBlockStop).
+                            if !runtime::turn_keys::screen::active() {
+                                render_thinking_block_summary(out, None, false)?;
+                            }
                             block_has_thinking_summary = true;
                         }
                         // 累积 thinking 文本到 pending_thinking（让 session 持久化能拿到）
@@ -15926,20 +16248,25 @@ impl AnthropicRuntimeClient {
                     }
                     // 把累积的 thinking 转成 AssistantEvent::Thinking（让 build_assistant_message 写入 session）
                     if let Some((thinking, signature)) = pending_thinking.take() {
+                        if runtime::turn_keys::screen::active() {
+                            render_thinking_fold(out, &thinking)?;
+                        }
                         events.push(AssistantEvent::Thinking {
                             thinking,
                             signature,
                         });
                     }
                     if let Some((id, name, input)) = pending_tool.take() {
+                        let input = repaired_tool_input(input);
                         runtime::turn_keys::end_tool();
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
                         desktop_agent::emit_tool_call(&id, &name, &input);
                         // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
+                        let (brief, full) = foldable(|| format_tool_call_start(&name, &input));
+                        writeln!(out)
+                            .and_then(|()| write_folded(out, &brief, full.as_deref()))
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
@@ -16678,11 +17005,11 @@ fn format_bash_call(parsed: &serde_json::Value) -> String {
     let lines = command.lines().collect::<Vec<_>>();
     let mut shown = lines
         .iter()
-        .take(3)
+        .take(if full_display() { usize::MAX } else { 3 })
         .map(|line| truncate_for_summary(line, 160))
         .collect::<Vec<_>>()
         .join("\n       ");
-    if lines.len() > 3 {
+    if lines.len() > 3 && !full_display() {
         shown.push_str(&format!(
             "\n       {TOOL_DIM_STYLE}... +{} lines{STYLE_RESET}",
             lines.len() - 3
@@ -16917,7 +17244,7 @@ fn inline_diff_rows(hunks: &[diff_view::Hunk], path: &str, max_rows: usize) -> S
             width,
             indent: RESULT_PREFIX.len(),
             path,
-            max_rows: Some(max_rows),
+            max_rows: (!full_display()).then_some(max_rows),
         },
     )
     .iter()
@@ -17120,7 +17447,76 @@ fn summarize_tool_payload(payload: &str) -> String {
     truncate_for_summary(&compact, 96)
 }
 
+thread_local! {
+    /// Set while the full form of collapsible output is rendered (see
+    /// [`print_foldable`]): display truncation is off.
+    static FULL_DISPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn full_display() -> bool {
+    FULL_DISPLAY.with(std::cell::Cell::get)
+}
+
+/// `render` with display truncation off.
+fn render_full(render: impl Fn() -> String) -> String {
+    FULL_DISPLAY.with(|flag| flag.set(true));
+    let full = render();
+    FULL_DISPLAY.with(|flag| flag.set(false));
+    full
+}
+
+const EXPAND_HINT: &str = "(ctrl+o to expand)";
+
+/// `render`'s output as a fold in full-screen mode: its short form, and its
+/// untruncated form shown instead on a click or Ctrl+O. Without full-screen
+/// mode, or when nothing was cut, just the short form.
+fn foldable(render: impl Fn() -> String) -> (String, Option<String>) {
+    let brief = render();
+    if !runtime::turn_keys::screen::active() {
+        return (brief, None);
+    }
+    let full = render_full(render);
+    if full == brief {
+        return (brief, None);
+    }
+    let brief = format!("{brief} {TOOL_DIM_STYLE}{EXPAND_HINT}{STYLE_RESET}");
+    (brief, Some(full))
+}
+
+/// Writes `brief`, with `full` as its expanded form when given. Both are
+/// written as whole lines.
+fn write_folded(
+    out: &mut (impl Write + ?Sized),
+    brief: &str,
+    full: Option<&str>,
+) -> io::Result<()> {
+    use runtime::turn_keys::screen;
+    let Some(full) = full else {
+        writeln!(out, "{brief}")?;
+        return out.flush();
+    };
+    out.flush()?;
+    screen::fold_begin();
+    writeln!(out, "{brief}")?;
+    out.flush()?;
+    screen::fold_full();
+    writeln!(out, "{full}")?;
+    out.flush()?;
+    screen::fold_end();
+    Ok(())
+}
+
+/// [`render::print_with_margins`] for collapsible output (see [`foldable`]).
+fn print_foldable(render: impl Fn() -> String) {
+    let (brief, full) = foldable(render);
+    let mut out = render::MarginWriter::for_stdout(io::stdout());
+    let _ = write_folded(&mut out, &brief, full.as_deref());
+}
+
 fn truncate_for_summary(value: &str, limit: usize) -> String {
+    if full_display() {
+        return value.to_string();
+    }
     let mut chars = value.chars();
     let truncated = chars.by_ref().take(limit).collect::<String>();
     if chars.next().is_some() {
@@ -17134,6 +17530,9 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     let original = content.trim_end_matches('\n');
     if original.is_empty() {
         return String::new();
+    }
+    if full_display() {
+        return original.to_string();
     }
 
     let total_lines = original.lines().count();
@@ -17204,6 +17603,31 @@ fn render_thinking_block_summary(
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
+/// A finished thinking block in full-screen mode: one dim line, which a
+/// click or Ctrl+O expands to the whole reasoning.
+fn render_thinking_fold(
+    out: &mut (impl Write + ?Sized),
+    thinking: &str,
+) -> Result<(), RuntimeError> {
+    let thinking = thinking.trim();
+    if thinking.is_empty() {
+        return Ok(());
+    }
+    let chars = thinking.chars().count();
+    let brief = format!("{TOOL_DIM_STYLE}∴ thinking: {chars} chars {EXPAND_HINT}{STYLE_RESET}");
+    let full = format!(
+        "{TOOL_DIM_STYLE}∴ thinking:{STYLE_RESET}\n{}",
+        thinking
+            .lines()
+            .map(|line| format!("{TOOL_DIM_STYLE}{RESULT_PREFIX}{line}{STYLE_RESET}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    writeln!(out)
+        .and_then(|()| write_folded(out, &brief, Some(&full)))
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 fn push_output_block(
     block: OutputContentBlock,
     out: &mut (impl Write + ?Sized),
@@ -17240,7 +17664,11 @@ fn push_output_block(
             thinking,
             signature,
         } => {
-            render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            if runtime::turn_keys::screen::active() {
+                render_thinking_fold(out, &thinking)?;
+            } else {
+                render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
+            }
             events.push(AssistantEvent::Thinking {
                 thinking,
                 signature,
@@ -17273,6 +17701,7 @@ fn response_to_events(
             &mut block_has_thinking_summary,
         )?;
         if let Some((id, name, input)) = pending_tool.take() {
+            let input = repaired_tool_input(input);
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
     }
@@ -17625,7 +18054,7 @@ impl CliToolExecutor {
             Ok(output) => {
                 let is_read = matches!(tool_name, "read_file" | "Read");
                 if self.emit_output && !is_read {
-                    render::print_with_margins(&format_tool_result(tool_name, &output, false));
+                    print_foldable(|| format_tool_result(tool_name, &output, false));
                 }
                 if matches!(
                     tool_name,
@@ -17645,9 +18074,7 @@ impl CliToolExecutor {
                     // whole file the tool read: the display said "lines
                     // 1-1049" for a page that held 1-465.
                     if self.emit_output {
-                        render::print_with_margins(&mark_first_result_line(
-                            &format_read_text_result(&text),
-                        ));
+                        print_foldable(|| mark_first_result_line(&format_read_text_result(&text)));
                     }
                     text
                 } else {
@@ -17660,11 +18087,8 @@ impl CliToolExecutor {
             }
             Err(error) => {
                 if self.emit_output {
-                    render::print_with_margins(&format_tool_result(
-                        tool_name,
-                        &error.to_string(),
-                        true,
-                    ));
+                    let error = error.to_string();
+                    print_foldable(|| format_tool_result(tool_name, &error, true));
                 }
                 Err(error)
             }
@@ -17683,6 +18107,7 @@ impl ToolExecutor for CliToolExecutor {
     /// registry immutably and return their results; printing and everything
     /// else that touches shared state happens here, in the original order.
     fn execute_batch(&mut self, calls: &[(String, String)]) -> Vec<Result<String, ToolError>> {
+        let _timer = self.emit_output.then(step_stats::ToolTimer::start);
         let calls = calls
             .iter()
             .map(|(tool_name, input)| (self.resolve_tool_name(tool_name), input.clone()))
@@ -17733,6 +18158,7 @@ impl ToolExecutor for CliToolExecutor {
     }
 
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        let _timer = self.emit_output.then(step_stats::ToolTimer::start);
         let tool_name = &self.resolve_tool_name(tool_name);
         self.check_allowed(tool_name)?;
         if let Some((offset, next_input)) = self.next_page_instead(tool_name, input) {
@@ -18075,7 +18501,39 @@ fn file_change_result_for_model(output: String) -> String {
     if hidden > 0 {
         text.push_str(&format!("\n[{hidden} more diff lines not shown]"));
     }
+    if let Some(note) = partial_rewrite_note(&parsed, hunks) {
+        text.push('\n');
+        text.push_str(&note);
+    }
     text
+}
+
+/// A nudge after `write_file` replaced a sizeable existing file to change
+/// only part of it. Small local models fix one compiler error by resending
+/// the whole file, which costs thousands of tokens each time and drops code
+/// they no longer remember; Claude Code's tool descriptions steer the same
+/// way. `None` for new files, short files and real rewrites.
+fn partial_rewrite_note(parsed: &serde_json::Value, hunks: &[serde_json::Value]) -> Option<String> {
+    const MIN_LINES: usize = 40;
+    if parsed["type"].as_str() != Some("update") {
+        return None;
+    }
+    let original_lines = parsed["originalFile"].as_str()?.lines().count();
+    if original_lines < MIN_LINES {
+        return None;
+    }
+    let removed = hunks
+        .iter()
+        .filter_map(|hunk| hunk["lines"].as_array())
+        .flatten()
+        .filter(|line| line.as_str().is_some_and(|line| line.starts_with('-')))
+        .count();
+    // Most of the file survived unchanged: an edit would have done.
+    (removed * 2 < original_lines).then(|| {
+        format!(
+            "[Rewrote all {original_lines} lines to change {removed}. For partial changes to an existing file use edit_file: it sends only the change, and a full rewrite can drop code.]"
+        )
+    })
 }
 
 fn web_fetch_result_for_model(output: String) -> String {
@@ -18239,32 +18697,10 @@ fn cap_tool_result_to(output: String, max_chars: Option<usize>) -> String {
     format!("{}\n\n{note}", &output[..end])
 }
 
-/// Writes a cut tool result to `~/.claw/tool-output/tool_<ms>.txt` and
-/// deletes saved results older than a week. `None` when it cannot be saved.
+/// Writes a cut tool result to `~/.claw/tool-output/` (see
+/// [`runtime::tool_spill`]). `None` when it cannot be saved.
 fn save_full_tool_output(output: &str) -> Option<PathBuf> {
-    const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-    let dir = runtime::default_config_home().join("tool-output");
-    fs::create_dir_all(&dir).ok()?;
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let old = entry
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > RETENTION);
-            if old {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-    let millis = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis();
-    let path = dir.join(format!("tool_{millis}_{}.txt", std::process::id()));
-    fs::write(&path, output).ok()?;
-    Some(path)
+    runtime::tool_spill::save(output, "tool")
 }
 
 /// Records the current folder in `~/.claw/workspaces.txt` (once), so the
@@ -18696,19 +19132,19 @@ mod tests {
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
         parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
-        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        render_config_report, render_diff_report, render_diff_report_for, render_full,
+        render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor,
+        GitOperation, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PermissionModeProvenance,
+        PromptHistoryEntry, SessionLifecycleKind, SessionLifecycleSummary, SlashCommand,
+        StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -23348,6 +23784,46 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn rewriting_a_file_to_change_a_few_lines_suggests_edit_file() {
+        let dir = std::env::temp_dir().join(format!("claw-rewrite-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("main.rs");
+        let path = path.to_str().expect("utf-8 path");
+        let body = |changed: usize| {
+            (0..60)
+                .map(|i| {
+                    if i < changed {
+                        format!("new {i}\n")
+                    } else {
+                        format!("line {i}\n")
+                    }
+                })
+                .collect::<String>()
+        };
+        let write = |content: &str| {
+            let output = runtime::write_file(path, content).expect("write");
+            super::tool_result_for_model(
+                "write_file",
+                serde_json::to_string(&output).expect("json"),
+            )
+        };
+
+        let created = write(&body(0));
+        assert!(created.starts_with("Created") && !created.contains("edit_file"));
+        let small_fix = write(&body(2));
+        assert!(
+            small_fix.contains("[Rewrote all 60 lines to change 2. For partial changes"),
+            "{small_fix}"
+        );
+        assert!(
+            !write(&body(50)).contains("edit_file"),
+            "a real rewrite gets no note"
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn bash_results_reach_the_model_as_plain_text() {
         let ok = r#"{"stdout":"a\nb\n","stderr":"","interrupted":false,
             "returnCodeInterpretation":null,"sandboxStatus":{"enabled":true}}"#;
@@ -24100,6 +24576,45 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn tool_call_markup_is_removed_from_side_answers() {
+        use super::without_tool_call_markup;
+        assert_eq!(
+            without_tool_call_markup(
+                "<tool_call><function=bash><parameter=command>sleep 9</parameter></function></tool_call>"
+            ),
+            ""
+        );
+        assert_eq!(
+            without_tool_call_markup("Paris.\n<tool_call>{\"name\":\"x\"}</tool_call>"),
+            "Paris."
+        );
+        assert_eq!(without_tool_call_markup(" Paris "), "Paris");
+    }
+
+    #[test]
+    fn the_expanded_form_shows_whole_commands_and_outputs() {
+        let script = (0..10)
+            .map(|index| format!("echo step {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = serde_json::json!({ "command": script }).to_string();
+        let brief = format_tool_call_start("bash", &input);
+        assert!(brief.contains("+7 lines") && !brief.contains("step 9"));
+        let full = render_full(|| format_tool_call_start("bash", &input));
+        assert!(full.contains("step 9") && !full.contains("+7 lines"));
+
+        let output = (0..120)
+            .map(|index| format!("raw {index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full = render_full(|| format_tool_result("plugin_echo", &output, false));
+        assert!(full.contains("raw 119") && !full.contains("full result preserved"));
+        // Truncation is back on afterwards.
+        let brief = format_tool_result("plugin_echo", &output, false);
+        assert!(!brief.contains("raw 119"));
+    }
+
+    #[test]
     fn ultraplan_progress_lines_include_phase_step_and_elapsed_status() {
         let snapshot = InternalPromptProgressState {
             command_label: "Ultraplan",
@@ -24676,18 +25191,10 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "import json, sys",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
-            "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            "            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "    line = sys.stdin.buffer.readline()",
+            "    if not line:",
+            "        return None",
+            "    return json.loads(line.decode())",
             "",
             "def send_message(message):",
             "    payload = json.dumps(message).encode()",

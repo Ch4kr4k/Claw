@@ -3,7 +3,7 @@
 //! keys. `/keybindings` creates the file and lists what is bound.
 //!
 //! ```json
-//! { "bindings": { "ctrl+o": "/focus", "ctrl+g": "submit", "ctrl+t": "text:TODO: " } }
+//! { "bindings": { "f2": "/focus", "ctrl+g": "submit", "ctrl+t": "text:TODO: " } }
 //! ```
 
 use std::fs;
@@ -182,7 +182,7 @@ fn parse(text: &str) -> (Vec<(Chord, Binding)>, Vec<String>) {
 
 const TEMPLATE: &str = r#"{
   "bindings": {
-    "ctrl+o": "/focus"
+    "f2": "/focus"
   }
 }
 "#;

@@ -665,6 +665,7 @@ impl LiveCli {
     /// A turn from the app, then LeanGate: while the files it edited have
     /// type errors, the agent is asked to fix them (a few rounds at most).
     fn run_desktop_turn(&mut self, input: &str) {
+        crate::learning::cancel();
         let _ = tools::leangate::take_edited_files();
         self.begin_checkpoint(input);
         let mut status = self.run_desktop_turn_once(input, true);
@@ -756,9 +757,9 @@ impl LiveCli {
                 // As in the terminal: review the turn for memories and skills.
                 let added = 1 + summary.assistant_messages.len() + summary.tool_results.len();
                 let messages = &self.runtime.session().messages;
-                crate::learning::review_turn_in_background(
-                    self.model.clone(),
-                    messages[messages.len().saturating_sub(added)..].to_vec(),
+                crate::learning::after_turn(
+                    messages,
+                    &messages[messages.len().saturating_sub(added)..],
                 );
                 emit(&json!({
                     "ev": "usage",
