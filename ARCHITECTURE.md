@@ -539,7 +539,11 @@ in the system prompt (`custom_agents_section`).
 
 ### Turn guards
 
-Inside `ConversationRuntime::drive_turn`, besides the repeated-result check:
+Inside `ConversationRuntime::drive_turn`, besides the repeated-result check
+(`REPEATED_CALL_LIMIT`; a call sent again after it was blocked gets
+`blocked_again_note`, and `BLOCKED_REPEAT_STEPS_LIMIT` steps of only such
+calls end the turn with a closing assistant note; `compact::collapse_repeated_cycles`
+keeps such a cycle once in both compaction summaries):
 `turn_guards::FailureGuard` notes and then blocks calls that keep failing;
 `turn_guards::is_repetition_dominated`/`is_runaway_repetition` replace a
 looped reply's text with `REPETITION_NOTE` and end the turn instead of

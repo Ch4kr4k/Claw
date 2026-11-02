@@ -687,6 +687,9 @@ pub fn stdout_is_terminal() -> bool {
 
 /// A new model request started: the agent is thinking until output arrives.
 pub fn begin_model_request() {
+    // A Ctrl+Enter during a tool step was for that step: its messages are
+    // passed before this request, which is not cut off for them.
+    clear_send_now();
     with_activity(|activity| {
         activity.tool = None;
         activity.request_output = false;
@@ -1105,6 +1108,46 @@ struct Keys {
     mice: Vec<screen::Mouse>,
     /// Ctrl+O presses: expand or collapse every fold.
     fold_toggles: u32,
+    /// Esc presses sent as `ESC [ 27 u` (kitty keyboard protocol).
+    escapes: u32,
+    /// Ctrl+C presses sent as `ESC [ 99 ; 5 u`: with the protocol on they
+    /// do not raise SIGINT, so they stop the reply here.
+    interrupts: u32,
+}
+
+/// The key a kitty keyboard protocol report (`ESC [ code ; mods u`) stands
+/// for, as the bytes the legacy encoding would have sent; `None` to drop it.
+fn kitty_key(params: &[u8], keys: &mut Keys) -> Option<u8> {
+    let params = std::str::from_utf8(params).ok()?;
+    let mut fields = params.split(';');
+    let code: u32 = fields.next()?.split(':').next()?.parse().ok()?;
+    let mods: u32 = fields
+        .next()
+        .and_then(|mods| mods.split(':').next()?.parse().ok())
+        .unwrap_or(1);
+    let modifiers = mods.saturating_sub(1);
+    let (shift, alt, ctrl) = (modifiers & 1 != 0, modifiers & 2 != 0, modifiers & 4 != 0);
+    match code {
+        27 if modifiers == 0 => {
+            keys.escapes += 1;
+            None
+        }
+        13 if ctrl && !alt => Some(CTRL_ENTER),
+        13 if !alt => Some(b'\r'),
+        9 if shift && !ctrl && !alt => {
+            keys.back_tabs += 1;
+            None
+        }
+        _ if ctrl && !alt && code == u32::from(b'c') => {
+            keys.interrupts += 1;
+            None
+        }
+        // Ctrl+letter: the control byte the editing keys are read from.
+        _ if ctrl && !alt && (u32::from(b'a')..=u32::from(b'z')).contains(&code) => {
+            u8::try_from(code).ok().map(|letter| letter & 0x1f)
+        }
+        _ => None,
+    }
 }
 
 /// Splits what was read from the keyboard into typed text, Shift+Tab
@@ -1151,6 +1194,14 @@ fn split_keys(bytes: &[u8]) -> Keys {
                 };
                 if let Some(byte) = cursor_key {
                     keys.text.push(byte);
+                } else if csi && bytes.get(end) == Some(&b'u') {
+                    if let Some(byte) = kitty_key(params, &mut keys) {
+                        if byte == CTRL_O {
+                            keys.fold_toggles += 1;
+                        } else {
+                            keys.text.push(byte);
+                        }
+                    }
                 } else if csi {
                     match (params, bytes.get(end)) {
                         (b"", Some(b'Z')) => keys.back_tabs += 1,
@@ -1339,6 +1390,32 @@ const CTRL_P: u8 = 0x10;
 /// Down (as Ctrl+N): the next row of the `/` menu.
 const CTRL_N: u8 = 0x0e;
 const CTRL_U: u8 = 0x15;
+/// Ctrl+Enter, as [`split_keys`] passes it on from the kitty keyboard
+/// protocol's `ESC [ 13 ; 5 u` (the legacy encoding is a plain Enter).
+const CTRL_ENTER: u8 = 0x1e;
+
+/// The terminal speaks the kitty keyboard protocol (the prompt found out):
+/// the watcher turns it on during a turn so Ctrl+Enter can be told from Enter.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+/// Ctrl+Enter was pressed with messages queued: the reply being streamed is
+/// cut off so the agent reads them now instead of after its step.
+static SEND_NOW: AtomicBool = AtomicBool::new(false);
+
+/// Records whether the terminal supports the kitty keyboard protocol.
+pub fn set_keyboard_enhancement(supported: bool) {
+    KEYBOARD_ENHANCED.store(supported, Ordering::SeqCst);
+}
+
+/// Whether Ctrl+Enter asked for the streaming reply to be cut off now.
+#[must_use]
+pub fn send_now_requested() -> bool {
+    SEND_NOW.load(Ordering::SeqCst)
+}
+
+/// Clears a Ctrl+Enter request (it is for the reply that was streaming).
+pub fn clear_send_now() {
+    SEND_NOW.store(false, Ordering::SeqCst);
+}
 
 /// Moves every queued message, oldest first and one per line, in front of
 /// what is being typed, with the cursor after them. Returns whether any were
@@ -1370,7 +1447,9 @@ fn record_type_ahead(bytes: &[u8]) {
     for ch in String::from_utf8_lossy(bytes).chars() {
         let control = u8::try_from(u32::from(ch)).ok();
         // The `/` menu takes ↑/↓, Tab and Enter while it is open.
-        let (menu, selected) = if matches!(ch, '\t' | '\r' | '\n')
+        let enter = matches!(ch, '\r' | '\n') || control == Some(CTRL_ENTER);
+        let (menu, selected) = if ch == '\t'
+            || enter
             || control.is_some_and(|byte| byte == CTRL_P || byte == CTRL_N)
         {
             type_ahead.menu(&commands)
@@ -1430,7 +1509,7 @@ fn record_type_ahead(bytes: &[u8]) {
             _ if control == Some(CTRL_P) => {
                 pull_queued_into(&mut type_ahead);
             }
-            '\r' | '\n' => {
+            _ if enter => {
                 let line = type_ahead.take();
                 if let (Some(question), Some(handler)) =
                     (btw_question(&line), SIDE_QUESTION_HANDLER.get())
@@ -1447,6 +1526,11 @@ fn record_type_ahead(bytes: &[u8]) {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(line.trim().to_string());
+                }
+                // Ctrl+Enter: what is queued goes to the agent now; the
+                // reply it is writing is cut off for it.
+                if control == Some(CTRL_ENTER) && queued_count() > 0 {
+                    SEND_NOW.store(true, Ordering::SeqCst);
                 }
             }
             ch if !ch.is_control() => {
@@ -1513,6 +1597,7 @@ mod imp {
             let original = stty(&["-g"])?;
             stty(WATCH_SETTINGS)?;
             *ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(original);
+            set_kitty_keys(true);
             if super::stdout_is_terminal() {
                 *ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some(Activity::new(Instant::now()));
@@ -1526,6 +1611,7 @@ mod imp {
         }
 
         pub(super) fn apply_original() {
+            set_kitty_keys(false);
             if let Some(original) = ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 let _ = stty(&[&original]);
             }
@@ -1533,6 +1619,7 @@ mod imp {
 
         pub(super) fn apply_watch() {
             let _ = stty(WATCH_SETTINGS);
+            set_kitty_keys(true);
         }
 
         pub(super) fn restore_original(self) {
@@ -1541,6 +1628,26 @@ mod imp {
             *ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) = None;
             Self::apply_original();
             *ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Whether the watcher pushed the kitty keyboard flags (popped once).
+    static KITTY_PUSHED: AtomicBool = AtomicBool::new(false);
+
+    /// Turns the kitty keyboard protocol's "disambiguate" mode on or off for
+    /// the watcher, where the terminal supports it: Ctrl+Enter then arrives
+    /// as `ESC [ 13 ; 5 u` instead of the same `\r` as Enter.
+    fn set_kitty_keys(on: bool) {
+        use std::io::Write;
+        if on && !super::KEYBOARD_ENHANCED.load(Ordering::SeqCst) {
+            return;
+        }
+        if KITTY_PUSHED.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = tty.write_all(if on { b"\x1b[>1u" } else { b"\x1b[<u" });
+            let _ = tty.flush();
         }
     }
 
@@ -1622,6 +1729,16 @@ mod imp {
             return;
         }
         let mut keys = split_keys(bytes);
+        if keys.interrupts > 0 {
+            abort.abort();
+        }
+        for _ in 0..keys.escapes {
+            if screen::tasks_view_open() {
+                screen::close_tasks_view();
+            } else if !close_command_menu() {
+                abort.abort();
+            }
+        }
         if screen::tasks_view_open() {
             // ←/→ (here as Ctrl+B/F) switch the task the view shows.
             keys.text.retain(|&byte| match byte {
@@ -1796,6 +1913,19 @@ mod tests {
     }
 
     #[test]
+    fn kitty_keyboard_reports_become_the_legacy_keys() {
+        // Ctrl+Enter, Enter, Esc, Ctrl+C, Ctrl+A, Shift+Tab, Ctrl+O, Alt+x.
+        let keys = super::split_keys(
+            b"a\x1b[13;5ub\x1b[13u\x1b[27u\x1b[99;5u\x1b[97;5u\x1b[9;2u\x1b[111;5u\x1b[120;3u",
+        );
+        assert_eq!(keys.text, b"a\x1eb\r\x01");
+        assert_eq!(keys.escapes, 1);
+        assert_eq!(keys.interrupts, 1);
+        assert_eq!(keys.back_tabs, 1);
+        assert_eq!(keys.fold_toggles, 1);
+    }
+
+    #[test]
     fn cursor_keys_stay_in_the_text_as_control_bytes() {
         let keys = super::split_keys(
             b"a\x1b[Db\x1b[C\x1bOD\x1bOC\x1b[H\x1bOH\x1b[1~\x1b[7~\x1b[F\x1bOF\x1b[4~\x1b[8~\x1b[3~\x1b[A\x1bOA",
@@ -1923,6 +2053,17 @@ mod tests {
         assert_eq!(take_queued().as_deref(), Some("second one"));
         assert_eq!(take_queued(), None, "blank lines are not queued");
         assert_eq!(take_type_ahead(), "draft");
+
+        // Ctrl+Enter queues like Enter and asks for the reply to be cut off,
+        // only when something is queued; a new model request clears it.
+        super::clear_send_now();
+        record_type_ahead(b"\x1e");
+        assert!(!super::send_now_requested(), "nothing queued");
+        record_type_ahead(b"stop, use the other file\x1e");
+        assert!(super::send_now_requested());
+        assert_eq!(take_queued().as_deref(), Some("stop, use the other file"));
+        super::begin_model_request();
+        assert!(!super::send_now_requested());
 
         record_type_ahead(b"a\rb\rtail");
         unqueue_into_type_ahead();

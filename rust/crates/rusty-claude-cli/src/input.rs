@@ -1439,6 +1439,8 @@ impl TerminalModeGuard {
         static SUPPORTS_ENHANCEMENT: OnceLock<bool> = OnceLock::new();
         let keyboard_enhanced = *SUPPORTS_ENHANCEMENT
             .get_or_init(|| terminal::supports_keyboard_enhancement().unwrap_or(false));
+        // The turn's key watcher uses it too, for Ctrl+Enter.
+        runtime::turn_keys::set_keyboard_enhancement(keyboard_enhanced);
         if keyboard_enhanced {
             let _ = execute!(
                 stdout,

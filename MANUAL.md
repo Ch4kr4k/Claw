@@ -303,6 +303,7 @@ Mention files with `@path` (Tab completes them) so the agent reads them. See
 | Esc | Stop the reply, and the shell command it is running (that command's process group gets SIGTERM, then SIGKILL after 3 s). Background jobs keep running; stop them with `KillShell`/`TaskStop` or `/tasks` |
 | Ctrl+C | Stop the reply (same as Esc; the program keeps running) |
 | Typing + Enter | Queue a message. It is passed to the agent before its next step (after the tools it is running, or right after its reply, which then goes on in the same turn), shown as `> text (sent to the agent)` |
+| Typing + Ctrl+Enter | Send it now: queue the message (with any already queued) and cut off the reply being written, so the agent reads it at once and goes on in the same turn (`(reply cut off to send your message)`). A tool that is running finishes first. Needs a terminal with the kitty keyboard protocol (kitty, Ghostty, WezTerm, foot); elsewhere Ctrl+Enter is a plain Enter |
 | `/` | Opens the same command menu as at the prompt, under the input row: ↑/↓ select, Tab completes, Enter runs the selected command, Esc closes the menu (the reply keeps running) |
 | `/command` + Enter | Runs a slash command. Commands that only show something or change the view (`/help`, `/todos`, `/tasks`, `/diff`, `/config`, `/agents`, `/skills`, `/hooks`, `/focus`, `/diffpanel`, `/theme`, `/color`, `/stop`, `/keybindings`, `/version`, `/sandbox`) run at once; the others (`/model`, `/compact`, `/cost`, …) show `(runs when the reply ends)` and run then. Slash commands are never passed to the agent |
 | Typing without Enter | Kept and pre-filled at the next prompt |
@@ -992,8 +993,12 @@ of smaller local models:
   ("the reply got stuck repeating itself"), and its text is not sent back. A
   call that fails twice the same way gets a note to change approach and is
   not run after four failures; a tool that fails eight times in a row is not
-  run again that turn. (A call that keeps returning the same result was
-  already stopped after three.)
+  run again that turn. A call that keeps returning the same result is not
+  run after three times; sending it again after that gets a sharper note
+  naming the call, and three more steps of nothing but that blocked call end
+  the turn ("stopped: the model kept repeating a blocked … call"). Compaction
+  summaries collapse such a repeated call and its result into one entry
+  marked as a loop, so a continued session does not start it again.
 - **Check before finishing:** when a turn edited code and is about to end
   without having run anything since, the model is reminded once to build,
   test or run it, or to say it is not verified. Edits to docs and data

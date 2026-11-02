@@ -46,6 +46,26 @@ const REPEATED_CALL_NOTE: &str = "Not run: you already made this exact call seve
      Use the result you have, try a different approach, or answer the user with what you \
      found.";
 
+/// How many steps in a row may consist only of calls the repeat guard
+/// blocked before the turn is ended. The guard only refuses the call; a
+/// local model (cybertiel 35B-A3B) wrote "I'm stuck in a loop, let me run a
+/// fresh command" and then sent the same blocked `BashOutput` call again,
+/// 127 times, for half an hour, until the user interrupted.
+const BLOCKED_REPEAT_STEPS_LIMIT: u32 = 3;
+
+/// Sent instead of [`REPEATED_CALL_NOTE`] once the model repeats a call that
+/// was already blocked: it names the call, so the model cannot miss which.
+fn blocked_again_note(tool_name: &str, input: &str) -> String {
+    let shown: String = input.chars().take(200).collect();
+    format!(
+        "Not run, again: `{tool_name}` with input {shown} is disabled for the rest of this turn. \
+         It was already blocked and it will be blocked every time. Do not send it again. Your \
+         next reply must be a different tool call, or your answer to the user with what you \
+         found and what is still unknown. If it refers to a background job or id, that job is \
+         gone: do not poll it."
+    )
+}
+
 /// Counts how many times in a row the call `key` returned this same result.
 fn note_repeated_call(
     repeated_calls: &mut BTreeMap<(String, String), (u64, u32)>,
@@ -666,6 +686,12 @@ where
         let mut cut_off_continuations = 0;
         // (tool, input) -> (hash of its last result, times in a row it was that).
         let mut repeated_calls: BTreeMap<(String, String), (u64, u32)> = BTreeMap::new();
+        // Calls the repeat guard already blocked, and steps in a row that
+        // did nothing but send such calls.
+        let mut blocked_calls: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let mut blocked_only_steps: u32 = 0;
+        let mut stopped_looping: Option<String> = None;
         let mut failures = crate::turn_guards::FailureGuard::default();
         let mut verify = crate::turn_guards::VerifyGuard::default();
         // Broad searches the model was already warned about once this turn.
@@ -828,6 +854,8 @@ where
             // Consecutive read-only calls run concurrently; every other call
             // runs alone, in order. Hooks, permission prompts and session writes
             // all stay on this thread, in the original order.
+            let mut step_ran_calls = false;
+            let mut step_blocked_repeat: Option<String> = None;
             let groups = group_for_parallel_execution(pending_tool_uses, |tool_name| {
                 !tool_name.eq_ignore_ascii_case("bash")
                     && self.tool_executor.can_run_in_parallel(tool_name)
@@ -837,14 +865,19 @@ where
                 for (tool_use_id, tool_name, input) in group {
                     let (pre_hook_result, effective_input, mut outcome) =
                         self.authorize_tool_use(&tool_name, &input, prompter.as_deref_mut());
+                    let key = (tool_name.clone(), effective_input.clone());
                     if outcome == PermissionOutcome::Allow
                         && repeated_calls
-                            .get(&(tool_name.clone(), effective_input.clone()))
+                            .get(&key)
                             .is_some_and(|(_, times)| *times >= REPEATED_CALL_LIMIT)
                     {
-                        outcome = PermissionOutcome::Deny {
-                            reason: REPEATED_CALL_NOTE.to_string(),
+                        let reason = if blocked_calls.insert(key) {
+                            REPEATED_CALL_NOTE.to_string()
+                        } else {
+                            step_blocked_repeat = Some(tool_name.clone());
+                            blocked_again_note(&tool_name, &effective_input)
                         };
+                        outcome = PermissionOutcome::Deny { reason };
                     }
                     if outcome == PermissionOutcome::Allow {
                         if let crate::turn_guards::CallVerdict::Block(reason) =
@@ -885,6 +918,7 @@ where
                     .filter(|call| call.outcome == PermissionOutcome::Allow)
                     .map(|call| (call.tool_name.clone(), call.effective_input.clone()))
                     .collect::<Vec<_>>();
+                step_ran_calls |= !allowed.is_empty();
                 for (tool_name, _) in &allowed {
                     self.record_tool_started(iterations, tool_name);
                 }
@@ -955,6 +989,20 @@ where
                 tool_results.push(result_message);
             }
 
+            // A model that keeps sending a call after it was blocked is not
+            // going to stop by itself: refusing the call again only adds
+            // another identical pair to its context, which makes the loop
+            // stronger. End the turn instead.
+            if step_ran_calls {
+                blocked_only_steps = 0;
+            } else if let Some(tool_name) = step_blocked_repeat {
+                blocked_only_steps += 1;
+                if blocked_only_steps >= BLOCKED_REPEAT_STEPS_LIMIT {
+                    stopped_looping = Some(tool_name);
+                    break;
+                }
+            }
+
             // Background shells or agents that finished while the tools ran
             // are reported before the next step, so the model can use them.
             if self.deliver_job_notices {
@@ -974,6 +1022,25 @@ where
             // Prompts the user queued while the tools ran are passed to the
             // model before its next step, so a running task can be steered.
             self.pass_queued_to_running_turn()?;
+        }
+
+        if let Some(tool_name) = stopped_looping {
+            eprintln!(
+                "\n\x1b[2m(stopped: the model kept repeating a blocked `{tool_name}` call)\x1b[0m"
+            );
+            // Kept in the session, so the next turn (and a compaction
+            // summary) says the loop was cut off rather than ending on it.
+            let note = ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: format!(
+                    "(I stopped this turn: I kept repeating a `{tool_name}` call that was \
+                     blocked as a repeat and could not change anything. Next time I will not \
+                     make that call again.)"
+                ),
+            }]);
+            self.session
+                .push_message(note.clone())
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            assistant_messages.push(note);
         }
 
         let summary = TurnSummary {
@@ -2507,6 +2574,65 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_call_sent_again_and_again_ends_the_turn() {
+        // A dead job polled 50 times: it must not run past the guard, the
+        // second block names the call, and the turn ends on its own.
+        let replies: Vec<_> = (0..50)
+            .map(|i| {
+                vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("p{i}"),
+                        name: "BashOutput".to_string(),
+                        input: r#"{"bash_id":"bg1","wait_seconds":2}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ]
+            })
+            .collect();
+        let runs = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let seen = runs.clone();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CutOffApi {
+                replies,
+                requests: Vec::new(),
+            },
+            StaticToolExecutor::new().register("BashOutput", move |_| {
+                *seen.borrow_mut() += 1;
+                Err(ToolError::new(
+                    "no background job `bg1`; no jobs have been started",
+                ))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime.run_turn("check the job", None).expect("turn ends");
+
+        assert_eq!(*runs.borrow(), super::REPEATED_CALL_LIMIT as usize);
+        // Limit runs, one plain block, then the limit of repeated blocks.
+        let requests = super::REPEATED_CALL_LIMIT + 1 + super::BLOCKED_REPEAT_STEPS_LIMIT;
+        assert_eq!(runtime.api_client_mut().requests.len(), requests as usize);
+        let outputs: Vec<&str> = summary
+            .tool_results
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(outputs
+            .iter()
+            .any(|output| output.contains("`BashOutput` with input")));
+        let last = runtime.session().messages.last().expect("a closing note");
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert!(
+            matches!(&last.blocks[0], ContentBlock::Text { text } if text.contains("I stopped this turn"))
+        );
+    }
+
+    #[test]
     fn a_call_that_keeps_returning_the_same_result_stops_running() {
         let call = |id: &str, command: &str| {
             vec![
@@ -3247,7 +3373,9 @@ mod tests {
                 vec![AssistantEvent::ToolUse {
                     id: format!("tool-{}", self.calls),
                     name: "echo".to_string(),
-                    input: "{}".to_string(),
+                    // A different input per step: identical calls are a loop the
+                    // repeat guard ends, and these tests are about compaction.
+                    input: format!(r#"{{"step":{}}}"#, self.calls),
                 }]
             } else {
                 vec![AssistantEvent::TextDelta("done".to_string())]

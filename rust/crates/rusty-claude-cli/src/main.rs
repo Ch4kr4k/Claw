@@ -15196,6 +15196,22 @@ impl AnthropicRuntimeClient {
     }
 }
 
+/// What a reply cut off with Ctrl+Enter is kept as, so the model sees why
+/// it ended and that the message after it came in while it was writing.
+const SENT_NOW_REPLY: &str = "[My reply was cut off here: the user sent the next message \
+     while I was writing it.]";
+
+/// Resolves once Ctrl+Enter asked to send the queued messages now; never
+/// when `watch` is false (a reply that is not shown cannot be steered).
+async fn wait_for_send_now(watch: bool) {
+    if !watch {
+        return std::future::pending().await;
+    }
+    while !runtime::turn_keys::send_now_requested() {
+        tokio::time::sleep(ABORT_POLL_INTERVAL).await;
+    }
+}
+
 /// Resolves once `abort_signal` is set; never resolves when there is none.
 async fn wait_for_abort(abort_signal: Option<runtime::HookAbortSignal>) {
     let Some(abort_signal) = abort_signal else {
@@ -16065,11 +16081,21 @@ impl AnthropicRuntimeClient {
             Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         };
         // Dropping `request` on Esc closes the connection, which also stops
-        // generation on the server.
+        // generation on the server. Ctrl+Enter does the same, but the turn
+        // goes on: the reply ends there and the queued messages follow it.
+        let watch_send_now = self.emit_output;
         let result = self.runtime.block_on(async {
             tokio::select! {
                 result = request => result,
                 () = wait_for_abort(abort_signal) => Err(RuntimeError::new(INTERRUPTED_BY_USER)),
+                () = wait_for_send_now(watch_send_now) => {
+                    runtime::turn_keys::clear_send_now();
+                    eprintln!("\n\x1b[2m(reply cut off to send your message)\x1b[0m");
+                    Ok(vec![
+                        AssistantEvent::TextDelta(SENT_NOW_REPLY.to_string()),
+                        AssistantEvent::MessageStop,
+                    ])
+                }
             }
         });
         render::stop_thinking();

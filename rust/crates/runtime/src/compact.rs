@@ -140,6 +140,56 @@ latest request and where the work stopped, so the task does not drift. Leave out
 requests that were already finished.
 </summary>";
 
+/// The longest cycle of entries (an assistant call and its result, with a
+/// thought or a note between) that [`collapse_repeated_cycles`] recognizes.
+const MAX_REPEAT_CYCLE: usize = 4;
+
+/// `entries` with every run of a repeating cycle kept once and replaced by a
+/// note saying how often it repeated. A model stuck calling a dead job id
+/// 127 times had each call copied into the compaction summary, and the
+/// summary started the loop again right after the session continued.
+fn collapse_repeated_cycles(
+    entries: Vec<String>,
+    note: impl Fn(usize, usize) -> String,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(entries.len());
+    let mut i = 0;
+    while i < entries.len() {
+        let mut best: Option<(usize, usize)> = None; // (cycle length, repeats)
+        for len in 1..=MAX_REPEAT_CYCLE {
+            let mut repeats = 1;
+            while i + (repeats + 1) * len <= entries.len()
+                && entries[i..i + len] == entries[i + repeats * len..i + (repeats + 1) * len]
+            {
+                repeats += 1;
+            }
+            if repeats > 1 && best.is_none_or(|(l, r)| len * repeats > l * r) {
+                best = Some((len, repeats));
+            }
+        }
+        match best {
+            Some((len, repeats)) => {
+                out.extend_from_slice(&entries[i..i + len]);
+                out.push(note(len, repeats - 1));
+                i += len * repeats;
+            }
+            None => {
+                out.push(entries[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn repeated_note(entries: usize, more: usize) -> String {
+    let what = if entries == 1 { "line" } else { "lines" };
+    format!(
+        "(the {entries} {what} above repeated {more} more times with the same result: a loop that \
+         changed nothing; do not make those calls again)"
+    )
+}
+
 /// The conversation `messages` as plain text for the summarizing model:
 /// `previous` (an earlier compaction summary) first, tool output cut to its
 /// head so a few large results do not crowd out the conversation.
@@ -160,6 +210,7 @@ pub fn summary_transcript(previous: Option<&str>, messages: &[ConversationMessag
         out.push_str(previous.trim());
         out.push_str("\n\nMessages since then:\n\n");
     }
+    let mut lines = Vec::new();
     for message in messages {
         let role = match message.role {
             MessageRole::System => "System",
@@ -185,9 +236,12 @@ pub fn summary_transcript(previous: Option<&str>, messages: &[ConversationMessag
                     cut(output, TOOL_OUTPUT_CHARS)
                 ),
             };
-            out.push_str(&line);
-            out.push_str("\n\n");
+            lines.push(line);
         }
+    }
+    for line in collapse_repeated_cycles(lines, repeated_note) {
+        out.push_str(&line);
+        out.push_str("\n\n");
     }
     out.push_str("Write the summary now.");
     out
@@ -446,6 +500,7 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
     }
 
     lines.push("- Key timeline:".to_string());
+    let mut timeline = Vec::with_capacity(messages.len());
     for message in messages {
         let role = match message.role {
             MessageRole::System => "system",
@@ -459,8 +514,11 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
             .map(summarize_block)
             .collect::<Vec<_>>()
             .join(" | ");
-        lines.push(format!("  - {role}: {content}"));
+        timeline.push(format!("  - {role}: {content}"));
     }
+    lines.extend(collapse_repeated_cycles(timeline, |entries, more| {
+        format!("  - {}", repeated_note(entries, more))
+    }));
     lines.push("</summary>".to_string());
     lines.join("\n")
 }
@@ -566,9 +624,9 @@ const IMAGE_TOKEN_ESTIMATE: usize = 1_500;
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
-        ContentBlock::Thinking { thinking, .. } => {
-            format!("thinking ({} chars)", thinking.chars().count())
-        }
+        // No length: it differs on every step of a loop, so the timeline
+        // entries of a repeated call would not match and not be collapsed.
+        ContentBlock::Thinking { .. } => "thinking".to_string(),
         ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}({input})"),
         ContentBlock::ToolResult {
             tool_name,
@@ -909,8 +967,9 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
+        collapse_repeated_cycles, collect_key_files, compact_session, format_compact_summary,
+        get_compact_continuation_message, infer_pending_work, should_compact, summarize_messages,
+        summary_transcript, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -987,6 +1046,59 @@ mod tests {
         assert_eq!(result.compacted_session, session);
         assert!(result.summary.is_empty());
         assert!(result.formatted_summary.is_empty());
+    }
+
+    #[test]
+    fn repeated_call_cycles_are_collapsed_in_both_summaries() {
+        let mut messages = vec![ConversationMessage::user_text("check the job")];
+        for i in 0..40 {
+            messages.push(ConversationMessage::assistant(vec![
+                ContentBlock::Thinking {
+                    thinking: "stuck ".repeat(i + 1),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: format!("p{i}"),
+                    name: "BashOutput".to_string(),
+                    input: r#"{"bash_id":"bg1"}"#.to_string(),
+                },
+            ]));
+            messages.push(ConversationMessage::tool_result(
+                format!("p{i}"),
+                "BashOutput",
+                "Not run: you already made this exact call",
+                true,
+            ));
+        }
+        messages.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "giving up".to_string(),
+        }]));
+
+        let summary = summarize_messages(&messages);
+        assert_eq!(
+            summary.matches("tool_use BashOutput").count(),
+            1,
+            "{summary}"
+        );
+        assert!(summary.contains("repeated 39 more times"), "{summary}");
+        assert!(summary.contains("giving up"));
+
+        let transcript = summary_transcript(None, &messages);
+        assert_eq!(
+            transcript.matches("called BashOutput").count(),
+            1,
+            "{transcript}"
+        );
+        assert!(transcript.contains("repeated 39 more times"));
+    }
+
+    #[test]
+    fn collapsing_keeps_entries_that_do_not_repeat() {
+        let entries = ["a", "b", "a", "c", "c", "c", "d"]
+            .map(String::from)
+            .to_vec();
+        let collapsed = collapse_repeated_cycles(entries, |len, more| format!("x{len}*{more}"));
+        assert_eq!(collapsed, ["a", "b", "a", "c", "x1*2", "d"]);
     }
 
     #[test]
