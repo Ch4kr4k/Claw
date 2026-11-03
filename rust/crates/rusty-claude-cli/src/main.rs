@@ -15300,6 +15300,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --plan, --dry-run          Read-only dry run: the model replies with the exact commands and edits it would make"
+    )?;
+    writeln!(
+        out,
         "  --allowedTools TOOLS       Restrict enabled tools by canonical snake_case name or alias"
     )?;
     writeln!(out, "                              Examples: read, glob, web_fetch, WebFetch; status JSON exposes aliases")?;
