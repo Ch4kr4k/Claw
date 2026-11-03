@@ -59,6 +59,7 @@ pub mod summary_compression;
 pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
+pub mod text_tool_calls;
 pub mod threats;
 pub mod tool_images;
 pub mod tool_spill;

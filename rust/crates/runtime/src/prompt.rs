@@ -337,6 +337,7 @@ fn discover_instruction_files(
             dir.join("AGENTS.md"),
             dir.join("CLAUDE.local.md"),
             dir.join(".claw").join("CLAUDE.md"),
+            dir.join(".claw").join("AGENTS.md"),
             dir.join(".claude").join("CLAUDE.md"),
             dir.join(".claw").join("instructions.md"),
         ] {

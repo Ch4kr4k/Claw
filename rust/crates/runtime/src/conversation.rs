@@ -730,6 +730,17 @@ where
                         return Err(error);
                     }
                 };
+            // A local server whose tool-call parser missed the model's
+            // format hands the call over as text; run it as the call it is.
+            if !reply_cut_off && crate::text_tool_calls::enabled() {
+                let recovered = crate::text_tool_calls::recover(&mut assistant_message);
+                if recovered > 0 {
+                    eprintln!(
+                        "\n\x1b[2m(the model wrote {recovered} tool call(s) as text; running {})\x1b[0m",
+                        if recovered == 1 { "it" } else { "them" }
+                    );
+                }
+            }
             // A reply stuck repeating itself is not continued (that fed the
             // loop) and its text is not kept (sent back, it starts the loop
             // again on the next request).

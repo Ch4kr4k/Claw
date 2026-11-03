@@ -197,7 +197,10 @@ The app keeps its projects, chat titles, preferences and scheduled tasks in
 
 Like Claude Code, the interactive REPL draws the whole terminal window: the
 conversation fills the top and the input box and status line stay at the
-bottom, even while you scroll back. The bottom area grows for a long prompt,
+bottom, even while you scroll back. The status line shows the permission
+mode, the model, context used of the window, the session (last 8
+characters; the full id is in `/status`) and running shells; what does not
+fit the width is left off from the right. The bottom area grows for a long prompt,
 the `/` menu, an approval or a question, and shrinks back afterwards.
 
 | Key | Action |
@@ -393,7 +396,11 @@ Every tool needs a permission level; the session runs in one mode:
 | `workspace-write` (default) | The above plus editing files inside the current directory and ordinary shell commands |
 | `danger-full-access` | Everything |
 
-Switch with `--permission-mode MODE` or `/permissions MODE`. When a call needs
+Switch with `--permission-mode MODE` or `/permissions MODE`. `--plan` (or
+`--dry-run`) starts in `read-only` as a dry run: the model is told to
+investigate with read-only tools and reply with the exact commands and file
+edits it would make, the risks and how to verify, without attempting them.
+`/plan` does the same inside a session. When a call needs
 more than the current mode, you are asked:
 
 ```text
@@ -623,7 +630,7 @@ request or change billing.
 | `/team-onboarding` | Onboarding guide for a teammate from this project's sessions |
 | `/dataviz [request]` | Chart and dashboard design guidance |
 | `/run-skill-generator` | Write a project skill that teaches `/run` and `/verify` to start the app |
-| `/context [show\|clear]` | Estimated tokens versus the model's context window |
+| `/context [show\|clear]` | Estimated tokens versus the model's context window, the auto-compaction threshold, and where they go: system prompt, tool definitions (as sent, after deferral), message text, tool calls, tool results, thinking, images |
 | `/usage`, `/cost` | Token usage, estimated cost, cache hit rate |
 | `/stats` | Token usage and cost, plus a speed table for the last turn: per model request, the context size and how much of it the server had cached, the wait for the first token, the generating time and output tokens/s, and the time the tools took; then session averages. A low cache share means the prompt is re-read every step; a long first-token wait means slow prompt reading |
 | `/resume [session]`, `/session` | Load, list, fork or delete saved sessions. `/resume` alone lists this folder's sessions (newest first, by their first request, with age and size) to pick from; type to filter |
@@ -642,9 +649,9 @@ mode on and starts planning that task.
 
 | Command | What it does |
 |---|---|
-| `/undo` | Revert the files changed by the last request |
+| `/undo [list\|<n>]` | Revert the files changed by the last request; `list` shows the checkpoints, `<n>` (or `--to <n>`) reverts the newest *n* |
 | `/rewind [n]` | List checkpoints, or undo the last *n* requests |
-| `/diff` | Git diff of current changes |
+| `/diff [--stat\|--name-only]` | Current changes. On a terminal: totals, one row per file, then highlighted hunks (new files included; plain `git diff` when piped or with `NO_COLOR`). `--stat`: lines added/removed per file; `--name-only`: just the changed and untracked files |
 | `/files` | Files read, written or edited in this session |
 | `/add-dir <path>` | Let file tools work in another directory without asking |
 | `/commit`, `/pr`, `/issue` | Draft a commit, pull request or issue |
@@ -713,10 +720,13 @@ project's own `.git`. This covers edits made by any tool, including shell
 commands. Checkpoints survive restarts.
 
 ```text
-/rewind        # list checkpoints for this session
+/rewind        # list checkpoints for this session (same as /undo list)
 /undo          # revert the last request's file changes
-/rewind 3      # revert the last three requests
+/rewind 3      # revert the last three requests (same as /undo 3)
 ```
+
+Undo restores the working tree's files only; your git index and commits
+are left as they are.
 
 Snapshots are skipped in your home directory, at `/`, in very large folders,
 when git is not installed, or with `CLAW_SNAPSHOTS=0`.
@@ -986,6 +996,14 @@ of smaller local models:
   (`"40"` for a number, `"true"` for a yes/no, one path where a list is
   expected) are converted to what the tool asks for. A call cut off at the
   output limit is never completed.
+- **Tool calls written as text:** when the server's tool-call parser misses
+  the model's format (a wrong chat template, llama.cpp without `--jinja`, an
+  Ollama model parser that does not match), a call arrives as reply text:
+  `<tool_call>{"name": …, "arguments": …}</tool_call>` (Hermes/Qwen) or
+  `<function=…><parameter=…>…</parameter></function>` (Qwen3-Coder). claw runs
+  it as a real call ("the model wrote 1 tool call(s) as text") instead of
+  ending the turn. Not done when the reply also has a native call, for
+  markup inside code fences, or with `CLAW_TEXT_TOOL_CALLS=0`.
 - **Reasoning in the text:** `<think>…</think>` blocks a model writes into
   its reply are moved to the thinking block instead of being shown as the
   answer.
@@ -1135,7 +1153,8 @@ installed).
 - Claude Code's personal files, `~/.claude/CLAUDE.md` and `~/.claude/rules/`
   (`$CLAUDE_CONFIG_DIR` if set), so what you wrote for Claude Code applies here;
 - in the project, up to the git root: `CLAUDE.md`, `CLAW.md`, `AGENTS.md`,
-  `.claw/CLAUDE.md`, `.claude/CLAUDE.md`, `.claw/instructions.md`;
+  `.claw/CLAUDE.md`, `.claw/AGENTS.md`, `.claude/CLAUDE.md`,
+  `.claw/instructions.md` (added to your personal ones, which stay loaded);
 - rule folders `.claw/rules/` (shared), `.claw/rules.local/` (personal) and
   Claude Code's `.claude/rules/`;
 - rules from other tools (Cursor, Copilot, Windsurf, …), unless
@@ -1352,6 +1371,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_THINKING_BUDGET` | Most tokens a `local/` model may think per reply (llama-server's `thinking_budget_tokens`); default half the reply budget, never more than the reply budget minus 1024; `-1` sends none |
 | `WGPU_POWER_PREF` | Which GPU the desktop app draws on: `low` (its default, a laptop's integrated GPU, leaving the discrete GPU's memory to a local model) or `high`. `ICED_BACKEND=tiny-skia` draws on the CPU instead |
 | `WINIT_X11_SCALE_FACTOR` | UI scale of the desktop app on X11. claw-desktop sets `1` when it is unset, so the window is the same size on a high-DPI laptop panel as on an external monitor; set e.g. `1.5` to scale it up (Settings → Text size changes only the text) |
+| `CLAW_TEXT_TOOL_CALLS` | `0` stops running tool calls a model wrote as text (`<tool_call>…`, `<function=…>`) |
 | `CLAW_DEFER_TOOLS` | `0` sends every tool's full description, instead of listing the specialised tools by name in `ToolSearch` |
 | `CLAW_TOOL_RESULT_MAX_CHARS` | Cap on what one tool call sends to a local model (the launcher sets 12000). Hosted models get a quarter of their context window instead (4k–100k characters). A cut result is saved whole under `~/.claw/tool-output/` (kept a week) and the note tells the model where to read the rest |
 | `CLAW_MODELS_CATALOG=0` | Don't look up hosted models' context and output limits in the models.dev catalog |

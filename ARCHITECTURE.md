@@ -555,7 +555,10 @@ across a session's turns through an `Arc<Mutex<…>>` the CLI keeps). Before
 the loop, tool input is repaired in the CLI (`repaired_tool_input` →
 `api::repair_json`) and coerced to the tool's schema in
 `tools::coerce_tool_input`; `api::providers::think_scrubber` moves inline
-`<think>` blocks of OpenAI-compatible streams to thinking. `tool_spill`
+`<think>` blocks of OpenAI-compatible streams to thinking, and
+`runtime::text_tool_calls` turns tool calls a local model wrote as text
+(Hermes `<tool_call>` JSON, Qwen3-Coder `<function=…>`) into tool-use blocks
+right after `build_assistant_message`, when the reply has no native call. `tool_spill`
 saves long output (bash over 16 KiB, capped results) under
 `~/.claw/tool-output/`, which `classify_read_path_permission` treats like the
 workspace. `ExecuteCode` (`tools/src/code_exec.rs`) serves read-only tools to

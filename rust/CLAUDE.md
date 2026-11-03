@@ -9,7 +9,7 @@ This file provides guidance to Claw Code (clawcode.dev) when working with code i
 ## Verification
 - From the repository root, run Rust formatting with `scripts/fmt.sh` (or `scripts/fmt.sh --check` for CI-style checks). From this `rust/` directory, the equivalent command is `../scripts/fmt.sh`. Root-level `cargo fmt --manifest-path rust/Cargo.toml` is not the supported formatting command.
 - From this `rust/` directory, run Rust verification with `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`.
-- `-D warnings` currently fails on pre-existing lints in `rusty-claude-cli`; add no new ones. For quick loops use `cargo test -p <crate>` (REPL, editor and renderer tests: `cargo test -p rusty-claude-cli --bin claw`).
+- The workspace is clean under `-D warnings`; add no new lints. Unit tests of `rusty-claude-cli/src/main.rs` and `tools/src/lib.rs` are in the sibling `tests.rs`. For quick loops use `cargo test -p <crate>` (REPL, editor and renderer tests: `cargo test -p rusty-claude-cli --bin claw`).
 
 ## Where things are
 - `crates/rusty-claude-cli` builds the `claw` binary: `main.rs` (args, REPL loop, provider/tool adapters), `input.rs` (line editor), `render.rs` (streaming markdown), `repl_commands.rs` (REPL-only slash commands).

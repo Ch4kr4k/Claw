@@ -257,7 +257,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "diff",
         aliases: &[],
         summary: "Show git diff for current workspace changes",
-        argument_hint: None,
+        argument_hint: Some("[--stat|--name-only]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -890,8 +890,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "undo",
         aliases: &[],
-        summary: "Undo the last file write or edit",
-        argument_hint: None,
+        summary: "Undo the last request's file changes; list checkpoints or undo several",
+        argument_hint: Some("[list|<n>]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1071,7 +1071,10 @@ pub enum SlashCommand {
     },
     Memory,
     Init,
-    Diff,
+    Diff {
+        /// `stat` or `name-only`; `None` for the full diff.
+        mode: Option<String>,
+    },
     Version,
     Export {
         path: Option<String>,
@@ -1200,7 +1203,7 @@ impl SlashCommand {
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
-            Self::Diff => "/diff",
+            Self::Diff { .. } => "/diff",
             Self::Status => "/status",
             Self::Stats => "/stats",
             Self::Version => "/version",
@@ -1660,10 +1663,16 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Init
         }
-        "diff" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Diff
-        }
+        "diff" => SlashCommand::Diff {
+            mode: match args.as_slice() {
+                [] => None,
+                ["--stat" | "stat"] => Some("stat".to_string()),
+                ["--name-only" | "name-only" | "--names" | "names"] => {
+                    Some("name-only".to_string())
+                }
+                _ => return Err(usage_error(command, "[--stat|--name-only]")),
+            },
+        },
         "version" => {
             validate_no_args(command, &args)?;
             SlashCommand::Version
@@ -1717,10 +1726,18 @@ pub fn validate_slash_command_input(
             SlashCommand::ReleaseNotes
         }
         "security-review" => SlashCommand::SecurityReview { scope: remainder },
-        "undo" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Undo
-        }
+        // `/undo list` and `/undo <n>` are `/rewind`'s listing and its
+        // undo of the newest n requests.
+        "undo" => match args.as_slice() {
+            [] => SlashCommand::Undo,
+            ["list" | "--list" | "-l"] => SlashCommand::Rewind { steps: None },
+            [n] | ["--to" | "--checkout", n] if n.parse::<usize>().is_ok_and(|n| n > 0) => {
+                SlashCommand::Rewind {
+                    steps: Some((*n).to_string()),
+                }
+            }
+            _ => return Err(usage_error(command, "[list|<n>]")),
+        },
         "retry" => {
             validate_no_args(command, &args)?;
             SlashCommand::Retry
@@ -5776,7 +5793,7 @@ pub fn handle_slash_command(
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
-        | SlashCommand::Diff
+        | SlashCommand::Diff { .. }
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
@@ -6196,7 +6213,35 @@ mod tests {
             Ok(Some(SlashCommand::Memory))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
-        assert_eq!(SlashCommand::parse("/diff"), Ok(Some(SlashCommand::Diff)));
+        assert_eq!(
+            SlashCommand::parse("/diff"),
+            Ok(Some(SlashCommand::Diff { mode: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/diff --stat"),
+            Ok(Some(SlashCommand::Diff {
+                mode: Some("stat".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/diff --name-only"),
+            Ok(Some(SlashCommand::Diff {
+                mode: Some("name-only".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/diff --bogus").is_err());
+        assert_eq!(SlashCommand::parse("/undo"), Ok(Some(SlashCommand::Undo)));
+        assert_eq!(
+            SlashCommand::parse("/undo list"),
+            Ok(Some(SlashCommand::Rewind { steps: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/undo --to 3"),
+            Ok(Some(SlashCommand::Rewind {
+                steps: Some("3".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/undo 0").is_err());
         assert_eq!(
             SlashCommand::parse("/version"),
             Ok(Some(SlashCommand::Version))

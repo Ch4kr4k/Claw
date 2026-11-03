@@ -370,10 +370,24 @@ impl LiveCli {
                     None => println!("  Estimated tokens ~{estimated} (context window unknown)"),
                 }
                 println!("  Compactions      {}", compaction_generation(session));
-                println!(
-                    "  System prompt    {} section(s)",
-                    self.effective_system_prompt().len()
-                );
+                if let Some(threshold) = crate::window_auto_compaction_threshold(&self.model) {
+                    println!("  Auto-compact at  ~{threshold} tokens");
+                }
+                let system_prompt = self.effective_system_prompt();
+                let tools = crate::current_tool_registry()
+                    .map(|registry| {
+                        crate::sent_tool_definitions(
+                            &registry,
+                            &self.model,
+                            self.allowed_tools.as_ref(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let breakdown = context_breakdown(&system_prompt, &tools, session);
+                println!("Where it goes (estimated, ~4 characters a token)");
+                for (label, tokens, detail) in &breakdown {
+                    println!("  {label:<16} ~{tokens:<7} {detail}");
+                }
                 let added = tools::additional_workspace_roots();
                 if !added.is_empty() {
                     println!("  Extra dirs       {}", added.len());
@@ -1130,6 +1144,72 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// `/context`'s rows: (category, estimated tokens, detail) for the system
+/// prompt, the tool definitions as sent, and the conversation by block kind,
+/// so a small window shows what to trim (compact, fewer tools, a new
+/// session).
+pub(crate) fn context_breakdown(
+    system_prompt: &[String],
+    tools: &[api::ToolDefinition],
+    session: &runtime::Session,
+) -> Vec<(&'static str, usize, String)> {
+    let tokens = |chars: usize| chars.div_ceil(4);
+    let prompt_chars: usize = system_prompt.iter().map(String::len).sum();
+    let tool_chars: usize = tools
+        .iter()
+        .map(|tool| serde_json::to_string(tool).map_or(0, |json| json.len()))
+        .sum();
+    let (mut text, mut calls, mut results, mut thinking, mut images) = (0, 0, 0, 0, 0usize);
+    let (mut call_count, mut result_count) = (0, 0);
+    for message in &session.messages {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text: body } => text += body.len(),
+                ContentBlock::ToolUse { name, input, .. } => {
+                    calls += name.len() + input.len();
+                    call_count += 1;
+                }
+                ContentBlock::ToolResult { output, .. } => {
+                    results += output.len();
+                    result_count += 1;
+                }
+                ContentBlock::Thinking { thinking: body, .. } => thinking += body.len(),
+                ContentBlock::Image { .. } => images += 1,
+            }
+        }
+    }
+    let mut rows = vec![
+        (
+            "System prompt",
+            tokens(prompt_chars),
+            format!("{} section(s)", system_prompt.len()),
+        ),
+        (
+            "Tool definitions",
+            tokens(tool_chars),
+            format!("{} tool(s) sent in full or via ToolSearch", tools.len()),
+        ),
+        ("Messages (text)", tokens(text), String::new()),
+        ("Tool calls", tokens(calls), format!("{call_count} call(s)")),
+        (
+            "Tool results",
+            tokens(results),
+            format!("{result_count} result(s)"),
+        ),
+    ];
+    if thinking > 0 {
+        rows.push(("Thinking", tokens(thinking), String::new()));
+    }
+    if images > 0 {
+        rows.push((
+            "Images",
+            images * 1_500,
+            format!("{images} image(s), ~1.5k each"),
+        ));
+    }
+    rows
 }
 
 #[cfg(test)]

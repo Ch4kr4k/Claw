@@ -722,9 +722,13 @@ fn ocr(input: &X11Input) -> Result<Value, String> {
     }))
 }
 
+/// A screen box as (left, top, right, bottom) pixels, or tesseract's
+/// (block, paragraph, line, word) key that identifies one text line.
+type Quad = (i64, i64, i64, i64);
+
 /// Lines from tesseract's TSV: their words joined, with screen boxes.
 fn ocr_lines(tsv: &str, origin_x: i64, origin_y: i64) -> Vec<Value> {
-    let mut lines: Vec<((i64, i64, i64, i64), Vec<String>, (i64, i64, i64, i64))> = Vec::new();
+    let mut lines: Vec<(Quad, Vec<String>, Quad)> = Vec::new();
     for row in tsv.lines().skip(1) {
         let fields: Vec<&str> = row.split('\t').collect();
         if fields.len() < 12 || fields[0] != "5" {

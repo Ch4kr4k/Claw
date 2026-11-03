@@ -328,8 +328,7 @@ fn post_id(url: &str) -> String {
         .and_then(|parsed| {
             parsed
                 .path_segments()?
-                .filter(|segment| !segment.is_empty())
-                .last()
+                .rfind(|segment| !segment.is_empty())
                 .map(str::to_string)
         })
         .unwrap_or_default()

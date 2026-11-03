@@ -68,7 +68,7 @@ fn extract_target_post_id(final_url: &str) -> Option<String> {
         }
     }
 
-    let last = url.path_segments()?.filter(|s| !s.is_empty()).next_back()?;
+    let last = url.path_segments()?.rfind(|s| !s.is_empty())?;
     if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) {
         Some(last.to_string())
     } else {

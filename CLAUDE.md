@@ -9,7 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Verification
 - Formatting from repo root: `scripts/fmt.sh --check` (apply with `scripts/fmt.sh`). Do not run `cargo fmt --manifest-path rust/Cargo.toml`.
 - From `rust/`: `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`.
-  - `-D warnings` currently fails on pre-existing lints in `rusty-claude-cli` (main.rs, setup_wizard.rs, tests/output_format_contract.rs). Make sure your change adds no new ones; CI runs clippy without `-D warnings`.
+  - The workspace is clean under `-D warnings` (since 2026-11-03); keep it that way. CI runs clippy without `-D warnings`, so check locally.
+  - Unit tests of `rusty-claude-cli/src/main.rs` and `tools/src/lib.rs` live in the sibling `tests.rs` (`mod tests;`).
   - Faster loops: `cargo test -p <crate>`, e.g. `cargo test -p rusty-claude-cli --bin claw` for REPL/editor tests.
 - Python side: `python -m unittest discover -s tests`.
 - `src/` and `tests/` are both present; update both surfaces together when Python behavior changes.
