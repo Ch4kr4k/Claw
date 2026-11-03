@@ -60,7 +60,7 @@ Dependency rules that matter:
 
 | File | Role |
 |---|---|
-| `main.rs` (~20k lines) | `main()` (L335) is only the error envelope; `run()` (L1000) dispatches the `CliAction` enum (L1168) built by the hand-rolled `parse_args` (L1484). `run_repl` (L7035) and `LiveCli` (L7147) drive the interactive session. `AnthropicRuntimeClient` (L12730) adapts `api` to the runtime's `ApiClient` trait; `CliToolExecutor` (L14024) adapts `tools`; `CliPermissionPrompter` (L12614) asks the user. Tests start at L14547. |
+| `main.rs` (~16k lines) | `main()` is only the error envelope; `run()` dispatches the `CliAction` enum built by `parse_args` (both in `cli_args.rs`). `run_repl` and `LiveCli` drive the interactive session; `LiveCli`'s methods are split into `live_turn.rs` (turns), `live_session.rs` (session/model/permission state) and `live_reports.rs` (read-only reports). `AnthropicRuntimeClient` (`provider_client.rs`) adapts `api` to the runtime's `ApiClient` trait; `CliToolExecutor` (`tool_executor.rs`) adapts `tools`; `CliPermissionPrompter` (`permission_prompt.rs`) asks the user. Unit tests are in `tests.rs`. |
 | `input.rs` | Raw-mode line editor (crossterm): markdown highlighting, multi-line input, paste placeholders, `/` command menu, tab completion, persistent history, Ctrl+C handling |
 | `render.rs` | Streaming markdown renderer (word-by-word text, syntax-highlighted code via syntect, buffered tables), tool-call lines, diffs, the "thinking" animation, themes |
 | `repl_commands.rs` | REPL-only commands: checkpoints (`/undo`, `/rewind`), `/plan`, `/effort`, `/usage`, `/context`, `/tasks`, `/files`, `/copy`, `/paste`, `/image`, `/theme`, `/retry`, `/add-dir`, `/rename`, prompt-backed review commands |

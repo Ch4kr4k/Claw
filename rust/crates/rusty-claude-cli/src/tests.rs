@@ -4980,6 +4980,9 @@ fn broken_images_in_a_reply_are_sent_back_to_the_model() {
 
 #[test]
 fn images_go_to_a_text_only_model_as_text() {
+    // No `visionModel` from the developer's own settings: describing the
+    // image would call (and could start) their real model server.
+    let _config = CleanConfig::enter();
     assert!(super::is_image_refusal(
         r#"api returned 404 Not Found: {"error":{"message":"No endpoints found that support image input"}}"#
     ));
