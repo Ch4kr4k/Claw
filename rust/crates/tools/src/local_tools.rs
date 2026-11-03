@@ -23,15 +23,18 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "Monitor",
-            description: "Run a command in the background and get each batch of new output lines back as a notice, so you can react to log lines, file changes or polled status while the conversation goes on (even while the user's prompt is idle). Filter the command's output to the lines you would act on (grep --line-buffered), and cover failures as well as success: silence looks like still-running. It stops after timeout_ms (default 5 minutes, at most 1 hour), on exit, or when it prints more than 600 lines a minute. Stop it early with TaskStop or KillShell.",
+            description: "Watch something in the background and get each batch of new lines back as a notice, so you can react to log lines, file changes, test results or events while the conversation goes on (even while the user's prompt is idle), instead of polling. Give exactly one source: `command` (a shell command; filter it to the lines you would act on with grep --line-buffered, and cover failures as well as success: silence looks like still-running), `task_id` (a shell already started with bash run_in_background: its new output, without restarting it), or `websocket_url` (ws://host:port/path; each message is an event; `websocket_send` is sent first, e.g. a subscribe message). It stops after timeout_ms (default 5 minutes, at most 1 hour), on exit, or at more than 600 lines a minute; a watched task_id keeps running when the watching stops. Stop it early with TaskStop or KillShell.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command; each stdout/stderr line is an event." },
+                    "task_id": { "type": "string", "description": "Id of a running background shell (bash run_in_background) to watch." },
+                    "websocket_url": { "type": "string", "description": "ws://host:port/path to read messages from (plain ws only; for wss run `websocat` as the command)." },
+                    "websocket_send": { "type": "string", "description": "Text message sent once after connecting." },
                     "description": { "type": "string", "description": "What is being watched, shown with every event." },
                     "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 3_600_000 }
                 },
-                "required": ["command", "description"],
+                "required": ["description"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::DangerFullAccess,
@@ -230,21 +233,53 @@ fn from<T: for<'de> Deserialize<'de>>(input: Value) -> Result<T, String> {
 
 #[derive(Deserialize)]
 struct MonitorInput {
-    command: String,
+    command: Option<String>,
+    task_id: Option<String>,
+    websocket_url: Option<String>,
+    websocket_send: Option<String>,
     description: String,
     timeout_ms: Option<u64>,
 }
 
 fn monitor(input: MonitorInput) -> Result<String, String> {
-    if input.command.trim().is_empty() {
-        return Err("command must not be empty".to_string());
-    }
     let timeout =
         Duration::from_millis(input.timeout_ms.unwrap_or(300_000).clamp(1_000, 3_600_000));
+    let given = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let sources = [&input.command, &input.task_id, &input.websocket_url]
+        .into_iter()
+        .filter(|value| given(value))
+        .count();
+    if sources != 1 {
+        return Err("give exactly one of command, task_id or websocket_url".to_string());
+    }
+    let jobs = runtime::global_background_jobs();
+    if let Some(task_id) = input.task_id.as_deref().filter(|_| given(&input.task_id)) {
+        let task_id = task_id.trim();
+        jobs.attach_monitor(task_id, &input.description, timeout)?;
+        return to_pretty_json(json!({
+            "monitor_id": task_id,
+            "description": input.description,
+            "timeout_secs": timeout.as_secs(),
+            "message": format!("Watching {task_id}: its new output arrives as notices. The shell keeps running after the watching stops; KillShell(\"{task_id}\") stops the shell."),
+        }));
+    }
+    if let Some(url) = input
+        .websocket_url
+        .as_deref()
+        .filter(|_| given(&input.websocket_url))
+    {
+        return monitor_websocket(
+            url.trim(),
+            input.websocket_send,
+            &input.description,
+            timeout,
+        );
+    }
+    let command_text = input.command.unwrap_or_default();
     let mut command = Command::new(runtime::shell_program());
-    command.arg("-c").arg(&input.command);
-    let id = runtime::global_background_jobs()
-        .start_monitor(command, &input.command, &input.description, timeout)
+    command.arg("-c").arg(&command_text);
+    let id = jobs
+        .start_monitor(command, &command_text, &input.description, timeout)
         .map_err(|error| format!("could not start the monitor: {error}"))?;
     to_pretty_json(json!({
         "monitor_id": id,
@@ -252,6 +287,219 @@ fn monitor(input: MonitorInput) -> Result<String, String> {
         "timeout_secs": timeout.as_secs(),
         "message": format!("Monitor {id} started. New output arrives as notices; stop it with TaskStop(\"{id}\")."),
     }))
+}
+
+/// `ws://host[:port]/path` as (host, port, path-with-query).
+fn parse_ws_url(url: &str) -> Result<(String, u16, String), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| format!("invalid websocket_url: {error}"))?;
+    match parsed.scheme() {
+        "ws" => {}
+        "wss" => {
+            return Err(
+                "wss:// is not supported directly; use command: \"websocat -t wss://…\" instead"
+                    .to_string(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "websocket_url must start with ws:// (got {other}://)"
+            ))
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or("websocket_url has no host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let mut path = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok((host, parsed.port().unwrap_or(80), path))
+}
+
+/// The WebSocket source: connects first (so a wrong address fails the call),
+/// then relays each message as lines into a monitor feed until the socket
+/// closes, the monitor is stopped, or it times out.
+fn monitor_websocket(
+    url: &str,
+    send: Option<String>,
+    description: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    use std::io::Write as _;
+    let (host, port, path) = parse_ws_url(url)?;
+    // Short reads so a stopped monitor is noticed while the socket is idle.
+    let mut socket = crate::browser::WebSocket::connect_to(
+        &host,
+        port,
+        &path,
+        Some(Duration::from_secs(2)),
+        "the WebSocket server",
+    )?;
+    if let Some(message) = send.filter(|m| !m.is_empty()) {
+        socket.send(&message)?;
+    }
+    let jobs = runtime::global_background_jobs();
+    let (id, mut feed) = jobs
+        .start_monitor_feed(url, description, timeout)
+        .map_err(|error| format!("could not start the monitor: {error}"))?;
+    let watched = id.clone();
+    std::thread::spawn(move || loop {
+        if !jobs.running_ids().contains(&watched) {
+            return;
+        }
+        let line = match socket.wait_readable() {
+            Ok(false) => continue,
+            Ok(true) => match socket.receive() {
+                Ok(message) => message,
+                Err(error) => format!("[websocket: {error}]"),
+            },
+            Err(error) => format!("[websocket: {error}]"),
+        };
+        let closed = line.starts_with("[websocket: ");
+        // A failed write means the monitor was stopped.
+        if writeln!(feed, "{line}")
+            .and_then(|()| feed.flush())
+            .is_err()
+            || closed
+        {
+            return; // dropping the feed ends the monitor
+        }
+    });
+    to_pretty_json(json!({
+        "monitor_id": id,
+        "description": description,
+        "timeout_secs": timeout.as_secs(),
+        "message": format!("Monitor {id} connected to {url}. Each message arrives as a notice; stop it with TaskStop(\"{id}\")."),
+    }))
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn ws_urls_parse_and_other_schemes_are_refused() {
+        assert_eq!(
+            parse_ws_url("ws://127.0.0.1:9000/events?topic=ci").unwrap(),
+            (
+                "127.0.0.1".to_string(),
+                9000,
+                "/events?topic=ci".to_string()
+            )
+        );
+        assert_eq!(parse_ws_url("ws://example.com").unwrap().1, 80);
+        assert!(parse_ws_url("wss://example.com")
+            .unwrap_err()
+            .contains("websocat"));
+        assert!(parse_ws_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn monitor_needs_exactly_one_source() {
+        let input = |value: Value| from::<MonitorInput>(value).and_then(monitor);
+        for value in [
+            json!({"description": "x"}),
+            json!({"description": "x", "command": "true", "task_id": "bg1"}),
+        ] {
+            assert!(input(value).unwrap_err().contains("exactly one"));
+        }
+        assert!(input(json!({"description": "x", "task_id": "bg-missing"}))
+            .unwrap_err()
+            .contains("no background shell"));
+    }
+
+    /// A one-connection WebSocket server: answers the handshake, reads the
+    /// client's first (masked) frame, then sends `messages` as text frames.
+    fn serve_once(messages: Vec<&'static str>) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            let mut writer = stream;
+            // The accept key is not checked by the client.
+            writer
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+                .unwrap();
+            let mut head = [0u8; 2];
+            reader.read_exact(&mut head).unwrap();
+            let len = usize::from(head[1] & 0x7f);
+            let mut mask = [0u8; 4];
+            reader.read_exact(&mut mask).unwrap();
+            let mut payload = vec![0u8; len];
+            reader.read_exact(&mut payload).unwrap();
+            let sent: Vec<u8> = payload
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ mask[i % 4])
+                .collect();
+            for message in messages {
+                let mut frame = vec![0x81, u8::try_from(message.len()).unwrap()];
+                frame.extend_from_slice(message.as_bytes());
+                writer.write_all(&frame).unwrap();
+            }
+            writer.write_all(&[0x88, 0]).unwrap(); // close
+            String::from_utf8(sent).unwrap()
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn websocket_messages_become_monitor_notices() {
+        let (port, server) = serve_once(vec!["build started", "build passed"]);
+        let result = input_ok(json!({
+            "description": "ci socket",
+            "websocket_url": format!("ws://127.0.0.1:{port}/events"),
+            "websocket_send": "subscribe ci",
+            "timeout_ms": 20_000
+        }));
+        assert_eq!(server.join().expect("server"), "subscribe ci");
+        let id = result["monitor_id"].as_str().expect("id").to_string();
+        let jobs = runtime::global_background_jobs();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = String::new();
+        // Other tests share the global notices; keep only this monitor's.
+        while std::time::Instant::now() < deadline
+            && !(seen.contains("build passed") && seen.contains("ended"))
+        {
+            for notice in jobs.drain_notices() {
+                if notice.contains(&format!("Monitor {id} ")) {
+                    seen.push_str(&notice);
+                    seen.push('\n');
+                } else {
+                    jobs.push_notice(notice);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            seen.contains("build started") && seen.contains("build passed"),
+            "{seen}"
+        );
+        assert!(seen.contains("closed the connection"), "{seen}");
+        assert!(seen.contains("ended"), "{seen}");
+    }
+
+    fn input_ok(value: Value) -> Value {
+        let text = from::<MonitorInput>(value)
+            .and_then(monitor)
+            .expect("monitor");
+        serde_json::from_str(&text).expect("json")
+    }
 }
 
 // ───────────────────────────── worktrees ─────────────────────────────

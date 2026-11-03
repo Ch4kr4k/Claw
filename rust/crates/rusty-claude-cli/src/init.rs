@@ -16,7 +16,14 @@ const STARTER_SETTINGS_JSON: &str = concat!(
     "}\n",
 );
 const GITIGNORE_COMMENT: &str = "# Claw Code local artifacts";
-const GITIGNORE_ENTRIES: [&str; 3] = [".claw/settings.local.json", ".claw/sessions/", ".clawhip/"];
+const GITIGNORE_ENTRIES: [&str; 5] = [
+    ".claw/settings.local.json",
+    ".claw/sessions/",
+    ".clawhip/",
+    // TodoWrite's checklist and its events log, written to the project root.
+    ".clawd-todos.json",
+    ".clawd-todos.events.jsonl",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InitStatus {
@@ -528,6 +535,7 @@ mod tests {
         assert_eq!(gitignore.matches(".claw/settings.local.json").count(), 1);
         assert_eq!(gitignore.matches(".claw/sessions/").count(), 1);
         assert_eq!(gitignore.matches(".clawhip/").count(), 1);
+        assert_eq!(gitignore.matches(".clawd-todos.events.jsonl").count(), 1);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

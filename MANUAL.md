@@ -673,7 +673,7 @@ mode on and starts planning that task.
 | `/review [scope]`, `/security-review [scope]`, `/bughunter [scope]` | Ask the model for a review |
 | `/simplify [focus]` | Have the model clean up the changed code (reuse, simpler logic, style) and apply it |
 | `/pr-comments [pr]` | Summarize a GitHub PR's comments with `gh` (default: the current branch's PR) |
-| `/todos` | Show the model's current todo list |
+| `/todos` | Show the model's current todo list. Each change is also logged as a typed event (`task.created`, `task.started`, `task.completed`, `task.reopened`, `task.removed`, with the task and a timestamp) to `.clawd-todos.events.jsonl` beside `.clawd-todos.json`, for scripts and status tools; `claw init` gitignores both |
 | `/run [what]`, `/verify [what]` | Have the model launch the app and drive it / confirm a change works by running it, not only tests |
 | `/deep-research <question>` | Web research across sources with a cited report |
 | `/update-config <request>` | Describe a settings change; the model edits the right settings file |
@@ -765,7 +765,15 @@ new output lines (a log line, a test result) reaches it as soon as it
 appears, and it can react while you are idle. Monitors stop after their
 timeout (5 minutes by default, at most an hour), when the command exits, or
 when they print more than 600 lines a minute. `/tasks stop <id>` stops one
-early.
+early. Besides a command, a monitor can watch:
+
+- a shell already running in the background (`task_id`, e.g. a build started
+  with `run_in_background`): its new output arrives as notices, without
+  restarting it or polling with BashOutput. When the watching stops (timeout
+  or flood), the shell keeps running;
+- a WebSocket (`websocket_url`, plain `ws://host:port/path`, with an optional
+  first message such as a subscription): each message is an event. For
+  `wss://`, the agent runs `websocat` as the command instead.
 
 **Scheduled prompts.** The agent can schedule a prompt in this session with
 a cron expression (the CronCreate tool, e.g. `*/10 * * * *`, local time),

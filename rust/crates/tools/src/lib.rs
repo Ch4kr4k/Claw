@@ -4221,6 +4221,9 @@ struct TodoWriteOutput {
     new_todos: Vec<TodoItem>,
     #[serde(rename = "verificationNudgeNeeded")]
     verification_nudge_needed: Option<bool>,
+    /// What changed, as typed events (also appended to the events log).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    events: Vec<todo_events::TodoEvent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5284,10 +5287,14 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
             .any(|todo| todo.content.to_lowercase().contains("verif")))
     .then_some(true);
 
+    let events = todo_events::diff(&old_todos, &input.todos, todo_events::now_ms());
+    todo_events::append(&store_path, &events);
+
     Ok(TodoWriteOutput {
         old_todos,
         new_todos: input.todos,
         verification_nudge_needed,
+        events,
     })
 }
 
@@ -8571,6 +8578,7 @@ mod search_fallback;
 mod session_search;
 mod signals;
 mod social;
+mod todo_events;
 
 /// Fingerprints a memory anchor's code, for `runtime::set_anchor_hasher`.
 #[must_use]

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -113,7 +113,8 @@ pub fn global_background_jobs() -> &'static BackgroundJobs {
 impl BackgroundJobs {
     /// Spawns `command` with piped output and registers it. Returns the job id.
     pub fn start(&self, command: Command, display: &str) -> std::io::Result<String> {
-        self.start_job(command, display, true)
+        self.start_job(command, display, true, false)
+            .map(|(id, _)| id)
     }
 
     /// Like [`Self::start`], for the `Monitor` tool: each batch of new output
@@ -128,14 +129,59 @@ impl BackgroundJobs {
         description: &str,
         timeout: Duration,
     ) -> std::io::Result<String> {
-        let id = self.start_job(command, display, false)?;
+        let (id, _) = self.start_job(command, display, false, false)?;
         let poll_id = id.clone();
         let description = description.to_string();
-        thread::spawn(move || self.watch_monitor(&poll_id, &description, timeout));
+        thread::spawn(move || self.watch_monitor(&poll_id, &description, timeout, true));
         Ok(id)
     }
 
-    fn watch_monitor(&self, id: &str, description: &str, timeout: Duration) {
+    /// A monitor fed by the caller instead of a command: each line written
+    /// to the returned stdin is an event (a `cat` job relays them, so
+    /// TaskStop, the timeout, the flood limit and `/tasks` work as for any
+    /// monitor). Used for `Monitor`'s WebSocket source. When the job is
+    /// stopped, writes to the stdin fail; the feeder should then stop.
+    pub fn start_monitor_feed(
+        &'static self,
+        display: &str,
+        description: &str,
+        timeout: Duration,
+    ) -> std::io::Result<(String, ChildStdin)> {
+        let (id, stdin) = self.start_job(Command::new("cat"), display, false, true)?;
+        let stdin = stdin.ok_or_else(|| std::io::Error::other("no stdin for the monitor feed"))?;
+        let poll_id = id.clone();
+        let description = description.to_string();
+        thread::spawn(move || self.watch_monitor(&poll_id, &description, timeout, true));
+        Ok((id, stdin))
+    }
+
+    /// Watches the new output of an already running job (a
+    /// `bash(run_in_background)` shell) as monitor notices. The job is not
+    /// owned: at the timeout or the flood limit only the watching stops, and
+    /// its exit is announced by the job itself. Shares the read position
+    /// with `BashOutput`.
+    pub fn attach_monitor(
+        &'static self,
+        id: &str,
+        description: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let job = self
+            .get(id)
+            .ok_or_else(|| format!("no background shell with id {id}"))?;
+        let state = *job.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state != JobState::Running {
+            return Err(format!("background shell {id} is not running ({state})"));
+        }
+        let poll_id = id.to_string();
+        let description = description.to_string();
+        thread::spawn(move || self.watch_monitor(&poll_id, &description, timeout, false));
+        Ok(())
+    }
+
+    /// `owned`: the monitor started the job, so it is killed at the timeout
+    /// or flood limit and its exit is announced here.
+    fn watch_monitor(&self, id: &str, description: &str, timeout: Duration, owned: bool) {
         let started = Instant::now();
         let mut window = (Instant::now(), 0_usize);
         loop {
@@ -165,6 +211,12 @@ impl BackgroundJobs {
                     ));
                 }
                 self.push_notice(notice);
+                if window.1 > MONITOR_MAX_LINES_PER_MINUTE && !owned {
+                    self.push_notice(format!(
+                        "Stopped watching {id} ({description}): more than {MONITOR_MAX_LINES_PER_MINUTE} lines a minute. The shell keeps running; read it with BashOutput."
+                    ));
+                    return;
+                }
                 if window.1 > MONITOR_MAX_LINES_PER_MINUTE {
                     let _ = self.kill(id);
                     self.push_notice(format!(
@@ -174,6 +226,13 @@ impl BackgroundJobs {
                 }
             }
             match read.state {
+                JobState::Running if started.elapsed() >= timeout && !owned => {
+                    self.push_notice(format!(
+                        "Stopped watching {id} ({description}) after {}s; the shell keeps running.",
+                        timeout.as_secs()
+                    ));
+                    return;
+                }
                 JobState::Running if started.elapsed() >= timeout => {
                     let _ = self.kill(id);
                     self.push_notice(format!(
@@ -184,6 +243,8 @@ impl BackgroundJobs {
                 }
                 JobState::Running => {}
                 JobState::Killed => return,
+                // The shell announces its own exit.
+                JobState::Exited(_) if !owned => return,
                 JobState::Exited(_) => {
                     self.push_notice(format!(
                         "Monitor {id} ({description}) ended: {}.",
@@ -200,9 +261,14 @@ impl BackgroundJobs {
         mut command: Command,
         display: &str,
         announce_exit: bool,
-    ) -> std::io::Result<String> {
+        piped_stdin: bool,
+    ) -> std::io::Result<(String, Option<ChildStdin>)> {
         command
-            .stdin(Stdio::null())
+            .stdin(if piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -212,6 +278,7 @@ impl BackgroundJobs {
             command.process_group(0);
         }
         let mut child = command.spawn()?;
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let id = {
@@ -240,7 +307,7 @@ impl BackgroundJobs {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), job);
-        Ok(id)
+        Ok((id, stdin))
     }
 
     fn get(&self, id: &str) -> Option<Arc<Job>> {
@@ -566,6 +633,69 @@ mod tests {
         }
         assert!(buffer.text.len() <= MAX_BUFFER_BYTES);
         assert!(buffer.dropped > 0);
+    }
+
+    /// Notices of `jobs` until one contains `needle` (or 5 seconds pass).
+    fn wait_notice(jobs: &BackgroundJobs, needle: &str, seen: &mut Vec<String>) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            seen.extend(jobs.drain_notices());
+            if seen.iter().any(|notice| notice.contains(needle)) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn a_fed_monitor_turns_written_lines_into_notices_and_stops_cleanly() {
+        use std::io::Write as _;
+        let jobs: &'static BackgroundJobs = Box::leak(Box::default());
+        let (id, mut feed) = jobs
+            .start_monitor_feed("ws://demo", "demo socket", Duration::from_secs(30))
+            .expect("start feed");
+        writeln!(feed, "event one").expect("write");
+        writeln!(feed, "event two").expect("write");
+        let mut seen = Vec::new();
+        assert!(wait_notice(jobs, "event two", &mut seen), "{seen:?}");
+        assert!(seen
+            .iter()
+            .any(|n| n.contains(&format!("Monitor {id} (demo socket)"))));
+
+        jobs.kill(&id).expect("stop");
+        // The feeder learns the monitor is gone from a failed write.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut failed = false;
+        while Instant::now() < deadline && !failed {
+            failed = writeln!(feed, "late").and_then(|()| feed.flush()).is_err();
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(failed, "writes should fail once the monitor is stopped");
+    }
+
+    #[test]
+    fn an_attached_monitor_stops_watching_at_timeout_but_leaves_the_shell_running() {
+        let jobs: &'static BackgroundJobs = Box::leak(Box::default());
+        let id = jobs
+            .start(sh("echo tick1; sleep 0.3; echo tick2; sleep 30"), "ticker")
+            .expect("start");
+        jobs.attach_monitor(&id, "ticker", Duration::from_secs(1))
+            .expect("attach");
+        let mut seen = Vec::new();
+        assert!(wait_notice(jobs, "tick2", &mut seen), "{seen:?}");
+        assert!(wait_notice(jobs, "Stopped watching", &mut seen), "{seen:?}");
+        assert!(
+            jobs.running_ids().contains(&id),
+            "the shell must keep running"
+        );
+        assert!(jobs
+            .attach_monitor("bg-nope", "x", Duration::from_secs(1))
+            .is_err());
+        jobs.kill(&id).expect("kill");
+        assert!(jobs
+            .attach_monitor(&id, "again", Duration::from_secs(1))
+            .is_err_and(|error| error.contains("not running")));
     }
 
     #[test]

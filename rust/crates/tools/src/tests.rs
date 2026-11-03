@@ -1476,6 +1476,7 @@ fn todo_list_renders_progress_and_marks() {
     .expect("TodoWrite should succeed");
     let rendered = super::render_todo_list();
     std::env::remove_var("CLAWD_TODO_STORE");
+    let _ = std::fs::remove_file(crate::todo_events::log_path(&path));
     let _ = std::fs::remove_file(path);
 
     assert!(empty.starts_with("No todos"));
@@ -1518,6 +1519,7 @@ fn todo_write_persists_and_returns_previous_state() {
     )
     .expect("TodoWrite should succeed");
     std::env::remove_var("CLAWD_TODO_STORE");
+    let _ = std::fs::remove_file(crate::todo_events::log_path(&path));
     let _ = std::fs::remove_file(path);
 
     let second_output: serde_json::Value = serde_json::from_str(&second).expect("valid json");
@@ -1579,6 +1581,7 @@ fn todo_write_rejects_invalid_payloads_and_sets_verification_nudge() {
     )
     .expect("completed todos should succeed");
     std::env::remove_var("CLAWD_TODO_STORE");
+    let _ = fs::remove_file(crate::todo_events::log_path(&path));
     let _ = fs::remove_file(path);
 
     let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
@@ -3002,6 +3005,7 @@ fn notebook_edit_replaces_inserts_and_deletes_cells() {
     assert!(cells[0].get("outputs").is_none());
     assert_eq!(cells[1]["cell_type"], "code");
     assert_eq!(cells[1]["source"][0], "print(3)\n");
+    let _ = std::fs::remove_file(crate::todo_events::log_path(&path));
     let _ = std::fs::remove_file(path);
 }
 

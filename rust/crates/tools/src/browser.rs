@@ -648,21 +648,35 @@ fn virtual_key(name: &str) -> u32 {
 
 // ------------------------------------------------------- a small WebSocket
 
-/// Enough of RFC 6455 for Chrome on localhost: text frames, fragments,
-/// pings.
-struct WebSocket {
+/// Enough of RFC 6455 (plain `ws://`) for Chrome's DevTools and simple
+/// event sources: text frames, fragments, pings.
+pub(crate) struct WebSocket {
     stream: BufReader<TcpStream>,
+    /// Who is on the other end, for error messages ("Chrome").
+    peer: &'static str,
 }
 
 impl WebSocket {
     fn connect(port: u16, path: &str) -> Result<Self, String> {
-        let stream = TcpStream::connect(("127.0.0.1", port)).map_err(|error| error.to_string())?;
-        stream.set_read_timeout(Some(CALL_TIMEOUT)).ok();
+        Self::connect_to("127.0.0.1", port, path, Some(CALL_TIMEOUT), "Chrome")
+    }
+
+    /// Opens `ws://host:port/path`; reads give up after `read_timeout`.
+    pub(crate) fn connect_to(
+        host: &str,
+        port: u16,
+        path: &str,
+        read_timeout: Option<Duration>,
+        peer: &'static str,
+    ) -> Result<Self, String> {
+        let stream = TcpStream::connect((host, port))
+            .map_err(|error| format!("could not connect to {peer} at {host}:{port}: {error}"))?;
+        stream.set_read_timeout(read_timeout).ok();
         let key = base64_encode(&random_bytes::<16>());
         let mut writer = stream.try_clone().map_err(|error| error.to_string())?;
         write!(
             writer,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )
         .map_err(|error| error.to_string())?;
@@ -672,7 +686,7 @@ impl WebSocket {
             .read_line(&mut status)
             .map_err(|error| error.to_string())?;
         if !status.contains(" 101 ") {
-            return Err(format!("Chrome refused the connection: {}", status.trim()));
+            return Err(format!("{peer} refused the connection: {}", status.trim()));
         }
         loop {
             let mut line = String::new();
@@ -683,10 +697,32 @@ impl WebSocket {
                 break;
             }
         }
-        Ok(Self { stream: reader })
+        Ok(Self {
+            stream: reader,
+            peer,
+        })
     }
 
-    fn send(&mut self, text: &str) -> Result<(), String> {
+    /// Waits for data within the read timeout without consuming anything:
+    /// `Ok(true)` when a frame is ready, `Ok(false)` on a timeout (so the
+    /// caller can check whether to keep waiting), `Err` when closed.
+    pub(crate) fn wait_readable(&mut self) -> Result<bool, String> {
+        match self.stream.fill_buf() {
+            Ok([]) => Err(format!("{} closed the connection", self.peer)),
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(format!("lost the connection to {}: {error}", self.peer)),
+        }
+    }
+
+    pub(crate) fn send(&mut self, text: &str) -> Result<(), String> {
         self.send_frame(0x1, text.as_bytes())
     }
 
@@ -719,7 +755,7 @@ impl WebSocket {
     }
 
     /// The next text message.
-    fn receive(&mut self) -> Result<String, String> {
+    pub(crate) fn receive(&mut self) -> Result<String, String> {
         let mut message = Vec::new();
         loop {
             let mut head = [0u8; 2];
@@ -751,7 +787,7 @@ impl WebSocket {
                 }
             }
             match opcode {
-                0x8 => return Err("Chrome closed the connection".to_string()),
+                0x8 => return Err(format!("{} closed the connection", self.peer)),
                 0x9 => self.send_frame(0xA, &payload)?,
                 0xA => {}
                 _ => {
@@ -767,7 +803,7 @@ impl WebSocket {
     fn read_exact(&mut self, buffer: &mut [u8]) -> Result<(), String> {
         self.stream
             .read_exact(buffer)
-            .map_err(|error| format!("lost the connection to Chrome: {error}"))
+            .map_err(|error| format!("lost the connection to {}: {error}", self.peer))
     }
 }
 

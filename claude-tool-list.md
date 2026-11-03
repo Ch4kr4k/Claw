@@ -48,7 +48,7 @@ Note for local setups: the `claw` launcher in `~/.local/bin` passes `--allowedTo
 |ListAgents|Lists this session's sub-agents (id, name, status, queued messages), plus background claw sessions and background shells for reference. No other local or cloud Claude sessions, no Remote Control.|No|yes|opus|
 |ListMcpResourcesTool|`ListMcpResources`: resources of connected MCP servers, through the CLI's MCP manager.|No|yes|claw|
 |LSP|A real language-server client: goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, call hierarchy, diagnostics. Built in: rust-analyzer, pyright/basedpyright/pylsp, typescript-language-server, gopls, clangd, jdtls, lua-language-server, solargraph/ruby-lsp, zls (first found on PATH). Others via `lspServers` in settings. Servers stay up for the session.|No|yes|claw, opus|
-|Monitor|Runs a command in the background; each batch of new output lines becomes a notice, delivered between steps and waking an idle prompt. Stops on timeout (default 5 min, max 1 h), on exit, or above 600 lines a minute. No WebSocket source.|Yes|yes|opus|
+|Monitor|Runs a command in the background; each batch of new output lines becomes a notice, delivered between steps and waking an idle prompt. Stops on timeout (default 5 min, max 1 h), on exit, or above 600 lines a minute. Sources: a command, a running background shell (`task_id`, watched without being killed) or a `ws://` WebSocket (`websocket_url`, optional `websocket_send`).|Yes|yes|opus|
 |NotebookEdit|Replaces, inserts or deletes Jupyter notebook cells.|Yes|yes|claw|
 |PowerShell|Runs PowerShell commands when `pwsh`/`powershell` is installed.|Yes|yes|claw|
 |PushNotification|Desktop notification via `notify-send` (Linux) or `osascript` (macOS), plus the terminal's OSC 9 notification. No phone push; that needs Anthropic's hosted Remote Control.|No|yes|opus|
@@ -69,7 +69,7 @@ Note for local setups: the `claw` launcher in `~/.local/bin` passes `--allowedTo
 |TaskOutput|New output of a background shell or monitor (by job id), else a task's recorded output. `BashOutput` does the same for shells.|No|yes|claw, opus|
 |TaskStop|Stops a background shell or monitor by job id (with its final output), else marks a task stopped. Running sub-agent threads cannot be stopped.|No|yes|claw, opus|
 |TaskUpdate|Updates a task's status or details.|No|yes|claw|
-|TodoWrite|Manages the session checklist (shown in the transcript).|No|yes|claw|
+|TodoWrite|Manages the session checklist (shown in the transcript). Returns and logs typed `task.*` events (`.clawd-todos.events.jsonl`).|No|yes|claw|
 |ToolSearch|Searches for and loads deferred tools, including MCP tools.|No|yes|claw|
 |WaitForMcpServers|Reports each MCP server's status (connected or failed, with the error). Claw connects MCP servers when the session or `/mcp reconnect` builds the runtime, so there is no background connection to wait for; failed ones are retried with `/mcp reconnect`.|No|yes|opus|
 |WebFetch|Fetches a URL and returns its text (HTML converted), with the HTTP status.|Yes|yes|claw|

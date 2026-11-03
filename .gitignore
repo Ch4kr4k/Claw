@@ -11,6 +11,7 @@ archive/
 .claw
 .claw.json
 .clawd-todos.json
+.clawd-todos.events.jsonl
 .dockerignore
 .git
 .github
@@ -47,6 +48,7 @@ target/
 .omx/
 # Claw workspace local configs (root and per-crate)
 rust/.clawd-todos.json
+rust/.clawd-todos.events.jsonl
 rust/.claw.json
 
 # Explicitly track all dotfiles except .gitignore (which is tracked by default)
