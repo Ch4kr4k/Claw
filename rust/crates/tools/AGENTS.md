@@ -47,3 +47,9 @@ Single-crate tool surface: registry, 60 tool specs, permission-gated dispatch, a
 - **Don't scatter implementation across new submodules.** The crate is intentionally flat (one lib.rs + two leaf mods). Only `lane_completion` and `pdf_extract` break out.
 - **Don't duplicate tool names.** The canonical name mapping already handles aliases.
 - **Don't bypass `enforce_permission_check`.** Every tool dispatch goes through permission gating. No exceptions.
+
+## API TOOLS
+
+- `github.rs`: `GitHub` (read-only) and `GitHubWrite` (full access) over the REST API with reqwest; token from `GITHUB_TOKEN`/`GH_TOKEN`/`gh auth token`. Results are compact text lines, not raw JSON.
+- `huggingface.rs`: `HuggingFace` (read-only) over the Hub API; token from `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN`/`$HF_HOME/token`. Downloads go through the `Download` tool using the `resolve/` URLs it prints.
+- Live check (network): `cargo test -p tools --lib live_hub -- --ignored --nocapture`.

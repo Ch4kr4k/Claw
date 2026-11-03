@@ -1583,6 +1583,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     .chain(code_search::specs())
     .chain(dev_tools::specs())
     .chain(hawkscan::specs())
+    .chain(github::specs())
+    .chain(huggingface::specs())
     .chain(code_exec_specs())
     .chain(external_agent::specs())
     .chain(apply_patch::specs())
@@ -1893,6 +1895,8 @@ fn execute_tool_with_enforcer(
             .or_else(|| code_search::execute(name, input))
             .or_else(|| dev_tools::execute(name, input))
             .or_else(|| hawkscan::execute(name, input))
+            .or_else(|| github::execute(name, input))
+            .or_else(|| huggingface::execute(name, input))
             .or_else(|| code_exec_execute(name, input))
             .or_else(|| external_agent::execute(name, input))
             .or_else(|| media::execute(name, input))
@@ -5915,6 +5919,8 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "grep_search",
             "WebFetch",
             "WebSearch",
+            "GitHub",
+            "HuggingFace",
             "ToolSearch",
             "Skill",
             "StructuredOutput",
@@ -5925,6 +5931,8 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "grep_search",
             "WebFetch",
             "WebSearch",
+            "GitHub",
+            "HuggingFace",
             "ToolSearch",
             "Skill",
             "TodoWrite",
@@ -5973,6 +5981,8 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "grep_search",
             "WebFetch",
             "WebSearch",
+            "GitHub",
+            "HuggingFace",
             "Download",
             "SocialMedia",
             "TodoWrite",
@@ -8566,7 +8576,9 @@ mod com;
 mod dev_tools;
 mod download;
 mod external_agent;
+mod github;
 mod hawkscan;
+mod huggingface;
 pub mod lane_completion;
 pub mod leangate;
 pub mod local_tools;

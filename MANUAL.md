@@ -936,6 +936,26 @@ Besides reading, editing, shell and web tools, the agent has:
   like Bash; when it blocks the scanner, the result gives the command to rerun
   outside it, which you approve. Unlike Claude Code's plugin, claw does not
   scan on its own after every change.
+- **GitHub / GitHubWrite:** the GitHub REST API without the `gh` CLI.
+  `GitHub` only reads, so it works in read-only mode: search repositories,
+  code and issues (GitHub search syntax, e.g. `repo:o/r is:open label:bug`);
+  a repository's facts and README; open/closed issues and pull requests; one
+  issue or PR with its comments (a PR also lists its changed files, and
+  `diff` adds the diff); a file or folder at any branch, tag or commit;
+  commits, releases, Actions runs, a user; and `api` for any other GET
+  endpoint. `GitHubWrite` creates issues, comments and pull requests, opens
+  or closes issues, and sends any other API request; it needs full access,
+  so it asks each time unless allowed. The token comes from `GITHUB_TOKEN`,
+  `GH_TOKEN` or `gh auth token`; reading works without one (60 requests an
+  hour, public repositories, no code search), writing does not.
+- **HuggingFace:** reads the Hugging Face Hub: search or list what is
+  trending among models, datasets and Spaces (filter by tag, e.g. `gguf`,
+  or author); a repo's facts (task, library, license, downloads, parameter
+  count, GGUF architecture and context, gated) and its card; its files with
+  sizes and download URLs; a text file such as `config.json`; today's papers
+  or a paper search; and `whoami`. Weights are fetched by giving a file's
+  URL to `Download`. Gated and private repos need `HF_TOKEN` (or
+  `huggingface-cli login`) after accepting the terms on the repo page.
 - **Custom agents:** an agent definition in `.claw/agents/`,
   `.claude/agents/` (in the project or above it), `~/.claw/agents/` or
   `~/.claude/agents/` (Claude Code's Markdown format, or Codex's TOML) is a
@@ -1097,7 +1117,8 @@ Manage it with `systemctl --user status|restart|stop searxng`; update it with
 
 The `claw` launcher offers a `local/` model a core set of tools to save
 context (`CodeSearch`, `Pty`, `Checkpoint`, `Diagnostics`, `GoogleDork`,
-`vision_analyze`, `RepoSignals`, `Trail`, `HawkScan` and `ExecuteCode` are in it); `CLAW_ALL_TOOLS=1 claw` offers all of them.
+`vision_analyze`, `RepoSignals`, `Trail`, `HawkScan`, `GitHub`, `GitHubWrite`,
+`HuggingFace` and `ExecuteCode` are in it); `CLAW_ALL_TOOLS=1 claw` offers all of them.
 When claw starts with a hosted model (`--model`, else `model` in settings, aliases
 resolved), it gets every tool. A `/model` switch later keeps the starting set.
 
