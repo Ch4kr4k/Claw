@@ -22,7 +22,8 @@ use futures_util::stream;
 use infinity_provider_protocol::{
     AssistantContent, CompletionError, CompletionRequest, ErrorClass, FinalResponse, Image,
     ImageSource, Message, ModelEntry, ModelProvider, ModelStream, Reasoning, ReasoningContent,
-    StreamChunk, ToolCall, ToolCallDeltaContent, ToolResultContent, Usage, UserContent,
+    StreamChunk, ToolCall, ToolCallDeltaContent, ToolDefinition, ToolResultContent, Usage,
+    UserContent,
 };
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -151,12 +152,31 @@ pub fn strip_base_prompt(preamble: &str) -> String {
 /// from each request (see [`strip_base_prompt`]), and the tool calls of each
 /// reply are held back and sent as one packed call when the reply ends (see
 /// [`crate::batch`]). The engine wraps every provider in it.
-pub struct ClawPrompt(pub std::sync::Arc<dyn ModelProvider>);
+pub struct ClawPrompt {
+    pub inner: std::sync::Arc<dyn ModelProvider>,
+    /// The claw tools to offer on each request, in place of every
+    /// registered one (claw's deferred-tool list: rarely used tools stay
+    /// behind `ToolSearch`). The engine's thread tools are always offered.
+    /// Every tool stays registered, so a call to one not offered still runs.
+    pub tool_list: Option<ToolList>,
+}
+
+/// Computes the claw tools a request offers; see [`ClawPrompt::tool_list`].
+pub type ToolList = std::sync::Arc<dyn Fn() -> Vec<ToolDefinition> + Send + Sync>;
+
+/// The engine's own tools offered with a [`ToolList`]: the thread tools.
+/// Its sleep and subscription tools are left out (claw has its own).
+pub const THREAD_TOOLS: &[&str] = &[
+    "spawn_thread",
+    "report_to_parent",
+    "close_thread",
+    "send_message_to_child",
+];
 
 #[async_trait]
 impl ModelProvider for ClawPrompt {
     async fn list_models(&self) -> Result<Vec<ModelEntry>, BoxError> {
-        self.0.list_models().await
+        self.inner.list_models().await
     }
 
     async fn invoke_model(
@@ -167,7 +187,17 @@ impl ModelProvider for ClawPrompt {
         request.preamble = request
             .preamble
             .map(|preamble| strip_base_prompt(&preamble));
-        let inner = self.0.invoke_model(model_id, request).await?;
+        if let Some(tool_list) = &self.tool_list {
+            let mut tools = tool_list();
+            tools.extend(
+                request
+                    .tools
+                    .into_iter()
+                    .filter(|tool| THREAD_TOOLS.contains(&tool.name.as_str())),
+            );
+            request.tools = tools;
+        }
+        let inner = self.inner.invoke_model(model_id, request).await?;
         Ok(pack_tool_calls(inner))
     }
 }

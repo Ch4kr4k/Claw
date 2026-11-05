@@ -148,6 +148,7 @@ fn config_with_images(
         prompter: None,
         executor: None,
         runtime_tools: false,
+        tool_list: None,
     };
     (config, requests)
 }
@@ -593,4 +594,66 @@ fn attachments_go_just_before_the_prompt_and_stay_out_of_the_outcome() {
     let first = &requests.lock().expect("requests")[0];
     assert_eq!(first.chat_history.len(), 2, "attachment, then the prompt");
     assert_eq!(outcome.messages.len(), 2, "prompt and reply only");
+}
+
+#[test]
+fn a_session_thread_id_keeps_the_system_prompt_identical_across_turns() {
+    let mut preambles = Vec::new();
+    for _ in 0..2 {
+        let (config, requests) = config(PermissionMode::ReadOnly, |_| text("hi"));
+        Engine::new(config)
+            .run_turn_blocking(
+                &[],
+                "hello",
+                TurnControl {
+                    thread_id: Some("session-42".into()),
+                    ..TurnControl::default()
+                },
+                |_| {},
+            )
+            .expect("turn");
+        let request = requests.lock().expect("requests")[0].clone();
+        preambles.push(request.preamble.expect("preamble"));
+    }
+    assert!(preambles[0].contains("session-42"));
+    assert_eq!(preambles[0], preambles[1]);
+}
+
+#[test]
+fn a_tool_list_limits_what_is_offered_but_not_what_runs() {
+    let (mut config, requests) = config(PermissionMode::DangerFullAccess, |request| {
+        if last_input(request) == "go" {
+            call("bash", json!({ "command": "echo hidden-ran" }))
+        } else if last_input(request).contains("hidden-ran") {
+            text("ran")
+        } else {
+            text("no")
+        }
+    });
+    config.tool_list = Some(Arc::new(|| {
+        vec![infinity_provider_protocol::ToolDefinition {
+            name: "read_file".into(),
+            description: "read".into(),
+            parameters: json!({ "type": "object" }),
+        }]
+    }));
+    let outcome = Engine::new(config)
+        .run_turn_blocking(&[], "go", TurnControl::default(), |_| {})
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "ran");
+    let names = requests.lock().expect("requests")[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "read_file",
+            "spawn_thread",
+            "report_to_parent",
+            "close_thread",
+            "send_message_to_child"
+        ]
+    );
 }

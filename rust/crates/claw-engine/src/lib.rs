@@ -24,7 +24,8 @@ pub use engine::{
     ENGINE_PROMPT,
 };
 pub use infinity_agent_core::system::AgentEvent;
-pub use provider::ClawModelProvider;
+pub use infinity_provider_protocol::ToolDefinition;
+pub use provider::{ClawModelProvider, ToolList, THREAD_TOOLS};
 pub use tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
 
 /// Whether the user asked for the Infinity engine (`CLAW_ENGINE=infinity`).

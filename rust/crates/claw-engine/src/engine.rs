@@ -21,7 +21,7 @@ use tokio::task::LocalSet;
 use tools::GlobalToolRegistry;
 
 use crate::history;
-use crate::provider::{ClawModelProvider, ClawPrompt};
+use crate::provider::{ClawModelProvider, ClawPrompt, ToolList};
 use crate::tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
 
 type System = LaunchingSystem<InMemoryConversationStore, InMemoryStateStore, NoRapHttp>;
@@ -76,6 +76,9 @@ pub struct EngineConfig {
     pub executor: Option<Executor>,
     /// Offer the registry's runtime (MCP) tools; `executor` must run them.
     pub runtime_tools: bool,
+    /// The claw tools each request offers (see [`ClawPrompt::tool_list`]);
+    /// `None` offers every registered tool.
+    pub tool_list: Option<ToolList>,
 }
 
 impl EngineConfig {
@@ -99,6 +102,7 @@ impl EngineConfig {
             prompter: None,
             executor: None,
             runtime_tools: false,
+            tool_list: None,
         })
     }
 
@@ -123,6 +127,7 @@ impl EngineConfig {
             prompter: None,
             executor: None,
             runtime_tools: false,
+            tool_list: None,
         }
     }
 }
@@ -153,6 +158,10 @@ pub struct TurnControl {
     /// model just before the prompt's text, and are not part of
     /// [`TurnOutcome::messages`].
     pub attachments: Vec<runtime::ContentBlock>,
+    /// The root thread's id. Give the same one for every turn of a session:
+    /// the id is in the system prompt, so a new one each turn would change
+    /// the prompt and cost a local server its prompt cache. `None` makes one.
+    pub thread_id: Option<String>,
 }
 
 /// What one turn did.
@@ -282,7 +291,10 @@ impl Engine {
         let host = Arc::new(host);
         let tools = ClawTool::all(&host, self.config.allowed_tools.as_ref());
         let model = StaticModel::new(
-            Arc::new(ClawPrompt(self.config.provider)),
+            Arc::new(ClawPrompt {
+                inner: self.config.provider,
+                tool_list: self.config.tool_list,
+            }),
             &self.config.model,
         )
         .await
@@ -300,7 +312,23 @@ impl Engine {
                 .with_tokio_sleep_tools()
                 .start();
 
-        let root = system.thread_builder().launch().await;
+        let root = match control.thread_id.take() {
+            Some(id) => {
+                let id = ThreadId::from(id);
+                store
+                    .ensure_root_thread(&id)
+                    .await
+                    .map_err(|error| EngineError::Store(error.to_string()))?;
+                system
+                    .thread_handle(&id)
+                    .await
+                    .map_err(|error| EngineError::Store(error.to_string()))?
+                    .ok_or_else(|| {
+                        EngineError::Store(format!("thread {} not found", id.as_str()))
+                    })?
+            }
+            None => system.thread_builder().launch().await,
+        };
         let root_id = root.thread_id().to_owned();
         let root_name = root_id.as_str().to_string();
         // The conversation so far, before the thread's first slice loads it.

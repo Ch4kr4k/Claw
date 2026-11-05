@@ -46,8 +46,10 @@ pub(crate) fn run(
     let registry = current_tool_registry()?;
     let policy = permission_policy(permission_mode, &feature_config, &registry)?;
     let system_prompt = build_system_prompt(model)?.join("\n\n");
+    let tool_list = crate::live_engine::engine_tool_list(&registry, model, allowed_tools.clone());
     let mut config = EngineConfig::for_model(model, system_prompt, registry, policy)?;
     config.allowed_tools = allowed_tools;
+    config.tool_list = Some(tool_list);
 
     let json = matches!(output_format, CliOutputFormat::Json);
     let mut printer = Printer::default();

@@ -41,6 +41,9 @@ impl LiveCli {
             abort: Some(abort),
             queued_prompts: Some(Box::new(runtime::turn_keys::take_queued_for_running_turn)),
             attachments: self.pending_attachments.clone(),
+            // One root thread id per session keeps the system prompt the same
+            // from turn to turn, so a local server's prompt cache holds.
+            thread_id: Some(self.session.id.clone()),
         };
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -114,6 +117,8 @@ impl LiveCli {
             .with_image_input(sends_images(&self.model));
         let executor_registry = registry.clone();
         let mcp_state = self.runtime.mcp_state.clone();
+        let tool_list = engine_tool_list(&registry, &self.model, self.allowed_tools.clone());
+        let search_allowed = self.allowed_tools.clone();
         let mut config = EngineConfig::for_provider(
             provider,
             self.effective_system_prompt().join("\n\n"),
@@ -123,6 +128,7 @@ impl LiveCli {
         config.allowed_tools.clone_from(&self.allowed_tools);
         config.hooks = Some(runtime::HookRunner::from_feature_config(&feature_config));
         config.runtime_tools = mcp_state.is_some();
+        config.tool_list = Some(tool_list);
         let prompter: Box<dyn runtime::PermissionPrompter + Send> =
             Box::new(CliPermissionPrompter::new(self.permission_mode));
         config.prompter = Some(Arc::new(Mutex::new(prompter)));
@@ -135,6 +141,16 @@ impl LiveCli {
             }
             runtime::turn_keys::begin_tool(&tool_activity_label(name, &input.to_string()));
             let result = match &mcp_state {
+                // claw's own search: it also loads what it finds into the
+                // tool list (`sent_tool_definitions`) for later requests.
+                _ if name == "ToolSearch" => CliToolExecutor::new(
+                    search_allowed.clone(),
+                    false,
+                    executor_registry.clone(),
+                    mcp_state.clone(),
+                )
+                .execute_search_tool(input.clone())
+                .map_err(|error| error.to_string()),
                 Some(mcp_state) if executor_registry.has_runtime_tool(name) => {
                     tool_executor::run_mcp_tool(mcp_state, name, input.clone())
                         .map_err(|error| error.to_string())
@@ -146,6 +162,28 @@ impl LiveCli {
         }));
         Ok(config)
     }
+}
+
+/// The tools a request offers, as the classic loop sends them
+/// ([`sent_tool_definitions`]: a local model's core set, rarely used tools
+/// behind `ToolSearch` until it loads them), worked out per request.
+pub(crate) fn engine_tool_list(
+    registry: &GlobalToolRegistry,
+    model: &str,
+    allowed_tools: Option<AllowedToolSet>,
+) -> claw_engine::ToolList {
+    let registry = registry.clone();
+    let model = model.to_string();
+    Arc::new(move || {
+        sent_tool_definitions(&registry, &model, allowed_tools.as_ref())
+            .into_iter()
+            .map(|tool| claw_engine::ToolDefinition {
+                name: tool.name,
+                description: tool.description.unwrap_or_default(),
+                parameters: tool.input_schema,
+            })
+            .collect()
+    })
 }
 
 /// Draws a turn's events: the root thread's reply streamed as markdown, one

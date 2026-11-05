@@ -199,6 +199,26 @@ each. A single call goes through untouched.
      before the prompt without being saved as part of the turn. Also
      checked by hand: an MCP tool called through `claw -p` (stdio fixture
      server plus a scripted SSE model), and the run saved as a session.
+   - **Measured on a real local model** (cybertiel-35b-a3b on llama-gpu,
+     logging proxy plus llama-server's `prompt eval time`). Two fixes came
+     out of it:
+     - *Tool list.* The engine offered all 40 tools; the classic loop sends
+       21 (`sent_tool_definitions`: a local model's core set, rarely used
+       tools behind `ToolSearch`). `EngineConfig::tool_list` /
+       `ClawPrompt::tool_list` now offers the same list, plus the thread
+       tools (`THREAD_TOOLS`), on every request. Every tool stays
+       registered, so a tool `ToolSearch` loads still runs, and `ToolSearch`
+       goes through the CLI's search so it records what it loaded. The
+       first request dropped from 19,714 to 14,920 prompt tokens (classic:
+       13,950).
+     - *Stable root thread.* The thread-id line sits near the top of the
+       preamble, and a new root id every turn made every REPL turn miss
+       the server's prompt cache (about 15k tokens, around 2.5 min on this
+       machine). `TurnControl::thread_id` (the claw session id in the
+       REPL) seeds the store with `ensure_root_thread` and attaches through
+       `thread_handle`. Turn 2's first request now processes 38 tokens, and
+       the turn took 24 s.
+
 4. **Flip the default and retire the old loop.** `CLAW_ENGINE=legacy`
    stays for one release. Then `ConversationRuntime`'s loop is deleted and
    `runtime` keeps sessions, config, prompt assembly and permissions.
