@@ -5,13 +5,19 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use claw_engine::{Engine, EngineConfig, EngineEvent, ToolActivity};
+use std::time::{Duration, Instant};
+
+use claw_engine::{Engine, EngineConfig, EngineEvent, ToolActivity, TurnControl};
 use futures_util::stream;
 use infinity_provider_protocol::{
     CompletionError, CompletionModel, CompletionRequest, FinalResponse, Message, ModelEntry,
     ModelStream, SingleModelProvider, StreamChunk, ToolCall, ToolResultContent, UserContent,
 };
-use runtime::{PermissionMode, PermissionPolicy};
+use runtime::{
+    ContentBlock, ConversationMessage, HookAbortSignal, HookRunner, MessageRole, PermissionMode,
+    PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+    RuntimeHookConfig,
+};
 use serde_json::json;
 use tools::GlobalToolRegistry;
 
@@ -104,11 +110,12 @@ struct Run {
     requests: Vec<CompletionRequest>,
 }
 
-fn run(
+type Requests = Arc<Mutex<Vec<CompletionRequest>>>;
+
+fn config(
     mode: PermissionMode,
-    prompt: &str,
     script: impl Fn(&CompletionRequest) -> Vec<StreamChunk> + Send + Sync + 'static,
-) -> Run {
+) -> (EngineConfig, Requests) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedModel {
         script: Box::new(script),
@@ -129,7 +136,19 @@ fn run(
         policy: policy(mode, &registry),
         registry,
         allowed_tools: None,
+        hooks: None,
+        prompter: None,
+        executor: None,
     };
+    (config, requests)
+}
+
+fn run(
+    mode: PermissionMode,
+    prompt: &str,
+    script: impl Fn(&CompletionRequest) -> Vec<StreamChunk> + Send + Sync + 'static,
+) -> Run {
+    let (config, requests) = config(mode, script);
     let mut events = Vec::new();
     let summary = Engine::new(config)
         .run_prompt_blocking(prompt, |event| events.push(event.clone()))
@@ -287,4 +306,207 @@ fn several_calls_in_one_reply_all_run_and_all_answer() {
         .filter(|event| matches!(event, EngineEvent::Tool(ToolActivity::Finished { .. })))
         .count();
     assert_eq!(finished, 3, "every call ran");
+}
+
+fn history_text(request: &CompletionRequest) -> String {
+    format!("{:?}", request.chat_history)
+}
+
+#[test]
+fn turn_continues_the_session_and_returns_what_it_added() {
+    let history = vec![
+        ConversationMessage::user_text("remember the word pelican"),
+        ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "noted".into(),
+        }]),
+    ];
+    let (config, requests) = config(PermissionMode::ReadOnly, |request| {
+        if history_text(request).contains("pelican") {
+            text("the word was pelican")
+        } else {
+            text("no memory")
+        }
+    });
+    let outcome = Engine::new(config)
+        .run_turn_blocking(
+            &history,
+            "what was the word?",
+            TurnControl::default(),
+            |_| {},
+        )
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "the word was pelican");
+    assert!(!outcome.interrupted);
+    assert_eq!(outcome.messages.len(), 2, "{:#?}", outcome.messages);
+    assert_eq!(outcome.messages[0].role, MessageRole::User);
+    assert_eq!(outcome.messages[1].role, MessageRole::Assistant);
+    assert!(
+        outcome.messages[1].usage.is_some(),
+        "usage lands on the reply"
+    );
+    let first = &requests.lock().expect("requests")[0];
+    assert_eq!(first.chat_history.len(), 3, "seed plus the new prompt");
+}
+
+#[test]
+fn abort_stops_a_running_tool_turn() {
+    let (config, _) = config(PermissionMode::DangerFullAccess, |request| {
+        if last_input(request) == "wait" {
+            call("bash", json!({ "command": "sleep 3" }))
+        } else {
+            text("finished")
+        }
+    });
+    let abort = HookAbortSignal::new();
+    let trigger = abort.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        trigger.abort();
+    });
+    let started = Instant::now();
+    let outcome = Engine::new(config)
+        .run_turn_blocking(
+            &[],
+            "wait",
+            TurnControl {
+                abort: Some(abort),
+                queued_prompts: None,
+            },
+            |_| {},
+        )
+        .expect("turn");
+    assert!(outcome.interrupted);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "returned after {:?}",
+        started.elapsed()
+    );
+    assert!(outcome.messages.iter().any(|message| message
+        .blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { name, .. } if name == "bash"))));
+}
+
+#[test]
+fn prompts_typed_during_the_turn_reach_the_thread() {
+    let (config, requests) = config(PermissionMode::DangerFullAccess, |request| {
+        let input = last_input(request);
+        if input == "start" {
+            call("bash", json!({ "command": "sleep 1; echo slept" }))
+        } else if input.contains("also check the tests") {
+            text("will do")
+        } else {
+            text("ok")
+        }
+    });
+    let mut sent = false;
+    let outcome = Engine::new(config)
+        .run_turn_blocking(
+            &[],
+            "start",
+            TurnControl {
+                abort: None,
+                queued_prompts: Some(Box::new(move || {
+                    if sent {
+                        Vec::new()
+                    } else {
+                        sent = true;
+                        vec!["also check the tests".to_string()]
+                    }
+                })),
+            },
+            |_| {},
+        )
+        .expect("turn");
+    assert!(requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .any(|request| history_text(request).contains("also check the tests")));
+    assert!(outcome
+        .messages
+        .iter()
+        .any(|message| message.blocks.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == "also check the tests")
+        )));
+}
+
+struct Recorder {
+    asked: Arc<Mutex<Vec<String>>>,
+    allow: bool,
+}
+
+impl PermissionPrompter for Recorder {
+    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+        self.asked
+            .lock()
+            .expect("asked")
+            .push(request.tool_name.clone());
+        if self.allow {
+            PermissionPromptDecision::Allow
+        } else {
+            PermissionPromptDecision::Deny {
+                reason: "user said no".into(),
+            }
+        }
+    }
+}
+
+#[test]
+fn calls_needing_approval_go_to_the_prompter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join("out.txt");
+    let target_text = target.display().to_string();
+    for allow in [true, false] {
+        let path = target_text.clone();
+        let (mut config, _) = config(PermissionMode::WorkspaceWrite, move |request| {
+            let input = last_input(request);
+            if input == "write" {
+                call("bash", json!({ "command": format!("touch {path}") }))
+            } else if input.contains("user said no") {
+                text("denied")
+            } else {
+                text("written")
+            }
+        });
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let prompter: Box<dyn PermissionPrompter + Send> = Box::new(Recorder {
+            asked: Arc::clone(&asked),
+            allow,
+        });
+        config.prompter = Some(Arc::new(Mutex::new(prompter)));
+        let outcome = Engine::new(config)
+            .run_turn_blocking(&[], "write", TurnControl::default(), |_| {})
+            .expect("turn");
+        assert_eq!(asked.lock().expect("asked").as_slice(), ["bash"]);
+        assert_eq!(
+            outcome.summary.final_text,
+            if allow { "written" } else { "denied" }
+        );
+        assert_eq!(target.exists(), allow);
+        let _ = std::fs::remove_file(&target);
+    }
+}
+
+#[test]
+fn pre_tool_hook_can_deny_a_call() {
+    let (mut config, _) = config(PermissionMode::DangerFullAccess, |request| {
+        let input = last_input(request);
+        if input == "run" {
+            call("bash", json!({ "command": "echo hi" }))
+        } else if input.contains("blocked by policy hook") {
+            text("hook said no")
+        } else {
+            text(&format!("unexpected: {input}"))
+        }
+    });
+    config.hooks = Some(HookRunner::new(RuntimeHookConfig::new(
+        vec!["echo 'blocked by policy hook'; exit 2".to_string()],
+        Vec::new(),
+        Vec::new(),
+    )));
+    let outcome = Engine::new(config)
+        .run_turn_blocking(&[], "run", TurnControl::default(), |_| {})
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "hook said no");
 }

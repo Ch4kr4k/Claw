@@ -799,9 +799,10 @@ removing it.
 
 ### Asynchronous engine (experimental)
 
-`CLAW_ENGINE=infinity` runs a one-shot prompt (`claw -p "…"`,
-`claw prompt …`) on the [Infinity](https://github.com/hydro-project/infinity)
-runtime instead of the classic loop:
+`CLAW_ENGINE=infinity` runs turns on the
+[Infinity](https://github.com/hydro-project/infinity) runtime instead of the
+classic loop. This covers interactive REPL turns and one-shot prompts
+(`claw -p "…"`, `claw prompt …`):
 
 - **Nothing waits on a slow tool.** `bash`, web fetches and sub-agents run in
   the background, and the agent picks up their results as they arrive.
@@ -817,18 +818,32 @@ runtime instead of the classic loop:
 CLAW_ENGINE=infinity claw --permission-mode workspace-write -p "review src/ in parallel, one thread per module"
 ```
 
-The answer goes to stdout. Tool lines, child-thread output and a summary
+**In the REPL**, a turn looks as usual, with a few differences:
+
+- Child threads' replies and tool calls are labelled `[#1]`, `[#2]`, and
+  the turn's end line counts the threads.
+- Text you type and send with Enter while a turn runs goes straight to the
+  agent, and interrupts a reply that is streaming.
+- Esc or Ctrl+C stops the turn and keeps what it did; a tool that has
+  already started finishes in the background.
+- Permission prompts, hooks, checkpoints (`/undo`), `--resume` and
+  learning work as usual: the session is still claw's own, and each turn
+  starts from it and saves what it added.
+
+**With `-p`**, the answer goes to stdout. Tool lines, child-thread output and a summary
 (threads, completions, tokens) go to stderr. With `--output-format json`,
 only a summary object is printed (`engine`, `message`, `threads`,
 `completions`, `usage`).
 
 Limitations for now:
 
-- No permission prompts: any call your `--permission-mode` doesn't allow
-  is denied, and the model is told why.
-- The session isn't saved.
-- Hooks, MCP tools and image results aren't used.
-- The interactive REPL still uses the classic loop.
+- With `-p` there are no permission prompts: any call your
+  `--permission-mode` doesn't allow is denied, and the model is told why.
+  `-p` runs aren't saved as sessions.
+- MCP tools, image results and attachments (`@image`, `/image`) aren't
+  used; `/effort` doesn't reach the model.
+- Child threads last for one turn: they finish (or are stopped) before the
+  turn ends.
 
 The design and the plan for the remaining work are in
 [`docs/infinity-engine.md`](docs/infinity-engine.md).
@@ -1446,7 +1461,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_THEME` | Theme, overriding the saved one |
 | `CLAW_DIFF_PANEL=0` | No diff panel this run (`/diffpanel off` saves it) |
 | `CLAW_FULLSCREEN=0` | Inline view instead of the full-screen window (output stays in the terminal's history) |
-| `CLAW_ENGINE=infinity` | Run `claw -p` / `claw prompt` on the asynchronous multi-threaded engine (experimental; see *Asynchronous engine* in section 9) |
+| `CLAW_ENGINE=infinity` | Run turns (REPL and `claw -p`) on the asynchronous multi-threaded engine (experimental; see *Asynchronous engine* in section 9) |
 | `CLAW_MERMAID` | `0` prints ```` ```mermaid ```` blocks as code only, `text` always draws them as box-drawing text (default: an image where inline images work, text elsewhere) |
 | `CLAW_INLINE_IMAGES` | `0` never draws reply images in the terminal, `1` always does (default: kitty and Ghostty, not inside tmux) |
 | `CLAW_AUTO_MEMORY=0` | Turn off auto memory for this run |

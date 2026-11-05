@@ -215,6 +215,9 @@ impl LiveCli {
     }
 
     pub(crate) fn run_turn_inner(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if claw_engine::requested() {
+            return self.run_engine_turn(input);
+        }
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         runtime::turn_keys::set_activity_color(&render::activity_color(render::current_theme()));
         let mut spinner = Spinner::new();

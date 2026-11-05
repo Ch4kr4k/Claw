@@ -221,11 +221,12 @@ pub fn to_message_request(
     MessageRequest {
         model: model_id.to_string(),
         max_tokens,
-        messages: request
-            .chat_history
-            .into_iter()
-            .filter_map(|message| to_claw_message(message, &batches))
-            .collect(),
+        messages: merge_same_role(
+            request
+                .chat_history
+                .into_iter()
+                .filter_map(|message| to_claw_message(message, &batches)),
+        ),
         system: request.preamble.filter(|preamble| !preamble.is_empty()),
         tool_choice: tools.as_ref().map(|_| ToolChoice::Auto),
         tools,
@@ -233,6 +234,20 @@ pub fn to_message_request(
         extra_body,
         ..MessageRequest::default()
     }
+}
+
+/// One message per run of same-role messages: Infinity keeps each history
+/// entry as its own message, and providers want roles to alternate (all
+/// results of a run of tool calls in one user message).
+fn merge_same_role(messages: impl Iterator<Item = ClawMessage>) -> Vec<ClawMessage> {
+    let mut merged: Vec<ClawMessage> = Vec::new();
+    for message in messages {
+        match merged.last_mut() {
+            Some(last) if last.role == message.role => last.content.extend(message.content),
+            _ => merged.push(message),
+        }
+    }
+    merged
 }
 
 fn to_claw_message(

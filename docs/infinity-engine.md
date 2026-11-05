@@ -1,6 +1,6 @@
 # Infinity engine: multi-threaded asynchronous agents for claw
 
-Status: phase 1 landed (opt-in, `CLAW_ENGINE=infinity`). Started 2026-11-05.
+Status: phases 1 and 2 landed (opt-in, `CLAW_ENGINE=infinity`). Started 2026-11-05.
 
 This document records the decision to move claw's agent loop onto the
 [Infinity runtime](https://github.com/hydro-project/infinity)
@@ -83,14 +83,23 @@ tools: they finish in milliseconds and yielding for them would only add a
 round trip. A *slow* tool is dispatched and the thread yields. Examples are
 `bash`, `WebFetch`, `WebSearch`, `Agent` and `REPL`. While it runs, the
 thread's driver is free: user text, child reports and other threads keep
-moving. The list is `claw_engine::tools::ASYNC_TOOLS`.
+moving. The inline list is `claw_engine::tools::SYNC_TOOLS`; everything
+else is dispatched.
 
-**Permissions.** `ClawTool` checks each call against a
-`runtime::PermissionPolicy` before it runs. A denied call returns an error
-result, which the model sees and can recover from. Phase 1 has no
-interactive prompter: in `prompt` mode, any call that needs more than
-read-only access is denied with a message saying so. Phase 2 routes these
-through a `UserChoice`-style request to the REPL.
+**Permissions and hooks.** `ToolHost::run` follows the classic loop's
+order:
+
+1. The PreToolUse hook runs. It can deny the call, rewrite its input, or
+   override the permission decision.
+2. The `runtime::PermissionPolicy` check runs. A call the policy can't
+   decide alone goes to the prompter: `CliPermissionPrompter` in the REPL,
+   behind a mutex so parallel calls ask one at a time.
+3. The tool runs.
+4. The PostToolUse (or failure) hook runs.
+
+A denied call returns an `Error: …` result, which the model sees and can
+recover from. Without a prompter (`-p` mode), a call that needs approval is
+denied with a message saying so.
 
 **Several tool calls in one reply.** Infinity runs only the first tool call
 of a completion and ignores the rest. Models often ask for several at once,
@@ -123,12 +132,38 @@ each. A single call goes through untouched.
      mock-anthropic scenarios also pass end to end through `claw -p`:
      streaming text, read, grep, write allowed or denied, bash, and a
      two-call reply.
-2. **Interactive REPL on the engine.** `LiveCli::run_turn` drives a
-   long-lived `ThreadHandle` instead of a fresh `ConversationRuntime`. The
-   renderer consumes `AgentEvent`s. Type-ahead becomes `send_user_text`,
-   which interrupts. Permission prompts and Esc/Ctrl+C go through the
-   handle. Pre- and post-tool hooks run in `ClawTool`. The footer shows
-   live threads (lifecycle events).
+2. **Interactive REPL on the engine** (done)
+   - `LiveCli::run_turn_inner` hands the turn to `live_engine.rs` when
+     `CLAW_ENGINE=infinity`, so checkpoints, job notices and LeanGate
+     still wrap it.
+   - claw's `Session` stays the record. `Engine::run_turn` seeds the root
+     thread's store with the session's messages (`claw_engine::history`),
+     runs the turn, and returns the messages it added. Those are pushed
+     onto the session, and `/undo`, `--resume`, compaction and learning
+     need no change. A batch comes back as the model's own `tool_use`
+     blocks and results. Adjacent same-role messages are merged for the
+     provider.
+   - `TurnControl`: Esc and Ctrl+C go through `TurnKeyWatcher`'s abort
+     signal, which shuts the system down. Partial turns are flushed and
+     kept, and the runtime is shut down in the background so a stopped
+     long tool doesn't hold the REPL. Prompts typed meanwhile
+     (`take_queued_for_running_turn`) are sent to the root as user text,
+     which interrupts a streaming reply.
+   - `ToolHost` runs PreToolUse hooks (deny, rewrite input, permission
+     override), asks the user through `CliPermissionPrompter` (one
+     question at a time), runs the tool through a CLI executor
+     (`AskUserQuestion` picker, activity label), then runs PostToolUse
+     hooks, all in the classic order.
+   - Rendering reuses the CLI's markdown stream, folded tool-call and
+     result blocks, activity row and diff-panel refresh. Child threads
+     are labelled `[#n]`.
+   - Tests: a seeded session, abort mid-tool (returns in about 0.3 s),
+     mid-turn prompts, prompter allow and deny, a PreToolUse deny, and
+     history round trips. Also two REPL turns in a PTY against the mock
+     server, with the saved JSONL checked.
+   - Not yet: the footer's live-thread count, image attachments,
+     `/effort` passed to the provider, and keeping child threads alive
+     across turns.
 3. **Persistence and parity.** A `ConversationStore`/`StateStore` backed by
    claw's session directory, so `--resume`, `/rewind` and checkpoints work.
    MCP tools are bridged through `infinity-mcp-bridge` or claw's own
@@ -139,11 +174,13 @@ each. A single call goes through untouched.
    stays for one release. Then `ConversationRuntime`'s loop is deleted and
    `runtime` keeps sessions, config, prompt assembly and permissions.
 
-## Phase 1 limitations
+## Current limitations
 
-- No interactive permission prompts (see above). Use
+- `-p` mode has no interactive permission prompts (the REPL has them). Use
   `--permission-mode workspace-write` or `danger-full-access`.
-- History lives only in memory and isn't saved to `~/.claw/sessions`.
-- Hooks, MCP tools, plugin tools and image attachments aren't wired yet.
-- Slow tools run on tokio's blocking pool, so a tool can't be cancelled
-  once it has started. Shutdown waits for running tools to finish.
+- `-p` runs aren't saved to `~/.claw/sessions`. REPL turns are saved.
+- MCP tools, image attachments and reasoning effort aren't wired yet.
+- Slow tools run on tokio's blocking pool and can't be cancelled once
+  started. A stopped turn returns at once and leaves them to finish.
+- Each turn builds a fresh engine, so child threads don't outlive the turn
+  that spawned them.

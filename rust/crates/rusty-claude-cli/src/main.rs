@@ -28,6 +28,7 @@ mod init;
 mod input;
 mod keybindings;
 mod learning;
+mod live_engine;
 mod live_reports;
 mod live_session;
 mod live_turn;

@@ -8,17 +8,21 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
+use infinity_agent_core::message::InputMessage;
 use infinity_agent_core::stores::{InMemoryConversationStore, InMemoryStateStore};
-use infinity_agent_core::system::local::{LaunchingSystem, ThreadLifecycleState};
+use infinity_agent_core::system::local::{ChannelSender, LaunchingSystem, ThreadLifecycleState};
 use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp, StaticModel};
+use infinity_agent_core::traits::{ConversationStore, InputSender};
+use infinity_agent_core::ThreadId;
 use infinity_provider_protocol::{ModelProvider, Usage};
-use runtime::PermissionPolicy;
+use runtime::{ConversationMessage, HookAbortSignal, HookRunner, PermissionPolicy};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tools::GlobalToolRegistry;
 
+use crate::history;
 use crate::provider::{ClawModelProvider, ClawPrompt};
-use crate::tools::{ClawTool, ToolActivity, ToolHost};
+use crate::tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
 
 type System = LaunchingSystem<InMemoryConversationStore, InMemoryStateStore, NoRapHttp>;
 
@@ -64,6 +68,12 @@ pub struct EngineConfig {
     pub registry: GlobalToolRegistry,
     pub policy: PermissionPolicy,
     pub allowed_tools: Option<BTreeSet<String>>,
+    /// PreToolUse / PostToolUse hooks run around every call.
+    pub hooks: Option<HookRunner>,
+    /// Asked when the policy needs approval; without one such calls are denied.
+    pub prompter: Option<SharedPrompter>,
+    /// Runs calls in place of the registry.
+    pub executor: Option<Executor>,
 }
 
 impl EngineConfig {
@@ -83,11 +93,14 @@ impl EngineConfig {
             registry,
             policy,
             allowed_tools: None,
+            hooks: None,
+            prompter: None,
+            executor: None,
         })
     }
 }
 
-/// Totals of one [`Engine::run_prompt`].
+/// Totals of one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
     /// The root thread's final reply (the text of its last completion).
@@ -99,12 +112,36 @@ pub struct RunSummary {
     pub usage: Usage,
 }
 
+/// How the caller steers a running turn.
+#[derive(Default)]
+pub struct TurnControl {
+    /// Set (Esc, Ctrl+C) to stop the turn: running completions are
+    /// interrupted, their partial turns kept, and the run returns.
+    pub abort: Option<HookAbortSignal>,
+    /// Polled while the turn runs: prompts the user typed meanwhile. Each
+    /// goes to the root thread at once (interrupting a streaming reply, as
+    /// user text does on the engine).
+    pub queued_prompts: Option<Box<dyn FnMut() -> Vec<String>>>,
+}
+
+/// What one turn did.
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutcome {
+    pub summary: RunSummary,
+    /// The messages the turn added to the root conversation (the prompt
+    /// included), as claw session messages.
+    pub messages: Vec<ConversationMessage>,
+    /// Whether the turn was stopped through [`TurnControl::abort`].
+    pub interrupted: bool,
+}
+
 /// Errors starting or running the engine.
 #[derive(Debug)]
 pub enum EngineError {
     Model(String),
     Runtime(std::io::Error),
     Send(String),
+    Store(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -113,11 +150,15 @@ impl std::fmt::Display for EngineError {
             Self::Model(error) => write!(f, "model: {error}"),
             Self::Runtime(error) => write!(f, "async runtime: {error}"),
             Self::Send(error) => write!(f, "engine input queue: {error}"),
+            Self::Store(error) => write!(f, "conversation store: {error}"),
         }
     }
 }
 
 impl std::error::Error for EngineError {}
+
+/// How often a running turn checks its [`TurnControl`].
+const CONTROL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// claw on Infinity.
 pub struct Engine {
@@ -138,40 +179,73 @@ impl Engine {
         prompt: &str,
         on_event: impl FnMut(&EngineEvent),
     ) -> Result<RunSummary, EngineError> {
+        self.run_turn_blocking(&[], prompt, TurnControl::default(), on_event)
+            .map(|outcome| outcome.summary)
+    }
+
+    /// Runs one turn of a conversation: the root thread starts from
+    /// `history` (claw's session so far), gets `prompt`, and runs until
+    /// every thread is idle or `control` stops it. On a fresh
+    /// multi-threaded runtime; for synchronous callers.
+    pub fn run_turn_blocking(
+        self,
+        history: &[ConversationMessage],
+        prompt: &str,
+        control: TurnControl,
+        on_event: impl FnMut(&EngineEvent),
+    ) -> Result<TurnOutcome, EngineError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(EngineError::Runtime)?;
-        runtime.block_on(self.run_prompt(prompt, on_event))
+        let outcome = runtime.block_on(self.run_turn(history, prompt, control, on_event));
+        // Dropping the runtime would wait for tools still running on its
+        // blocking pool (a stopped `cargo build`); they finish on their own
+        // and their results are dropped.
+        runtime.shutdown_background();
+        outcome
     }
 
-    /// Runs `prompt` to completion; see [`Self::run_prompt_blocking`]. Must
-    /// be awaited inside a multi-threaded tokio runtime.
-    pub async fn run_prompt(
+    /// See [`Self::run_turn_blocking`]. Must be awaited inside a
+    /// multi-threaded tokio runtime.
+    pub async fn run_turn(
         self,
+        history: &[ConversationMessage],
         prompt: &str,
+        control: TurnControl,
         on_event: impl FnMut(&EngineEvent),
-    ) -> Result<RunSummary, EngineError> {
+    ) -> Result<TurnOutcome, EngineError> {
         LocalSet::new()
-            .run_until(self.run_prompt_local(prompt.to_string(), on_event))
+            .run_until(self.run_turn_local(history, prompt.to_string(), control, on_event))
             .await
     }
 
-    async fn run_prompt_local(
+    #[allow(clippy::too_many_lines)]
+    async fn run_turn_local(
         self,
+        history: &[ConversationMessage],
         prompt: String,
+        mut control: TurnControl,
         mut on_event: impl FnMut(&EngineEvent),
-    ) -> Result<RunSummary, EngineError> {
+    ) -> Result<TurnOutcome, EngineError> {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<EngineEvent>();
         let activity_tx = events_tx.clone();
-        let host = Arc::new(
-            ToolHost::new(self.config.registry, self.config.policy).with_activity(Arc::new(
-                move |activity| {
-                    // A closed channel means the run is over; drop the report.
-                    let _ = activity_tx.send(EngineEvent::Tool(activity));
-                },
-            )),
+        let mut host = ToolHost::new(self.config.registry, self.config.policy).with_activity(
+            Arc::new(move |activity| {
+                // A closed channel means the run is over; drop the report.
+                let _ = activity_tx.send(EngineEvent::Tool(activity));
+            }),
         );
+        if let Some(hooks) = self.config.hooks {
+            host = host.with_hooks(hooks);
+        }
+        if let Some(prompter) = self.config.prompter {
+            host = host.with_prompter(prompter);
+        }
+        if let Some(executor) = self.config.executor {
+            host = host.with_executor(executor);
+        }
+        let host = Arc::new(host);
         let tools = ClawTool::all(&host, self.config.allowed_tools.as_ref());
         let model = StaticModel::new(
             Arc::new(ClawPrompt(self.config.provider)),
@@ -184,40 +258,43 @@ impl Engine {
         } else {
             format!("{}\n\n{ENGINE_PROMPT}", self.config.system_prompt)
         };
-        let mut system: System = AgentSystemBuilder::new_local(
-            InMemoryConversationStore::new(),
-            InMemoryStateStore::new(),
-            model,
-        )
-        .tools(tools)
-        .extra_system_prompt(system_prompt)
-        .with_tokio_sleep_tools()
-        .start();
+        let store = InMemoryConversationStore::new();
+        let mut system: System =
+            AgentSystemBuilder::new_local(store.clone(), InMemoryStateStore::new(), model)
+                .tools(tools)
+                .extra_system_prompt(system_prompt)
+                .with_tokio_sleep_tools()
+                .start();
 
         let root = system.thread_builder().launch().await;
-        let root_id = root.thread_id().as_str().to_string();
+        let root_id = root.thread_id().to_owned();
+        let root_name = root_id.as_str().to_string();
+        // The conversation so far, before the thread's first slice loads it.
+        let seed = history::to_infinity(history)
+            .into_iter()
+            .map(|entry| (entry, uuid::Uuid::new_v4().to_string()))
+            .collect::<Vec<_>>();
+        let seeded = seed.len();
+        store
+            .append_messages(&root_id, seed)
+            .await
+            .map_err(|error| EngineError::Store(error.to_string()))?;
         forward(root, true, events_tx.clone());
-        let mut attached = HashSet::from([root_id.clone()]);
+        let mut attached = HashSet::from([root_name.clone()]);
 
-        let first = system.sender();
-        infinity_agent_core::traits::InputSender::send_to_input_queue(
-            &first,
-            infinity_agent_core::message::InputMessage::user_text(
-                rap_protocol::ThreadId::from(root_id.clone()),
-                prompt,
-            ),
-            &uuid::Uuid::new_v4().to_string(),
-        )
-        .await
-        .map_err(|error| EngineError::Send(error.to_string()))?;
+        let sender = system.sender();
+        send_user_text(&sender, &root_id, prompt).await?;
 
         let mut summary = RunSummary::default();
         let mut seen_live = false;
+        let mut interrupted = false;
         let mut root_text = String::new();
         // When every driver has exited, a message one of them sent last (a
         // child's report) may not have restarted its target yet: the run is
         // only over once the system stays idle for IDLE_GRACE.
         let mut idle_deadline: Option<tokio::time::Instant> = None;
+        let mut poll = tokio::time::interval(CONTROL_POLL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 lifecycle = system.next_lifecycle_event() => {
@@ -240,7 +317,7 @@ impl Engine {
                     on_event(&EngineEvent::Lifecycle { thread, live });
                 }
                 Some(event) = events_rx.recv() => {
-                    record(&event, &root_id, &mut root_text, &mut summary);
+                    record(&event, &root_name, &mut root_text, &mut summary);
                     on_event(&event);
                 }
                 () = sleep_until_or_never(idle_deadline) => {
@@ -249,16 +326,71 @@ impl Engine {
                     }
                     idle_deadline = None;
                 }
+                _ = poll.tick() => {
+                    if control.abort.as_ref().is_some_and(HookAbortSignal::is_aborted) {
+                        interrupted = true;
+                        break;
+                    }
+                    if let Some(queued) = control.queued_prompts.as_mut() {
+                        for text in queued() {
+                            idle_deadline = None;
+                            send_user_text(&sender, &root_id, text).await?;
+                        }
+                    }
+                }
             }
         }
+        // Interrupts running completions and flushes their partial turns.
+        system.shutdown().await;
         // Events emitted just before the last driver exited.
         while let Ok(event) = events_rx.try_recv() {
-            record(&event, &root_id, &mut root_text, &mut summary);
+            record(&event, &root_name, &mut root_text, &mut summary);
             on_event(&event);
         }
-        system.shutdown().await;
         summary.threads = attached.len();
-        Ok(summary)
+        let entries = store
+            .load_history_up_to(&root_id, None, None)
+            .await
+            .map_err(|error| EngineError::Store(error.to_string()))?;
+        let added = entries.get(seeded..).unwrap_or_default();
+        let mut messages = history::from_infinity(added);
+        if let Some(last) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.role == runtime::MessageRole::Assistant)
+        {
+            last.usage = Some(token_usage(&summary.usage));
+        }
+        Ok(TurnOutcome {
+            summary,
+            messages,
+            interrupted,
+        })
+    }
+}
+
+async fn send_user_text(
+    sender: &ChannelSender,
+    thread: &ThreadId<str>,
+    text: String,
+) -> Result<(), EngineError> {
+    sender
+        .send_to_input_queue(
+            InputMessage::user_text(thread.to_owned(), text),
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+        .map_err(|error| EngineError::Send(error.to_string()))
+}
+
+/// The run's usage in claw's form (input here includes cached input).
+fn token_usage(usage: &Usage) -> runtime::TokenUsage {
+    let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    runtime::TokenUsage {
+        input_tokens: clamp(usage.input_tokens.saturating_sub(usage.cached_input_tokens)),
+        output_tokens: clamp(usage.output_tokens),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: clamp(usage.cached_input_tokens),
     }
 }
 

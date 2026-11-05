@@ -15,13 +15,17 @@
 
 pub mod batch;
 pub mod engine;
+pub mod history;
 pub mod provider;
 pub mod tools;
 
-pub use engine::{Engine, EngineConfig, EngineError, EngineEvent, RunSummary, ENGINE_PROMPT};
+pub use engine::{
+    Engine, EngineConfig, EngineError, EngineEvent, RunSummary, TurnControl, TurnOutcome,
+    ENGINE_PROMPT,
+};
 pub use infinity_agent_core::system::AgentEvent;
 pub use provider::ClawModelProvider;
-pub use tools::{ClawTool, ToolActivity, ToolHost};
+pub use tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
 
 /// Whether the user asked for the Infinity engine (`CLAW_ENGINE=infinity`).
 #[must_use]

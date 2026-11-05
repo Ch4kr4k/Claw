@@ -10,7 +10,7 @@
 //! yields and its driver stays free for user input, child reports and other
 //! work. The result re-enters the thread later as an [`InputMessage`].
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use infinity_agent_core::message::{InputMessage, InputMessageContent};
@@ -19,7 +19,10 @@ use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::{Text, ToolResult, ToolResultContent, UserContent};
 use rap_protocol::{ProviderCallId, ToolCallId};
-use runtime::{PermissionOutcome, PermissionPolicy};
+use runtime::{
+    HookRunResult, HookRunner, PermissionContext, PermissionOutcome, PermissionPolicy,
+    PermissionPrompter,
+};
 use tools::GlobalToolRegistry;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -64,10 +67,22 @@ pub enum ToolActivity {
 /// Callback receiving [`ToolActivity`]; called from worker threads.
 pub type ActivitySink = Arc<dyn Fn(ToolActivity) + Send + Sync>;
 
+/// Runs one tool call in place of the registry (for front ends with tools
+/// of their own, such as an interactive `AskUserQuestion`). Called from
+/// worker threads with the hook-updated input.
+pub type Executor = Arc<dyn Fn(&str, &serde_json::Value) -> Result<String, String> + Send + Sync>;
+
+/// Asks the user about calls the policy does not allow by itself. Calls are
+/// asked one at a time (the lock is held for the question).
+pub type SharedPrompter = Arc<Mutex<Box<dyn PermissionPrompter + Send>>>;
+
 /// State shared by every [`ClawTool`] of an engine.
 pub struct ToolHost {
     registry: GlobalToolRegistry,
     policy: PermissionPolicy,
+    hooks: Option<HookRunner>,
+    prompter: Option<SharedPrompter>,
+    executor: Option<Executor>,
     activity: Option<ActivitySink>,
 }
 
@@ -77,6 +92,9 @@ impl ToolHost {
         Self {
             registry,
             policy,
+            hooks: None,
+            prompter: None,
+            executor: None,
             activity: None,
         }
     }
@@ -87,14 +105,36 @@ impl ToolHost {
         self
     }
 
+    /// Runs the session's PreToolUse / PostToolUse hooks around each call.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: HookRunner) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
+    /// Asks `prompter` when the policy needs approval for a call.
+    #[must_use]
+    pub fn with_prompter(mut self, prompter: SharedPrompter) -> Self {
+        self.prompter = Some(prompter);
+        self
+    }
+
+    /// Runs calls through `executor` instead of the registry.
+    #[must_use]
+    pub fn with_executor(mut self, executor: Executor) -> Self {
+        self.executor = Some(executor);
+        self
+    }
+
     fn report(&self, activity: ToolActivity) {
         if let Some(sink) = &self.activity {
             sink(activity);
         }
     }
 
-    /// Checks the policy, then runs the tool. Blocking: call it from a
-    /// blocking-pool thread. The text is what the model sees.
+    /// The PreToolUse hook, the permission check, the tool, then the
+    /// PostToolUse hook, as the classic loop runs them. Blocking: call it
+    /// from a blocking-pool thread. The text is what the model sees.
     pub(crate) fn run(
         &self,
         thread: &str,
@@ -102,22 +142,120 @@ impl ToolHost {
         input: &serde_json::Value,
     ) -> (String, bool) {
         let input_text = serde_json::to_string(input).unwrap_or_default();
-        let (output, is_error) = match self.policy.authorize(name, &input_text, None) {
-            PermissionOutcome::Deny { reason } => (format!("Error: {reason}"), true),
-            PermissionOutcome::Allow => match self.registry.execute(name, input) {
-                Ok(output) => (output, false),
-                Err(error) => (format!("Error: {error}"), true),
+        let pre = self
+            .hooks
+            .as_ref()
+            .map(|hooks| hooks.run_pre_tool_use(name, &input_text));
+        let effective_input = pre
+            .as_ref()
+            .and_then(HookRunResult::updated_input)
+            .map_or_else(|| input_text.clone(), ToOwned::to_owned);
+        let outcome = match pre.as_ref().and_then(hook_stop) {
+            Some(verb) => PermissionOutcome::Deny {
+                reason: hook_message(
+                    pre.as_ref().expect("bug: hook stop without a hook result"),
+                    &format!("PreToolUse hook {verb} tool `{name}`"),
+                ),
             },
+            None => self.authorize(name, &effective_input, pre.as_ref()),
         };
+        let (mut output, mut is_error) = match outcome {
+            PermissionOutcome::Deny { reason } => (format!("Error: {reason}"), true),
+            PermissionOutcome::Allow => {
+                let value =
+                    serde_json::from_str(&effective_input).unwrap_or_else(|_| input.clone());
+                let result = match &self.executor {
+                    Some(executor) => executor(name, &value),
+                    None => self.registry.execute(name, &value),
+                };
+                match result {
+                    Ok(output) => (output, false),
+                    Err(error) => (format!("Error: {error}"), true),
+                }
+            }
+        };
+        if let Some(pre) = &pre {
+            output = merge_hook_feedback(pre.messages(), output, false);
+        }
+        if let Some(hooks) = &self.hooks {
+            let post = if is_error {
+                hooks.run_post_tool_use_failure(name, &effective_input, &output)
+            } else {
+                hooks.run_post_tool_use(name, &effective_input, &output, false)
+            };
+            let stopped = hook_stop(&post).is_some();
+            is_error |= stopped;
+            output = merge_hook_feedback(post.messages(), output, stopped);
+        }
         self.report(ToolActivity::Finished {
             thread: thread.to_string(),
             name: name.to_string(),
-            input: input_text,
+            input: effective_input,
             output: output.clone(),
             is_error,
         });
         (output, is_error)
     }
+
+    fn authorize(&self, name: &str, input: &str, pre: Option<&HookRunResult>) -> PermissionOutcome {
+        let context = pre.map_or_else(PermissionContext::default, |pre| {
+            PermissionContext::new(
+                pre.permission_override(),
+                pre.permission_reason().map(ToOwned::to_owned),
+            )
+        });
+        match &self.prompter {
+            Some(prompter) => {
+                let mut prompter = prompter
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let prompter: &mut dyn PermissionPrompter = &mut **prompter;
+                self.policy
+                    .authorize_with_context(name, input, &context, Some(prompter))
+            }
+            None => self
+                .policy
+                .authorize_with_context(name, input, &context, None),
+        }
+    }
+}
+
+/// Why a hook stopped the call, if it did.
+fn hook_stop(result: &HookRunResult) -> Option<&'static str> {
+    if result.is_cancelled() {
+        Some("cancelled")
+    } else if result.is_failed() {
+        Some("failed for")
+    } else if result.is_denied() {
+        Some("denied")
+    } else {
+        None
+    }
+}
+
+fn hook_message(result: &HookRunResult, fallback: &str) -> String {
+    if result.messages().is_empty() {
+        fallback.to_string()
+    } else {
+        result.messages().join("\n")
+    }
+}
+
+fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> String {
+    if messages.is_empty() {
+        return output;
+    }
+    let mut sections = Vec::new();
+    if !output.trim().is_empty() {
+        sections.push(output);
+    }
+    let label = if is_error {
+        "Hook feedback (error)"
+    } else {
+        "Hook feedback"
+    };
+    sections.push(format!("{label}:\n{}", messages.join("\n")));
+    sections.join("\n\n")
 }
 
 /// One claw tool exposed to the Infinity runtime.
