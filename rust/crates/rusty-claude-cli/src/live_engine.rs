@@ -1,4 +1,4 @@
-//! REPL turns on the Infinity engine (`CLAW_ENGINE=infinity`).
+//! Turns on the Infinity engine (the default; `CLAW_ENGINE=legacy` opts out).
 //!
 //! The session stays claw's: each turn seeds the engine's root thread with
 //! the session's messages and appends what the turn added, so checkpoints,
@@ -94,6 +94,30 @@ impl LiveCli {
         Ok(())
     }
 
+    /// One turn on the engine with nothing drawn (`-p --output-format
+    /// json`): the session is updated and saved as for a REPL turn, and the
+    /// turn comes back as the classic loop's summary, so the JSON output is
+    /// built the same way whichever loop ran it.
+    pub(crate) fn run_engine_turn_quiet(
+        &mut self,
+        input: &str,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let config = self.engine_config()?;
+        let history = self.runtime.session().messages.clone();
+        let control = TurnControl {
+            attachments: self.pending_attachments.clone(),
+            thread_id: Some(self.session.id.clone()),
+            ..TurnControl::default()
+        };
+        let outcome = Engine::new(config).run_turn_blocking(&history, input, control, |_| {})?;
+        for message in outcome.messages.iter().cloned() {
+            self.runtime.session_mut().push_message(message)?;
+        }
+        self.pending_attachments.clear();
+        self.persist_session()?;
+        Ok(turn_summary(&outcome))
+    }
+
     fn engine_config(&self) -> Result<EngineConfig, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         let runtime_config = ConfigLoader::default_for(&cwd).load()?;
@@ -115,10 +139,21 @@ impl LiveCli {
             .with_reasoning_effort(self.reasoning_effort.clone())
             .with_max_output_tokens(reply_budget(&self.model))
             .with_image_input(sends_images(&self.model));
-        let executor_registry = registry.clone();
-        let mcp_state = self.runtime.mcp_state.clone();
+        // One CLI executor for the turn, output off (the turn view draws):
+        // it repairs tool names, enforces --allowedTools, pages and outlines
+        // reads to the model's window, flags repeated calls, runs ToolSearch
+        // (loading what it finds) and MCP tools, as in the classic loop.
+        let cli_executor = Arc::new(
+            CliToolExecutor::new(
+                self.allowed_tools.clone(),
+                false,
+                registry.clone(),
+                self.runtime.mcp_state.clone(),
+            )
+            .with_model(&self.model),
+        );
         let tool_list = engine_tool_list(&registry, &self.model, self.allowed_tools.clone());
-        let search_allowed = self.allowed_tools.clone();
+        let mcp_configured = self.runtime.mcp_state.is_some();
         let mut config = EngineConfig::for_provider(
             provider,
             self.effective_system_prompt().join("\n\n"),
@@ -127,8 +162,11 @@ impl LiveCli {
         );
         config.allowed_tools.clone_from(&self.allowed_tools);
         config.hooks = Some(runtime::HookRunner::from_feature_config(&feature_config));
-        config.runtime_tools = mcp_state.is_some();
+        config.runtime_tools = mcp_configured;
         config.tool_list = Some(tool_list);
+        let resolver = Arc::clone(&cli_executor);
+        config.resolve_tool_name =
+            Some(Arc::new(move |name: &str| resolver.resolve_tool_name(name)));
         let prompter: Box<dyn runtime::PermissionPrompter + Send> =
             Box::new(CliPermissionPrompter::new(self.permission_mode));
         config.prompter = Some(Arc::new(Mutex::new(prompter)));
@@ -139,28 +177,42 @@ impl LiveCli {
                 runtime::turn_keys::end_tool();
                 return answer;
             }
-            runtime::turn_keys::begin_tool(&tool_activity_label(name, &input.to_string()));
-            let result = match &mcp_state {
-                // claw's own search: it also loads what it finds into the
-                // tool list (`sent_tool_definitions`) for later requests.
-                _ if name == "ToolSearch" => CliToolExecutor::new(
-                    search_allowed.clone(),
-                    false,
-                    executor_registry.clone(),
-                    mcp_state.clone(),
-                )
-                .execute_search_tool(input.clone())
-                .map_err(|error| error.to_string()),
-                Some(mcp_state) if executor_registry.has_runtime_tool(name) => {
-                    tool_executor::run_mcp_tool(mcp_state, name, input.clone())
-                        .map_err(|error| error.to_string())
-                }
-                _ => executor_registry.execute(name, input),
-            };
+            let input = input.to_string();
+            runtime::turn_keys::begin_tool(&tool_activity_label(name, &input));
+            let result = cli_executor
+                .run_call(name, &input)
+                .map_err(|error| error.to_string());
             runtime::turn_keys::end_tool();
             result
         }));
         Ok(config)
+    }
+}
+
+/// An engine turn as the classic loop reports one: the replies, the tool
+/// results, completions as iterations, and the usage of the turn.
+fn turn_summary(outcome: &claw_engine::TurnOutcome) -> runtime::TurnSummary {
+    let of_role = |role: MessageRole| {
+        outcome
+            .messages
+            .iter()
+            .filter(|message| message.role == role)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let usage = outcome
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| message.usage)
+        .unwrap_or_default();
+    runtime::TurnSummary {
+        assistant_messages: of_role(MessageRole::Assistant),
+        tool_results: of_role(MessageRole::Tool),
+        prompt_cache_events: Vec::new(),
+        iterations: outcome.summary.completions,
+        usage,
+        auto_compaction: None,
     }
 }
 

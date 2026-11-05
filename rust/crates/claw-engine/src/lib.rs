@@ -25,7 +25,7 @@ pub use engine::{
 };
 pub use infinity_agent_core::system::AgentEvent;
 pub use infinity_provider_protocol::ToolDefinition;
-pub use provider::{ClawModelProvider, ToolList, THREAD_TOOLS};
+pub use provider::{ClawModelProvider, NameResolver, ToolList, THREAD_TOOLS};
 pub use tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
 
 /// Whether turns run on the Infinity engine: the default, unless
@@ -36,11 +36,4 @@ pub fn requested() -> bool {
         let value = value.trim();
         value.eq_ignore_ascii_case("legacy") || value.eq_ignore_ascii_case("classic")
     })
-}
-
-/// Whether `CLAW_ENGINE=infinity` was set explicitly (for output whose
-/// shape differs from the classic loop's, such as `-p` JSON).
-#[must_use]
-pub fn explicitly_requested() -> bool {
-    std::env::var("CLAW_ENGINE").is_ok_and(|value| value.trim().eq_ignore_ascii_case("infinity"))
 }

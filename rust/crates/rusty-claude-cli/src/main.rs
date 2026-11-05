@@ -23,7 +23,6 @@ mod command_actions;
 mod desktop_agent;
 mod diff_panel;
 mod diff_view;
-mod engine_prompt;
 mod init;
 mod input;
 mod keybindings;
@@ -1190,20 +1189,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let resolved_model = resolve_repl_model(model)?;
-            // Text output goes through LiveCli (on the engine too, see
-            // `run_turn_inner`), so the run is saved as a session. The
-            // engine's JSON summary has another shape than the classic
-            // JSON, so only an explicit CLAW_ENGINE=infinity gets it.
-            if claw_engine::explicitly_requested() && matches!(output_format, CliOutputFormat::Json)
-            {
-                return engine_prompt::run(
-                    &effective_prompt,
-                    &resolved_model,
-                    output_format,
-                    allowed_tools,
-                    permission_mode,
-                );
-            }
             let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             // A background session (`/background`) continues a saved one.
@@ -14467,7 +14452,7 @@ impl CliToolExecutor {
     /// which failed as unknown or "not enabled" tools. Like opencode's tool
     /// call repair, a known alias or a name that differs only in case or
     /// `_`/`-` is mapped to the real tool; anything else is left as is.
-    fn resolve_tool_name(&self, requested: &str) -> String {
+    pub(crate) fn resolve_tool_name(&self, requested: &str) -> String {
         let actual = self.tool_registry.actual_tool_names();
         if actual.iter().any(|name| name == requested)
             || self.tool_registry.has_runtime_tool(requested)

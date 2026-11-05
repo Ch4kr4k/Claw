@@ -221,30 +221,37 @@ each. A single call goes through untouched.
 
 4. **Flip the default, then retire the old loop**
    - Step 1 (done): `claw_engine::requested()` is true unless `CLAW_ENGINE`
-     is `legacy` or `classic`. `-p --output-format json` keeps the classic
-     JSON contract unless `CLAW_ENGINE=infinity` is set explicitly
-     (`explicitly_requested`), because scripts parse it. `--compact` and
-     the prompt-backed commands (`/commit`, `/pr`, …) still use the classic
-     helpers.
-   - Step 2 (next): move the `Agent` sub-agents, JSON output, compact
-     mode and prompt-backed commands onto the engine. Port the CLI
-     executor's tool-name repair and read-pagination nudges into the
-     engine executor.
+     is `legacy` or `classic`.
+   - Step 2, part 1 (done):
+     - *The CLI's tool handling on the engine.* `CliToolExecutor::execute`'s
+       body is now `run_call(&self)`, and the engine REPL shares one
+       executor (output off) across parallel calls. That gives the engine
+       name repair, the `--allowedTools` check, read paging and outlines
+       sized to the model's window, repeated-call notes, ToolSearch loading
+       and MCP calls, as in the classic loop. Name repair must happen
+       before Infinity rejects an unknown tool, so it also runs in the
+       stream (`EngineConfig::resolve_tool_name` → `ClawPrompt`). A model
+       calling `Read` now runs `read_file`. The classic loop checks
+       permissions under the unrepaired name, so it asks before `Read`;
+       the engine doesn't.
+     - *`-p --output-format json` on the engine, same contract.*
+       `run_engine_turn_quiet` returns the classic `TurnSummary`, so the
+       JSON is built by the same code. Keys, message, tool uses and
+       results, iterations, usage and cost match the classic loop on the
+       mock scenarios. `engine_prompt.rs` (the separate engine summary) is
+       gone.
+   - Step 2, still to do: `Agent` sub-agents, `--compact`, and the
+     prompt-backed commands (`/commit`, `/pr`, `/bughunter`, …) onto the
+     engine.
    - Step 3: after a release with `CLAW_ENGINE=legacy` available, delete
      `ConversationRuntime`'s loop. `runtime` keeps sessions, config,
      prompt assembly and permissions.
 
 ## Current limitations
 
-- `-p` with `--output-format json` has no permission prompts and isn't
-  saved as a session (text output has both).
 - Slow tools run on tokio's blocking pool and can't be cancelled once
   started. A stopped turn returns at once and leaves them to finish.
 - Each turn builds a fresh engine, so child threads don't outlive the turn
   that spawned them.
-- claw's tool-name repair (calling `Read` for `read_file`, …) and its
-  repeated-call and pagination nudges live in `CliToolExecutor` and aren't
-  applied on the engine. An unknown name gets Infinity's "tool does not
-  exist" result, and the model retries.
 - `Agent` sub-agents still run the classic loop inside; they move with
   phase 4.

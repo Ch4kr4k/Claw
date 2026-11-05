@@ -550,13 +550,18 @@ impl LiveCli {
         &mut self,
         input: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
+        let summary = if claw_engine::requested() {
+            self.run_engine_turn_quiet(input)?
+        } else {
+            let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+            let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+            let result = runtime.run_turn(input, Some(&mut permission_prompter));
+            hook_abort_monitor.stop();
+            let summary = result?;
+            self.replace_runtime(runtime)?;
+            self.persist_session()?;
+            summary
+        };
         println!(
             "{}",
             json!({

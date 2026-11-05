@@ -70,15 +70,14 @@ Dependency rules that matter:
 ## The asynchronous engine (default)
 
 Turns run on `claw-engine` (`CLAW_ENGINE=legacy` falls back to
-`ConversationRuntime`'s loop; `-p` JSON stays on it unless
-`CLAW_ENGINE=infinity`). Every input is a message to a thread. A thread's
+`ConversationRuntime`'s loop). Every input is a message to a thread. A thread's
 slice runs one completion and persists the turn, then dispatches its tool
 call and yields; the result comes back as a new message. Threads are FIFO
 inside themselves and concurrent with each other, and the model creates
 them with `spawn_thread`.
 
 ```text
-claw -p ──► engine_prompt::run ──► Engine::run_prompt_blocking
+REPL / claw -p ──► LiveCli::run_turn_inner ──► live_engine ──► Engine::run_turn_blocking
               (multi-thread tokio runtime + LocalSet)
                  LaunchingSystem ── root thread ── child threads …
                    │ ModelProvider = ClawPrompt(ClawModelProvider)

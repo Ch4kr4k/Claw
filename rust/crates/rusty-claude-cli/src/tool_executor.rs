@@ -324,11 +324,19 @@ impl ToolExecutor for CliToolExecutor {
     }
 
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.run_call(tool_name, input)
+    }
+}
+
+impl CliToolExecutor {
+    /// One call, as [`ToolExecutor::execute`] runs it; through a shared
+    /// reference so the engine can run calls at the same time.
+    pub(crate) fn run_call(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         let _timer = self.emit_output.then(step_stats::ToolTimer::start);
         let tool_name = &self.resolve_tool_name(tool_name);
         self.check_allowed(tool_name)?;
         if let Some((offset, next_input)) = self.next_page_instead(tool_name, input) {
-            let page = self.execute(tool_name, &next_input)?;
+            let page = self.run_call(tool_name, &next_input)?;
             return Ok(format!(
                 "[You asked for this file from the start again, right after reading a page \
                  of it that was cut. This is the next page (offset={offset}); pass `offset` \

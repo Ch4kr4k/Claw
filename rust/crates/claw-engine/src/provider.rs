@@ -159,7 +159,13 @@ pub struct ClawPrompt {
     /// behind `ToolSearch`). The engine's thread tools are always offered.
     /// Every tool stays registered, so a call to one not offered still runs.
     pub tool_list: Option<ToolList>,
+    /// Maps the name a model called to the tool it means (models trained on
+    /// other agents call `Read`, `Bash`, …), before the engine checks it.
+    pub resolve_name: Option<NameResolver>,
 }
+
+/// See [`ClawPrompt::resolve_name`].
+pub type NameResolver = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// Computes the claw tools a request offers; see [`ClawPrompt::tool_list`].
 pub type ToolList = std::sync::Arc<dyn Fn() -> Vec<ToolDefinition> + Send + Sync>;
@@ -198,23 +204,25 @@ impl ModelProvider for ClawPrompt {
             request.tools = tools;
         }
         let inner = self.inner.invoke_model(model_id, request).await?;
-        Ok(pack_tool_calls(inner))
+        Ok(pack_tool_calls(inner, self.resolve_name.clone()))
     }
 }
 
 /// `inner` with its tool calls packed into one, sent just before `Final`
 /// (or at the end of the stream).
-fn pack_tool_calls(inner: ModelStream) -> ModelStream {
+fn pack_tool_calls(inner: ModelStream, resolve_name: Option<NameResolver>) -> ModelStream {
     use futures_util::StreamExt;
     struct State {
         inner: ModelStream,
         calls: Vec<ToolCall>,
+        resolve_name: Option<NameResolver>,
         pending: VecDeque<Result<StreamChunk, CompletionError>>,
         done: bool,
     }
     let state = State {
         inner,
         calls: Vec::new(),
+        resolve_name,
         pending: VecDeque::new(),
         done: false,
     };
@@ -227,7 +235,12 @@ fn pack_tool_calls(inner: ModelStream) -> ModelStream {
                 return None;
             }
             match state.inner.next().await {
-                Some(Ok(StreamChunk::ToolCall(call))) => state.calls.push(call),
+                Some(Ok(StreamChunk::ToolCall(mut call))) => {
+                    if let Some(resolve) = &state.resolve_name {
+                        call.function.name = resolve(&call.function.name);
+                    }
+                    state.calls.push(call);
+                }
                 Some(Ok(StreamChunk::Final(final_response))) => {
                     let packed = batch::pack(std::mem::take(&mut state.calls));
                     state

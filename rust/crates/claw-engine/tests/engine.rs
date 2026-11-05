@@ -149,6 +149,7 @@ fn config_with_images(
         executor: None,
         runtime_tools: false,
         tool_list: None,
+        resolve_tool_name: None,
     };
     (config, requests)
 }
@@ -656,4 +657,29 @@ fn a_tool_list_limits_what_is_offered_but_not_what_runs() {
             "send_message_to_child"
         ]
     );
+}
+
+#[test]
+fn tool_names_from_other_agents_are_repaired_before_the_engine_checks_them() {
+    let (mut config, _) = config(PermissionMode::DangerFullAccess, |request| {
+        let input = last_input(request);
+        if input == "go" {
+            call("Bash", json!({ "command": "echo repaired" }))
+        } else if input.contains("repaired") {
+            text("ran")
+        } else {
+            text(&format!("unexpected: {input}"))
+        }
+    });
+    config.resolve_tool_name = Some(Arc::new(|name: &str| {
+        if name == "Bash" {
+            "bash".to_string()
+        } else {
+            name.to_string()
+        }
+    }));
+    let outcome = Engine::new(config)
+        .run_turn_blocking(&[], "go", TurnControl::default(), |_| {})
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "ran");
 }

@@ -21,7 +21,7 @@ use tokio::task::LocalSet;
 use tools::GlobalToolRegistry;
 
 use crate::history;
-use crate::provider::{ClawModelProvider, ClawPrompt, ToolList};
+use crate::provider::{ClawModelProvider, ClawPrompt, NameResolver, ToolList};
 use crate::tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
 
 type System = LaunchingSystem<InMemoryConversationStore, InMemoryStateStore, NoRapHttp>;
@@ -79,6 +79,8 @@ pub struct EngineConfig {
     /// The claw tools each request offers (see [`ClawPrompt::tool_list`]);
     /// `None` offers every registered tool.
     pub tool_list: Option<ToolList>,
+    /// Repairs tool names a model gets wrong (see [`ClawPrompt::resolve_name`]).
+    pub resolve_tool_name: Option<NameResolver>,
 }
 
 impl EngineConfig {
@@ -103,6 +105,7 @@ impl EngineConfig {
             executor: None,
             runtime_tools: false,
             tool_list: None,
+            resolve_tool_name: None,
         })
     }
 
@@ -128,6 +131,7 @@ impl EngineConfig {
             executor: None,
             runtime_tools: false,
             tool_list: None,
+            resolve_tool_name: None,
         }
     }
 }
@@ -294,6 +298,7 @@ impl Engine {
             Arc::new(ClawPrompt {
                 inner: self.config.provider,
                 tool_list: self.config.tool_list,
+                resolve_name: self.config.resolve_tool_name,
             }),
             &self.config.model,
         )
