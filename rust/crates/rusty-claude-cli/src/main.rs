@@ -1190,7 +1190,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let resolved_model = resolve_repl_model(model)?;
-            if claw_engine::requested() {
+            // Text output goes through LiveCli (on the engine too, see
+            // `run_turn_inner`), so the run is saved as a session; the
+            // engine's JSON summary has its own path.
+            if claw_engine::requested() && matches!(output_format, CliOutputFormat::Json) {
                 return engine_prompt::run(
                     &effective_prompt,
                     &resolved_model,

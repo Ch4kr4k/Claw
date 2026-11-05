@@ -218,6 +218,18 @@ impl CliToolExecutor {
                 "runtime tool `{tool_name}` is unavailable without configured MCP servers"
             )));
         };
+        run_mcp_tool(mcp_state, tool_name, value)
+    }
+}
+
+/// Runs one MCP runtime tool (a server tool or the MCP wrapper tools) on
+/// the session's MCP state.
+pub(crate) fn run_mcp_tool(
+    mcp_state: &Mutex<RuntimeMcpState>,
+    tool_name: &str,
+    value: serde_json::Value,
+) -> Result<String, ToolError> {
+    {
         let mut mcp_state = mcp_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -74,6 +74,8 @@ pub struct EngineConfig {
     pub prompter: Option<SharedPrompter>,
     /// Runs calls in place of the registry.
     pub executor: Option<Executor>,
+    /// Offer the registry's runtime (MCP) tools; `executor` must run them.
+    pub runtime_tools: bool,
 }
 
 impl EngineConfig {
@@ -96,7 +98,32 @@ impl EngineConfig {
             hooks: None,
             prompter: None,
             executor: None,
+            runtime_tools: false,
         })
+    }
+
+    /// A config served by `provider` (built with claw's options: effort,
+    /// reply budget, image support).
+    #[must_use]
+    pub fn for_provider(
+        provider: ClawModelProvider,
+        system_prompt: String,
+        registry: GlobalToolRegistry,
+        policy: PermissionPolicy,
+    ) -> Self {
+        let model = provider.entry().model_id.clone();
+        Self {
+            provider: Arc::new(provider),
+            model,
+            system_prompt,
+            registry,
+            policy,
+            allowed_tools: None,
+            hooks: None,
+            prompter: None,
+            executor: None,
+            runtime_tools: false,
+        }
     }
 }
 
@@ -122,6 +149,10 @@ pub struct TurnControl {
     /// goes to the root thread at once (interrupting a streaming reply, as
     /// user text does on the engine).
     pub queued_prompts: Option<Box<dyn FnMut() -> Vec<String>>>,
+    /// Blocks sent with the prompt (`@image`, `/image`): they reach the
+    /// model just before the prompt's text, and are not part of
+    /// [`TurnOutcome::messages`].
+    pub attachments: Vec<runtime::ContentBlock>,
 }
 
 /// What one turn did.
@@ -245,6 +276,9 @@ impl Engine {
         if let Some(executor) = self.config.executor {
             host = host.with_executor(executor);
         }
+        if self.config.runtime_tools {
+            host = host.with_runtime_tools();
+        }
         let host = Arc::new(host);
         let tools = ClawTool::all(&host, self.config.allowed_tools.as_ref());
         let model = StaticModel::new(
@@ -270,8 +304,14 @@ impl Engine {
         let root_id = root.thread_id().to_owned();
         let root_name = root_id.as_str().to_string();
         // The conversation so far, before the thread's first slice loads it.
+        let attachments = runtime::ConversationMessage {
+            role: runtime::MessageRole::User,
+            blocks: std::mem::take(&mut control.attachments),
+            usage: None,
+        };
         let seed = history::to_infinity(history)
             .into_iter()
+            .chain(history::to_infinity(std::slice::from_ref(&attachments)))
             .map(|entry| (entry, uuid::Uuid::new_v4().to_string()))
             .collect::<Vec<_>>();
         let seeded = seed.len();

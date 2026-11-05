@@ -371,6 +371,15 @@ pub struct FooterStatus {
     pub cycle: Vec<(String, String)>,
 }
 
+/// Child agent threads running on the asynchronous engine, shown in the
+/// status line next to background shells.
+static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets how many child agent threads are running (0 hides the count).
+pub fn set_live_threads(threads: usize) {
+    LIVE_THREADS.store(threads, Ordering::SeqCst);
+}
+
 /// Sets what the status line shows, idle and during a turn.
 pub fn set_footer_status(status: FooterStatus) {
     *FOOTER.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
@@ -402,6 +411,13 @@ pub fn footer_status_line(width: usize, colored: bool) -> String {
         details.push(format!(
             "{shells} shell{}",
             if shells == 1 { "" } else { "s" }
+        ));
+    }
+    let threads = LIVE_THREADS.load(Ordering::SeqCst);
+    if threads > 0 {
+        details.push(format!(
+            "{threads} thread{}",
+            if threads == 1 { "" } else { "s" }
         ));
     }
     compose_footer(&mode, &mode_sgr, &details, width, colored)

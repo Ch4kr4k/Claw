@@ -40,6 +40,7 @@ impl LiveCli {
         let control = TurnControl {
             abort: Some(abort),
             queued_prompts: Some(Box::new(runtime::turn_keys::take_queued_for_running_turn)),
+            attachments: self.pending_attachments.clone(),
         };
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -48,6 +49,7 @@ impl LiveCli {
         let result = Engine::new(config)
             .run_turn_blocking(&history, input, control, |event| view.show(event));
         view.flush();
+        runtime::turn_keys::set_live_threads(0);
         drop(key_watcher);
         render::stop_thinking();
         let outcome = match result {
@@ -99,17 +101,28 @@ impl LiveCli {
             .feature_config()
             .clone()
             .with_hooks(runtime_config.hooks().merged(&plugin_hooks));
-        let registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?;
+        // The session's registry: built-ins, plugin tools and the MCP
+        // servers' tools, as the classic loop has them.
+        let registry = match self.runtime.runtime.as_ref() {
+            Some(rt) => rt.tool_executor().tool_registry.clone(),
+            None => GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?,
+        };
         let policy = permission_policy(self.permission_mode, &feature_config, &registry)?;
+        let provider = claw_engine::ClawModelProvider::from_model(&self.model)?
+            .with_reasoning_effort(self.reasoning_effort.clone())
+            .with_max_output_tokens(reply_budget(&self.model))
+            .with_image_input(sends_images(&self.model));
         let executor_registry = registry.clone();
-        let mut config = EngineConfig::for_model(
-            &self.model,
+        let mcp_state = self.runtime.mcp_state.clone();
+        let mut config = EngineConfig::for_provider(
+            provider,
             self.effective_system_prompt().join("\n\n"),
             registry,
             policy,
-        )?;
+        );
         config.allowed_tools.clone_from(&self.allowed_tools);
         config.hooks = Some(runtime::HookRunner::from_feature_config(&feature_config));
+        config.runtime_tools = mcp_state.is_some();
         let prompter: Box<dyn runtime::PermissionPrompter + Send> =
             Box::new(CliPermissionPrompter::new(self.permission_mode));
         config.prompter = Some(Arc::new(Mutex::new(prompter)));
@@ -121,7 +134,13 @@ impl LiveCli {
                 return answer;
             }
             runtime::turn_keys::begin_tool(&tool_activity_label(name, &input.to_string()));
-            let result = executor_registry.execute(name, input);
+            let result = match &mcp_state {
+                Some(mcp_state) if executor_registry.has_runtime_tool(name) => {
+                    tool_executor::run_mcp_tool(mcp_state, name, input.clone())
+                        .map_err(|error| error.to_string())
+                }
+                _ => executor_registry.execute(name, input),
+            };
             runtime::turn_keys::end_tool();
             result
         }));
@@ -140,6 +159,9 @@ struct TurnView {
     child_text: BTreeMap<String, String>,
     /// Whether the root's current reply has shown text yet.
     streaming: bool,
+    /// Child threads whose driver is running, for the status line.
+    live_children: std::collections::BTreeSet<String>,
+    root: Option<String>,
 }
 
 impl TurnView {
@@ -172,7 +194,19 @@ impl TurnView {
                 event,
             } => self.show_root(event),
             EngineEvent::Agent { thread, event, .. } => self.show_child(thread, event),
-            EngineEvent::Tool(ToolActivity::Started { .. }) | EngineEvent::Lifecycle { .. } => {}
+            EngineEvent::Lifecycle { thread, live } => {
+                // The first thread to go live is the root.
+                let root = self.root.get_or_insert_with(|| thread.clone());
+                if thread != root {
+                    if *live {
+                        self.live_children.insert(thread.clone());
+                    } else {
+                        self.live_children.remove(thread);
+                    }
+                    runtime::turn_keys::set_live_threads(self.live_children.len());
+                }
+            }
+            EngineEvent::Tool(ToolActivity::Started { .. }) => {}
             EngineEvent::Tool(ToolActivity::Finished {
                 thread,
                 name,

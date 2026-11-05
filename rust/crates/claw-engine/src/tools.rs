@@ -17,7 +17,9 @@ use infinity_agent_core::message::{InputMessage, InputMessageContent};
 use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
-use infinity_provider_protocol::{Text, ToolResult, ToolResultContent, UserContent};
+use infinity_provider_protocol::{
+    Image, ImageMediaType, ImageSource, Text, ToolResult, ToolResultContent, UserContent,
+};
 use rap_protocol::{ProviderCallId, ToolCallId};
 use runtime::{
     HookRunResult, HookRunner, PermissionContext, PermissionOutcome, PermissionPolicy,
@@ -83,6 +85,9 @@ pub struct ToolHost {
     hooks: Option<HookRunner>,
     prompter: Option<SharedPrompter>,
     executor: Option<Executor>,
+    /// Whether the registry's runtime (MCP) tools are offered: only when the
+    /// executor can run them.
+    runtime_tools: bool,
     activity: Option<ActivitySink>,
 }
 
@@ -95,6 +100,7 @@ impl ToolHost {
             hooks: None,
             prompter: None,
             executor: None,
+            runtime_tools: false,
             activity: None,
         }
     }
@@ -116,6 +122,14 @@ impl ToolHost {
     #[must_use]
     pub fn with_prompter(mut self, prompter: SharedPrompter) -> Self {
         self.prompter = Some(prompter);
+        self
+    }
+
+    /// Offers the registry's runtime (MCP) tools too; the executor (see
+    /// [`Self::with_executor`]) must run them.
+    #[must_use]
+    pub fn with_runtime_tools(mut self) -> Self {
+        self.runtime_tools = true;
         self
     }
 
@@ -277,9 +291,11 @@ impl ClawTool {
         host.registry
             .definitions(allowed)
             .into_iter()
-            // MCP tools need the session's MCP state, which the engine does
-            // not hold yet (docs/infinity-engine.md, phase 3).
-            .filter(|definition| !host.registry.has_runtime_tool(&definition.name))
+            // MCP tools need the session's MCP state, which only a front
+            // end's executor holds.
+            .filter(|definition| {
+                host.runtime_tools || !host.registry.has_runtime_tool(&definition.name)
+            })
             .map(|definition| {
                 Box::new(ClawTool {
                     name: definition.name,
@@ -304,12 +320,46 @@ impl ClawTool {
     }
 }
 
-fn tool_result(id: &str, call_id: Option<String>, text: String) -> ToolResult {
+fn tool_result(id: &str, call_id: Option<String>, output: String, is_error: bool) -> ToolResult {
+    let (text, images) = if is_error {
+        (output, Vec::new())
+    } else {
+        with_images(output)
+    };
+    let mut content = vec![ToolResultContent::Text(Text { text })];
+    content.extend(images);
     ToolResult {
         id: id.to_string(),
         call_id,
-        content: vec![ToolResultContent::Text(Text { text })],
+        content,
     }
+}
+
+/// The pictures a tool result names with `claw-image: /path` lines (the X11
+/// tool's screenshots, rendered pages), read and size-budgeted as the
+/// classic loop does, plus the text with any note about images left out.
+#[must_use]
+pub fn with_images(output: String) -> (String, Vec<ToolResultContent>) {
+    if !output.contains(runtime::tool_images::TOOL_IMAGE_MARKER) {
+        return (output, Vec::new());
+    }
+    let mut message = runtime::ConversationMessage::tool_result("", "", output, false);
+    runtime::tool_images::attach_tool_images(&mut message);
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in message.blocks {
+        match block {
+            runtime::ContentBlock::ToolResult { output, .. } => text = output,
+            runtime::ContentBlock::Image {
+                media_type, data, ..
+            } => images.push(ToolResultContent::Image(Image {
+                data: ImageSource::Base64(data),
+                media_type: ImageMediaType::from_mime_type(&media_type),
+            })),
+            _ => {}
+        }
+    }
+    (text, images)
 }
 
 #[async_trait]
@@ -340,13 +390,14 @@ impl Tool<ChannelSender> for ClawTool {
         if !runs_inline(&self.name) {
             return None;
         }
-        let (output, _) = self
+        let (output, is_error) = self
             .run_blocking(context.group_id.as_str().to_string(), args.clone())
             .await;
         Some(tool_result(
             id.as_str(),
             call_id.map(|call_id| call_id.as_str().to_string()),
             output,
+            is_error,
         ))
     }
 
@@ -369,14 +420,16 @@ impl Tool<ChannelSender> for ClawTool {
         // Return immediately: the thread yields while the tool runs, and the
         // result comes back through the input queue like any other message.
         tokio::spawn(async move {
-            let (output, _) = tokio::task::spawn_blocking(move || host.run(&thread, &name, &args))
-                .await
-                .unwrap_or_else(|error| (format!("Error: tool panicked: {error}"), true));
+            let (output, is_error) =
+                tokio::task::spawn_blocking(move || host.run(&thread, &name, &args))
+                    .await
+                    .unwrap_or_else(|error| (format!("Error: tool panicked: {error}"), true));
             let message = InputMessage {
                 content: InputMessageContent::User(UserContent::ToolResult(tool_result(
                     id.as_str(),
                     call_id.map(ProviderCallId::into_inner),
                     output,
+                    is_error,
                 ))),
                 group_id,
                 metadata: None,

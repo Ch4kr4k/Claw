@@ -116,6 +116,14 @@ fn config(
     mode: PermissionMode,
     script: impl Fn(&CompletionRequest) -> Vec<StreamChunk> + Send + Sync + 'static,
 ) -> (EngineConfig, Requests) {
+    config_with_images(mode, false, script)
+}
+
+fn config_with_images(
+    mode: PermissionMode,
+    images: bool,
+    script: impl Fn(&CompletionRequest) -> Vec<StreamChunk> + Send + Sync + 'static,
+) -> (EngineConfig, Requests) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let model = ScriptedModel {
         script: Box::new(script),
@@ -126,7 +134,7 @@ fn config(
         display_name: "scripted".to_string(),
         context_window: 200_000,
         max_output_tokens: None,
-        supports_image_input: false,
+        supports_image_input: images,
     };
     let registry = GlobalToolRegistry::builtin();
     let config = EngineConfig {
@@ -139,6 +147,7 @@ fn config(
         hooks: None,
         prompter: None,
         executor: None,
+        runtime_tools: false,
     };
     (config, requests)
 }
@@ -370,7 +379,7 @@ fn abort_stops_a_running_tool_turn() {
             "wait",
             TurnControl {
                 abort: Some(abort),
-                queued_prompts: None,
+                ..TurnControl::default()
             },
             |_| {},
         )
@@ -405,7 +414,6 @@ fn prompts_typed_during_the_turn_reach_the_thread() {
             &[],
             "start",
             TurnControl {
-                abort: None,
                 queued_prompts: Some(Box::new(move || {
                     if sent {
                         Vec::new()
@@ -414,6 +422,7 @@ fn prompts_typed_during_the_turn_reach_the_thread() {
                         vec!["also check the tests".to_string()]
                     }
                 })),
+                ..TurnControl::default()
             },
             |_| {},
         )
@@ -509,4 +518,79 @@ fn pre_tool_hook_can_deny_a_call() {
         .run_turn_blocking(&[], "run", TurnControl::default(), |_| {})
         .expect("turn");
     assert_eq!(outcome.summary.final_text, "hook said no");
+}
+
+/// A 1×1 PNG.
+const PIXEL: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0,
+    0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99, 0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn tool_images_reach_a_model_that_reads_them() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let png = dir.path().join("shot.png");
+    std::fs::write(&png, PIXEL).expect("write png");
+    let png_text = png.display().to_string();
+    let (mut config, requests) =
+        config_with_images(PermissionMode::DangerFullAccess, true, |request| {
+            if last_input(request) == "look" {
+                call("bash", json!({ "command": "screenshot" }))
+            } else {
+                text("seen")
+            }
+        });
+    // Like the X11 tool: a plain-text result naming the picture.
+    config.executor = Some(Arc::new(move |_: &str, _: &serde_json::Value| {
+        Ok(format!("took a screenshot\nclaw-image: {png_text}"))
+    }));
+    let outcome = Engine::new(config)
+        .run_turn_blocking(&[], "look", TurnControl::default(), |_| {})
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "seen");
+    let requests = requests.lock().expect("requests");
+    let with_image = requests.iter().any(|request| {
+        request.chat_history.iter().any(|message| match message {
+            Message::User { content } => content.iter().any(|item| match item {
+                UserContent::ToolResult(result) => result
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, ToolResultContent::Image(_))),
+                _ => false,
+            }),
+            Message::Assistant { .. } => false,
+        })
+    });
+    assert!(with_image, "the screenshot was attached to the bash result");
+}
+
+#[test]
+fn attachments_go_just_before_the_prompt_and_stay_out_of_the_outcome() {
+    let (config, requests) = config(PermissionMode::ReadOnly, |request| {
+        if history_text(request).contains("attached-note") {
+            text("got the attachment")
+        } else {
+            text("nothing attached")
+        }
+    });
+    let outcome = Engine::new(config)
+        .run_turn_blocking(
+            &[],
+            "see attachment",
+            TurnControl {
+                attachments: vec![ContentBlock::Text {
+                    text: "attached-note".into(),
+                }],
+                ..TurnControl::default()
+            },
+            |_| {},
+        )
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "got the attachment");
+    let first = &requests.lock().expect("requests")[0];
+    assert_eq!(first.chat_history.len(), 2, "attachment, then the prompt");
+    assert_eq!(outcome.messages.len(), 2, "prompt and reply only");
 }

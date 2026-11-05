@@ -268,16 +268,26 @@ impl Tool<ChannelSender> for BatchTool {
         let sender = context.message_sender.clone();
         let group_id = context.group_id.clone();
         tokio::spawn(async move {
-            let text = tokio::task::spawn_blocking(move || {
-                encode_results(&run_batch(&host, &thread, &calls))
+            let (text, images) = tokio::task::spawn_blocking(move || {
+                let mut images = Vec::new();
+                let mut results = run_batch(&host, &thread, &calls);
+                for result in results.iter_mut().filter(|result| !result.is_error) {
+                    let (text, found) =
+                        crate::tools::with_images(std::mem::take(&mut result.output));
+                    result.output = text;
+                    images.extend(found);
+                }
+                (encode_results(&results), images)
             })
             .await
-            .unwrap_or_else(|error| format!("Error: tool batch panicked: {error}"));
+            .unwrap_or_else(|error| (format!("Error: tool batch panicked: {error}"), Vec::new()));
+            let mut content = vec![ToolResultContent::Text(Text { text })];
+            content.extend(images);
             let message = InputMessage {
                 content: InputMessageContent::User(UserContent::ToolResult(ToolResult {
                     id: id.as_str().to_string(),
                     call_id: call_id.map(ProviderCallId::into_inner),
-                    content: vec![ToolResultContent::Text(Text { text })],
+                    content,
                 })),
                 group_id,
                 metadata: None,

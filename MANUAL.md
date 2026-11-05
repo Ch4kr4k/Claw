@@ -830,20 +830,19 @@ CLAW_ENGINE=infinity claw --permission-mode workspace-write -p "review src/ in p
   learning work as usual: the session is still claw's own, and each turn
   starts from it and saves what it added.
 
-**With `-p`**, the answer goes to stdout. Tool lines, child-thread output and a summary
-(threads, completions, tokens) go to stderr. With `--output-format json`,
-only a summary object is printed (`engine`, `message`, `threads`,
-`completions`, `usage`).
+**With `-p`**, text output looks and is saved like a classic `-p` run.
+With `--output-format json` you get a summary object instead (`engine`,
+`message`, `threads`, `completions`, `usage`).
+
+MCP tools, images from tools (screenshots), `@image` / `/image`
+attachments and `/effort` work as in the classic loop.
 
 Limitations for now:
 
-- With `-p` there are no permission prompts: any call your
-  `--permission-mode` doesn't allow is denied, and the model is told why.
-  `-p` runs aren't saved as sessions.
-- MCP tools, image results and attachments (`@image`, `/image`) aren't
-  used; `/effort` doesn't reach the model.
+- `-p --output-format json` prints the engine's summary instead of the
+  usual JSON, asks no permission questions, and isn't saved as a session.
 - Child threads last for one turn: they finish (or are stopped) before the
-  turn ends.
+  turn ends. While they run, the status line shows `N threads`.
 
 The design and the plan for the remaining work are in
 [`docs/infinity-engine.md`](docs/infinity-engine.md).

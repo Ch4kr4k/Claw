@@ -34,6 +34,8 @@ const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
 pub struct ClawModelProvider {
     client: ProviderClient,
     entry: ModelEntry,
+    /// `/effort`: sent as `reasoning_effort` (each backend maps it).
+    reasoning_effort: Option<String>,
 }
 
 impl ClawModelProvider {
@@ -60,7 +62,34 @@ impl ClawModelProvider {
             supports_image_input: false,
             model_id,
         };
-        Self { client, entry }
+        Self {
+            client,
+            entry,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Sends `effort` (`low`, `medium`, `high`, …) with every request.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Caps replies at `tokens` output tokens (claw's reply budget, which
+    /// leaves room in a local model's window).
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, tokens: u32) -> Self {
+        self.entry.max_output_tokens = Some(u64::from(tokens));
+        self
+    }
+
+    /// Whether the model reads images. Without, Infinity sends a text
+    /// placeholder in place of each image.
+    #[must_use]
+    pub fn with_image_input(mut self, supported: bool) -> Self {
+        self.entry.supports_image_input = supported;
+        self
     }
 
     /// The model this provider serves.
@@ -88,7 +117,10 @@ impl ModelProvider for ClawModelProvider {
                 || api::max_tokens_for_model(model_id),
                 |tokens| u32::try_from(tokens).unwrap_or(u32::MAX),
             );
-        let message_request = to_message_request(model_id, max_tokens, request);
+        let mut message_request = to_message_request(model_id, max_tokens, request);
+        message_request
+            .reasoning_effort
+            .clone_from(&self.reasoning_effort);
         let message_stream = self
             .client
             .stream_message(&message_request)

@@ -1157,6 +1157,12 @@ where
         &self.session
     }
 
+    /// The tool executor the loop runs calls through.
+    #[must_use]
+    pub fn tool_executor(&self) -> &T {
+        &self.tool_executor
+    }
+
     pub fn api_client_mut(&mut self) -> &mut C {
         &mut self.api_client
     }

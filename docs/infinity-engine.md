@@ -1,6 +1,6 @@
 # Infinity engine: multi-threaded asynchronous agents for claw
 
-Status: phases 1 and 2 landed (opt-in, `CLAW_ENGINE=infinity`). Started 2026-11-05.
+Status: phases 1–3 landed (opt-in, `CLAW_ENGINE=infinity`). Started 2026-11-05.
 
 This document records the decision to move claw's agent loop onto the
 [Infinity runtime](https://github.com/hydro-project/infinity)
@@ -164,23 +164,56 @@ each. A single call goes through untouched.
    - Not yet: the footer's live-thread count, image attachments,
      `/effort` passed to the provider, and keeping child threads alive
      across turns.
-3. **Persistence and parity.** A `ConversationStore`/`StateStore` backed by
-   claw's session directory, so `--resume`, `/rewind` and checkpoints work.
-   MCP tools are bridged through `infinity-mcp-bridge` or claw's own
-   `mcp_tool_bridge`. Plugin tools, image results (`claw-image:`) and usage
-   or cost reporting follow. The `Agent` tool becomes an alias of
-   `spawn_thread` with claw's sub-agent types mapped to thread prompts.
+3. **Parity with the classic loop** (done)
+   - **Persistence.** Phase 2 already keeps claw's `Session` as the record,
+     so no Infinity store backed by the session directory is needed.
+     `claw -p` in text mode now goes through `LiveCli` too, so `-p` runs
+     are saved like classic ones. JSON output keeps the engine's summary
+     path (`engine_prompt.rs`).
+   - **MCP.** The engine REPL uses the session's own registry
+     (`ConversationRuntime::tool_executor`), which includes the MCP
+     servers' tools. The CLI executor runs those through the session's
+     shared `RuntimeMcpState`. `run_mcp_tool` was factored out of
+     `CliToolExecutor` for this. `ToolHost::with_runtime_tools` /
+     `EngineConfig::runtime_tools` turns them on. MCP calls are slow
+     tools, so they're dispatched.
+   - **Images.** Results naming a picture (`claw-image: /path`) go through
+     `runtime::tool_images::attach_tool_images`, with the same size budget
+     and "left out" note. They're sent as Infinity image parts, per inner
+     call for a batch. `ClawModelProvider::with_image_input(sends_images)`
+     tells Infinity whether the model reads them; it sends placeholders
+     otherwise. `@image` / `/image` attachments reach the model just
+     before the prompt (`TurnControl::attachments`).
+   - **Request options.** `/effort` is sent as `reasoning_effort`, and
+     `reply_budget(model)` caps replies (`with_reasoning_effort`,
+     `with_max_output_tokens`, `EngineConfig::for_provider`).
+   - **Status line.** `turn_keys::set_live_threads` shows `N threads`
+     while child threads run.
+   - **Sub-agents.** The `Agent` tool stays: it runs claw's typed
+     sub-agents (Explore, Plan, custom agents, each with its own prompt and
+     tool limits). On the engine it's a slow tool, so the parent yields
+     while it works. `spawn_thread` is the other kind, a fork that
+     inherits the conversation. Making `Agent` an alias would have dropped
+     the typed agents, so both are offered.
+   - Tests: a tool image reaches a vision model, and an attachment goes
+     before the prompt without being saved as part of the turn. Also
+     checked by hand: an MCP tool called through `claw -p` (stdio fixture
+     server plus a scripted SSE model), and the run saved as a session.
 4. **Flip the default and retire the old loop.** `CLAW_ENGINE=legacy`
    stays for one release. Then `ConversationRuntime`'s loop is deleted and
    `runtime` keeps sessions, config, prompt assembly and permissions.
 
 ## Current limitations
 
-- `-p` mode has no interactive permission prompts (the REPL has them). Use
-  `--permission-mode workspace-write` or `danger-full-access`.
-- `-p` runs aren't saved to `~/.claw/sessions`. REPL turns are saved.
-- MCP tools, image attachments and reasoning effort aren't wired yet.
+- `-p` with `--output-format json` has no permission prompts and isn't
+  saved as a session (text output has both).
 - Slow tools run on tokio's blocking pool and can't be cancelled once
   started. A stopped turn returns at once and leaves them to finish.
 - Each turn builds a fresh engine, so child threads don't outlive the turn
   that spawned them.
+- claw's tool-name repair (calling `Read` for `read_file`, …) and its
+  repeated-call and pagination nudges live in `CliToolExecutor` and aren't
+  applied on the engine. An unknown name gets Infinity's "tool does not
+  exist" result, and the model retries.
+- `Agent` sub-agents still run the classic loop inside; they move with
+  phase 4.
