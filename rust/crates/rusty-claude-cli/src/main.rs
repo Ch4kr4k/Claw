@@ -1111,6 +1111,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
     apply_saved_provider_credentials();
+    // `Agent` sub-agents run on the engine too, unless the classic loop
+    // was asked for.
+    if claw_engine::requested() {
+        tools::set_subagent_runner(Some(claw_engine::subagent::runner()));
+    }
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,

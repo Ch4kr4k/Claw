@@ -363,6 +363,9 @@ impl LiveCli {
         ) {
             return Ok(answer);
         }
+        if claw_engine::requested() {
+            return self.run_engine_side_prompt(prompt, false, None);
+        }
         let session = self.runtime.session().clone().without_persistence();
         let mut runtime = build_runtime(
             session,

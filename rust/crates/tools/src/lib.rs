@@ -5819,6 +5819,56 @@ fn run_agent_job(job: &AgentJob) -> Result<String, String> {
     Ok(final_text)
 }
 
+/// One sub-agent turn as a [`SubagentRunner`] gets it.
+pub struct SubagentTurn {
+    pub agent_id: String,
+    pub model: String,
+    pub system_prompt: Vec<String>,
+    /// The tools the agent may use (canonical names).
+    pub allowed_tools: BTreeSet<String>,
+    /// Model replies the turn may take before it is stopped.
+    pub max_iterations: usize,
+    /// The agent's conversation so far (empty for a new agent).
+    pub session: Session,
+    pub prompt: String,
+}
+
+/// Runs sub-agent turns in place of the built-in loop (the CLI installs
+/// the asynchronous engine here): returns the final answer and the
+/// session with the turn added.
+pub type SubagentRunner =
+    std::sync::Arc<dyn Fn(SubagentTurn) -> (Result<String, String>, Session) + Send + Sync>;
+
+static SUBAGENT_RUNNER: Mutex<Option<SubagentRunner>> = Mutex::new(None);
+
+/// Installs (or, with `None`, removes) the [`SubagentRunner`].
+pub fn set_subagent_runner(runner: Option<SubagentRunner>) {
+    *SUBAGENT_RUNNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = runner;
+}
+
+/// The permission policy sub-agents run under: full access, with each
+/// tool's own requirement.
+#[must_use]
+pub fn subagent_permission_policy() -> PermissionPolicy {
+    agent_permission_policy()
+}
+
+/// Runs one tool call of a sub-agent limited to `allowed_tools`, as the
+/// built-in loop does.
+pub fn run_subagent_tool(
+    allowed_tools: &BTreeSet<String>,
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    if !allowed_tools.contains(&canonical_allowed_tool_name(name)) {
+        return Err(format!("tool `{name}` is not enabled for this sub-agent"));
+    }
+    let enforcer = PermissionEnforcer::new(agent_permission_policy());
+    execute_tool_with_enforcer(Some(&enforcer), name, input)
+}
+
 /// One turn of a sub-agent's conversation, on `session` (empty for a new
 /// agent, the earlier one when [`local_tools`]' `SendMessage` resumes it).
 fn run_agent_conversation(
@@ -5826,6 +5876,27 @@ fn run_agent_conversation(
     session: Session,
     prompt: String,
 ) -> (Result<String, String>, Session) {
+    let runner = SUBAGENT_RUNNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Provider fallbacks are the built-in loop's (it retries down the
+    // chain), so a configured chain keeps it.
+    if let Some(runner) = runner.filter(|_| load_provider_fallback_config().is_empty()) {
+        return runner(SubagentTurn {
+            agent_id: job.manifest.agent_id.clone(),
+            model: job
+                .manifest
+                .model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string()),
+            system_prompt: job.system_prompt.clone(),
+            allowed_tools: job.allowed_tools.clone(),
+            max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+            session,
+            prompt,
+        });
+    }
     let mut runtime = match build_agent_runtime(job, session) {
         Ok(runtime) => runtime.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS),
         Err(error) => return (Err(error), Session::new()),

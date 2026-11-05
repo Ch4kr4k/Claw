@@ -7,6 +7,7 @@
 //!   permission checks; slow tools yield instead of blocking the thread.
 //! - [`engine::Engine`] runs a prompt on a local agent system, child threads
 //!   included, and streams [`engine::EngineEvent`]s.
+//! - [`subagent::runner`] runs `Agent` sub-agents on the engine.
 //!
 //! Design and phase plan: `docs/infinity-engine.md`.
 
@@ -17,6 +18,7 @@ pub mod batch;
 pub mod engine;
 pub mod history;
 pub mod provider;
+pub mod subagent;
 pub mod tools;
 
 pub use engine::{

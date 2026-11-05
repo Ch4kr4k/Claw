@@ -162,6 +162,14 @@ pub struct ClawPrompt {
     /// Maps the name a model called to the tool it means (models trained on
     /// other agents call `Read`, `Bash`, …), before the engine checks it.
     pub resolve_name: Option<NameResolver>,
+    /// `false` sends no tools at all, the thread tools included: a plain
+    /// answer (side questions, tool-free internal prompts).
+    pub offer_tools: bool,
+    /// Model calls allowed in all (a sub-agent's reply cap); a call past
+    /// it fails, which ends the thread.
+    pub max_completions: Option<usize>,
+    /// Model calls made so far, shared with the engine.
+    pub completions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// See [`ClawPrompt::resolve_name`].
@@ -190,6 +198,20 @@ impl ModelProvider for ClawPrompt {
         model_id: &str,
         mut request: CompletionRequest,
     ) -> Result<ModelStream, CompletionError> {
+        // A thread looping on inline tools against a model that answers
+        // at once never yields otherwise, and the turn's control task (stop,
+        // queued prompts, a sub-agent's reply cap) would never run.
+        tokio::task::yield_now().await;
+        let made = self
+            .completions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if let Some(max) = self.max_completions.filter(|max| made > *max) {
+            return Err(CompletionError::provider(
+                ErrorClass::Fatal,
+                format!("stopped: the turn reached its limit of {max} model replies"),
+            ));
+        }
         request.preamble = request
             .preamble
             .map(|preamble| strip_base_prompt(&preamble));
@@ -202,6 +224,9 @@ impl ModelProvider for ClawPrompt {
                     .filter(|tool| THREAD_TOOLS.contains(&tool.name.as_str())),
             );
             request.tools = tools;
+        }
+        if !self.offer_tools {
+            request.tools.clear();
         }
         let inner = self.inner.invoke_model(model_id, request).await?;
         Ok(pack_tool_calls(inner, self.resolve_name.clone()))

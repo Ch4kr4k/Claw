@@ -118,6 +118,49 @@ impl LiveCli {
         Ok(turn_summary(&outcome))
     }
 
+    /// A prompt answered on the engine from a copy of the conversation; the
+    /// session is left as it was (side questions, internal prompts).
+    /// Without `enable_tools` no tools are offered or run. `progress` gets
+    /// the steps of the run, as the classic loop reports them.
+    pub(crate) fn run_engine_side_prompt(
+        &self,
+        prompt: &str,
+        enable_tools: bool,
+        progress: Option<&InternalPromptProgressReporter>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut config = self.engine_config()?;
+        if !enable_tools {
+            config.offer_tools = false;
+            config.allowed_tools = Some(std::collections::BTreeSet::new());
+        }
+        let history = self.runtime.session().messages.clone();
+        let control = TurnControl {
+            // The session's root thread id keeps the system prompt (and a
+            // local server's prompt cache) the same as the main turns'.
+            thread_id: Some(self.session.id.clone()),
+            ..TurnControl::default()
+        };
+        let outcome =
+            Engine::new(config).run_turn_blocking(&history, prompt, control, |event| {
+                let Some(progress) = progress else { return };
+                match event {
+                    EngineEvent::Agent {
+                        event: AgentEvent::CompletionStarted,
+                        ..
+                    } => progress.mark_model_phase(),
+                    EngineEvent::Tool(ToolActivity::Started { name, .. }) => {
+                        progress.mark_tool_phase(name, "");
+                    }
+                    _ => {}
+                }
+            })?;
+        let text = outcome.summary.final_text.trim().to_string();
+        if let Some(progress) = progress {
+            progress.mark_text_phase(&text);
+        }
+        Ok(text)
+    }
+
     fn engine_config(&self) -> Result<EngineConfig, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         let runtime_config = ConfigLoader::default_for(&cwd).load()?;

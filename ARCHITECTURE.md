@@ -90,8 +90,13 @@ REPL / claw -p ──► LiveCli::run_turn_inner ──► live_engine ──►
                  EngineEvent stream → stdout/stderr printer
 ```
 
-The run ends when every thread is idle. The plan for moving the REPL onto
-it, and for persistence, hooks and MCP, is in
+The run ends when every thread is idle. `-p`, `--compact`, `/btw` and
+internal prompts use the same engine (`run_engine_turn_quiet`,
+`run_engine_side_prompt`). `Agent` sub-agents stay owned by `tools`, which
+runs each sub-agent turn through the `tools::SubagentRunner` the CLI
+installs at startup (`claw_engine::subagent::runner`): a separate engine per
+turn on the agent's id, with only that agent's tools and a cap of 32 model
+calls. The design and the phase plan are in
 [`docs/infinity-engine.md`](docs/infinity-engine.md).
 
 ## Lifecycle of one REPL request

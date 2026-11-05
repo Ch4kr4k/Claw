@@ -831,8 +831,15 @@ CLAW_ENGINE=legacy claw    # the previous loop
   learning work as usual: the session is still claw's own, and each turn
   starts from it and saves what it added.
 
-**With `-p`**, text and JSON output look like a classic `-p` run (the JSON
-has the same fields and values), and the run is saved as a session.
+**With `-p`** (and `--compact`), text and JSON output look like a classic
+`-p` run (the JSON has the same fields and values), and the run is saved as
+a session.
+
+**Sub-agents** (`Agent`) run on the engine too, each on its own, limited to
+its type's tools and stopped after 32 model replies, as before. With a
+`providerFallbacks` chain configured they keep the classic loop, which
+retries down the chain. `/btw` side answers also run on the engine, without
+tools and without touching the conversation.
 
 MCP tools, images from tools (screenshots), `@image` / `/image`
 attachments and `/effort` work as in the classic loop.
@@ -841,6 +848,7 @@ Limitations for now:
 
 - Child threads last for one turn: they finish (or are stopped) before the
   turn ends. While they run, the status line shows `N threads`.
+- The desktop app's turns still use the classic loop.
 
 The design and the plan for the remaining work are in
 [`docs/infinity-engine.md`](docs/infinity-engine.md).

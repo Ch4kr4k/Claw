@@ -81,6 +81,12 @@ pub struct EngineConfig {
     pub tool_list: Option<ToolList>,
     /// Repairs tool names a model gets wrong (see [`ClawPrompt::resolve_name`]).
     pub resolve_tool_name: Option<NameResolver>,
+    /// Offer tools at all; `false` asks for a plain answer (see
+    /// [`ClawPrompt::offer_tools`]).
+    pub offer_tools: bool,
+    /// Model calls the turn may make, child threads included; past it the
+    /// turn ends as interrupted (see [`ClawPrompt::max_completions`]).
+    pub max_completions: Option<usize>,
 }
 
 impl EngineConfig {
@@ -106,6 +112,8 @@ impl EngineConfig {
             runtime_tools: false,
             tool_list: None,
             resolve_tool_name: None,
+            offer_tools: true,
+            max_completions: None,
         })
     }
 
@@ -132,6 +140,8 @@ impl EngineConfig {
             runtime_tools: false,
             tool_list: None,
             resolve_tool_name: None,
+            offer_tools: true,
+            max_completions: None,
         }
     }
 }
@@ -294,11 +304,15 @@ impl Engine {
         }
         let host = Arc::new(host);
         let tools = ClawTool::all(&host, self.config.allowed_tools.as_ref());
+        let completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let model = StaticModel::new(
             Arc::new(ClawPrompt {
                 inner: self.config.provider,
                 tool_list: self.config.tool_list,
                 resolve_name: self.config.resolve_tool_name,
+                offer_tools: self.config.offer_tools,
+                max_completions: self.config.max_completions,
+                completions: Arc::clone(&completions),
             }),
             &self.config.model,
         )
@@ -415,6 +429,13 @@ impl Engine {
         }
         // Interrupts running completions and flushes their partial turns.
         system.shutdown().await;
+        if self
+            .config
+            .max_completions
+            .is_some_and(|max| completions.load(std::sync::atomic::Ordering::Relaxed) > max)
+        {
+            interrupted = true;
+        }
         // Events emitted just before the last driver exited.
         while let Ok(event) = events_rx.try_recv() {
             record(&event, &root_name, &mut root_text, &mut summary);

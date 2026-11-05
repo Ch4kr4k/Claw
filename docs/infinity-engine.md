@@ -240,9 +240,35 @@ each. A single call goes through untouched.
        results, iterations, usage and cost match the classic loop on the
        mock scenarios. `engine_prompt.rs` (the separate engine summary) is
        gone.
-   - Step 2, still to do: `Agent` sub-agents, `--compact`, and the
-     prompt-backed commands (`/commit`, `/pr`, `/bughunter`, …) onto the
-     engine.
+   - Step 2, part 2 (done):
+     - *`--compact` (text and JSON) on the engine* through
+       `run_engine_turn_quiet`.
+     - *Side prompts on the engine.* `/btw` side answers and internal
+       prompts (`run_internal_prompt_text*`) use `run_engine_side_prompt`:
+       a copy of the conversation on the session's root thread id (so the
+       prompt cache holds), the session left untouched, and with tools off
+       `EngineConfig::offer_tools = false` (no tools offered, not even the
+       thread tools) plus an empty allowed set. The prompt commands
+       (`/commit`, `/pr`, `/bughunter`, `/ultraplan`, skills, loops) were
+       already plain `run_turn` calls, so they run on the engine as REPL
+       turns.
+     - *`Agent` sub-agents on the engine.* `tools` owns sub-agents
+       (manifests, background jobs, `SendMessage` resumes) and now runs
+       each turn through a `tools::SubagentRunner` when one is installed;
+       the CLI installs `claw_engine::subagent::runner()` at startup unless
+       `CLAW_ENGINE=legacy`. A sub-agent turn gets its own engine on the
+       agent id as root thread (resumes keep the prompt cache), only the
+       agent's tools (`tools::run_subagent_tool`, the sub-agent permission
+       policy, no prompter), and the classic cap of 32 model replies
+       (`EngineConfig::max_completions`, counted per model call in
+       `ClawPrompt`, since inline tools loop inside one step). A configured
+       `providerFallbacks` chain keeps the classic loop, which retries down
+       the chain.
+     - `ClawPrompt` yields before each model call, so a thread looping on
+       inline tools against an instant model can't starve the turn's
+       control task (stop, queued prompts).
+   - Step 2, left: the desktop app's turn (`desktop_agent.rs`) still runs
+     the classic loop; it needs its own event renderer for the engine.
    - Step 3: after a release with `CLAW_ENGINE=legacy` available, delete
      `ConversationRuntime`'s loop. `runtime` keeps sessions, config,
      prompt assembly and permissions.
@@ -253,5 +279,5 @@ each. A single call goes through untouched.
   started. A stopped turn returns at once and leaves them to finish.
 - Each turn builds a fresh engine, so child threads don't outlive the turn
   that spawned them.
-- `Agent` sub-agents still run the classic loop inside; they move with
-  phase 4.
+- `Agent` sub-agents with a `providerFallbacks` chain, and the desktop
+  app's turns, still run the classic loop.

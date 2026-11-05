@@ -150,6 +150,8 @@ fn config_with_images(
         runtime_tools: false,
         tool_list: None,
         resolve_tool_name: None,
+        offer_tools: true,
+        max_completions: None,
     };
     (config, requests)
 }
@@ -682,4 +684,69 @@ fn tool_names_from_other_agents_are_repaired_before_the_engine_checks_them() {
         .run_turn_blocking(&[], "go", TurnControl::default(), |_| {})
         .expect("turn");
     assert_eq!(outcome.summary.final_text, "ran");
+}
+
+#[test]
+fn without_tools_the_request_offers_none() {
+    let (mut config, requests) = config(PermissionMode::DangerFullAccess, |_| text("plain"));
+    config.offer_tools = false;
+    let outcome = Engine::new(config)
+        .run_turn_blocking(&[], "a side question", TurnControl::default(), |_| {})
+        .expect("turn");
+    assert_eq!(outcome.summary.final_text, "plain");
+    assert!(requests.lock().expect("requests")[0].tools.is_empty());
+}
+
+fn subagent_turn(allowed: &[&str], max_iterations: usize) -> tools::SubagentTurn {
+    tools::SubagentTurn {
+        agent_id: "agent-7".to_string(),
+        model: "scripted".to_string(),
+        system_prompt: vec!["sub-agent prompt".to_string()],
+        allowed_tools: allowed.iter().map(ToString::to_string).collect(),
+        max_iterations,
+        session: runtime::Session::new(),
+        prompt: "go".to_string(),
+    }
+}
+
+#[test]
+fn a_subagent_gets_only_its_tools_and_keeps_its_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("note.txt");
+    std::fs::write(&path, "agent note 7\n").expect("write note");
+    let path_text = path.display().to_string();
+    let (config, requests) = config(PermissionMode::DangerFullAccess, move |request| {
+        let input = last_input(request);
+        if input == "go" {
+            call("read_file", json!({ "path": path_text }))
+        } else if input.contains("agent note 7") {
+            text("found 7")
+        } else {
+            text(&format!("unexpected: {input}"))
+        }
+    });
+    let (result, session) =
+        claw_engine::subagent::run_turn(config, subagent_turn(&["read_file"], 8));
+    assert_eq!(result.as_deref(), Ok("found 7"));
+    // The prompt, the call, its result and the answer.
+    assert_eq!(session.messages.len(), 4);
+    let offered = requests.lock().expect("requests")[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    assert!(offered.contains(&"read_file".to_string()));
+    assert!(!offered.contains(&"bash".to_string()), "{offered:?}");
+}
+
+#[test]
+fn a_subagent_that_never_finishes_is_stopped() {
+    let (config, _) = config(PermissionMode::DangerFullAccess, |_| {
+        call("glob_search", json!({ "pattern": "*.nothing-matches" }))
+    });
+    let started = Instant::now();
+    let (result, _) = claw_engine::subagent::run_turn(config, subagent_turn(&["glob_search"], 3));
+    let error = result.expect_err("stopped");
+    assert!(error.contains("3 model replies"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
