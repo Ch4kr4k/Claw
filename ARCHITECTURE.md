@@ -46,6 +46,7 @@ claw-code/
 | `mock-anthropic-service` | lib+bin | Scripted `/v1/messages` mock used by CLI integration tests and the parity harness |
 | `compat-harness` | lib | Extracts upstream manifests for parity comparison |
 | `claw-analog` | lib+bin | A lean alternate agent loop over `api` + `runtime` |
+| `claw-engine` | lib | claw on the Infinity runtime (`infinity-agent-core`): `ClawModelProvider` (claw's providers as an Infinity `ModelProvider`), `ClawTool` (registry tools with policy checks; fast tools inline, slow ones dispatched so the thread yields), the `parallel_tools` batch, and `Engine` (a local agent system on a `LocalSet`, child threads included). Opt-in via `CLAW_ENGINE=infinity`; see [`docs/infinity-engine.md`](docs/infinity-engine.md) |
 | `claw-rag-service` | bin | Standalone axum RAG service (SQLite, optional Qdrant) |
 
 Dependency rules that matter:
@@ -65,6 +66,33 @@ Dependency rules that matter:
 | `render.rs` | Streaming markdown renderer (word-by-word text, syntax-highlighted code via syntect, buffered tables), tool-call lines, diffs, the "thinking" animation, themes |
 | `repl_commands.rs` | REPL-only commands: checkpoints (`/undo`, `/rewind`), `/plan`, `/effort`, `/usage`, `/context`, `/tasks`, `/files`, `/copy`, `/paste`, `/image`, `/theme`, `/retry`, `/add-dir`, `/rename`, prompt-backed review commands |
 | `init.rs`, `setup_wizard.rs` | `claw init` scaffolding and the first-run provider setup |
+
+## The asynchronous engine (opt-in)
+
+`CLAW_ENGINE=infinity` runs prompt mode on `claw-engine` instead of
+`ConversationRuntime`. Every input is a message to a thread. A thread's
+slice runs one completion and persists the turn, then dispatches its tool
+call and yields; the result comes back as a new message. Threads are FIFO
+inside themselves and concurrent with each other, and the model creates
+them with `spawn_thread`.
+
+```text
+claw -p ──► engine_prompt::run ──► Engine::run_prompt_blocking
+              (multi-thread tokio runtime + LocalSet)
+                 LaunchingSystem ── root thread ── child threads …
+                   │ ModelProvider = ClawPrompt(ClawModelProvider)
+                   │   strip Infinity's base prompt, pack a reply's calls
+                   │   into `parallel_tools`, unpack them for the provider
+                   │ Tool = ClawTool (policy → tools registry)
+                   │   inline: execute_synchronous (spawn_blocking)
+                   │   slow:   execute → spawn_blocking → result message
+                   ▼
+                 EngineEvent stream → stdout/stderr printer
+```
+
+The run ends when every thread is idle. The plan for moving the REPL onto
+it, and for persistence, hooks and MCP, is in
+[`docs/infinity-engine.md`](docs/infinity-engine.md).
 
 ## Lifecycle of one REPL request
 

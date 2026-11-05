@@ -796,6 +796,43 @@ extension in settings:
 `claw/<name>` and moves the session there; ExitWorktree returns, keeping or
 removing it.
 
+
+### Asynchronous engine (experimental)
+
+`CLAW_ENGINE=infinity` runs a one-shot prompt (`claw -p "…"`,
+`claw prompt …`) on the [Infinity](https://github.com/hydro-project/infinity)
+runtime instead of the classic loop:
+
+- **Nothing waits on a slow tool.** `bash`, web fetches and sub-agents run in
+  the background, and the agent picks up their results as they arrive.
+  Reads, searches and edits still answer at once.
+- **Parallel calls.** Several tool calls in one reply all run; read-only
+  ones run at the same time.
+- **Threads.** The model can split work with `spawn_thread`. Each child
+  runs concurrently, inherits the conversation so far (or starts empty with
+  `fresh_context`), and reports back with `report_to_parent` or
+  `close_thread`. Child output is shown on stderr as `[#1] …`.
+
+```sh
+CLAW_ENGINE=infinity claw --permission-mode workspace-write -p "review src/ in parallel, one thread per module"
+```
+
+The answer goes to stdout. Tool lines, child-thread output and a summary
+(threads, completions, tokens) go to stderr. With `--output-format json`,
+only a summary object is printed (`engine`, `message`, `threads`,
+`completions`, `usage`).
+
+Limitations for now:
+
+- No permission prompts: any call your `--permission-mode` doesn't allow
+  is denied, and the model is told why.
+- The session isn't saved.
+- Hooks, MCP tools and image results aren't used.
+- The interactive REPL still uses the classic loop.
+
+The design and the plan for the remaining work are in
+[`docs/infinity-engine.md`](docs/infinity-engine.md).
+
 ## 10. Documents and images
 
 The file tools read `.docx`, `.pptx`, `.xlsx`/`.xls`/`.ods`, `.pdf` and
@@ -1409,6 +1446,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_THEME` | Theme, overriding the saved one |
 | `CLAW_DIFF_PANEL=0` | No diff panel this run (`/diffpanel off` saves it) |
 | `CLAW_FULLSCREEN=0` | Inline view instead of the full-screen window (output stays in the terminal's history) |
+| `CLAW_ENGINE=infinity` | Run `claw -p` / `claw prompt` on the asynchronous multi-threaded engine (experimental; see *Asynchronous engine* in section 9) |
 | `CLAW_MERMAID` | `0` prints ```` ```mermaid ```` blocks as code only, `text` always draws them as box-drawing text (default: an image where inline images work, text elsewhere) |
 | `CLAW_INLINE_IMAGES` | `0` never draws reply images in the terminal, `1` always does (default: kitty and Ghostty, not inside tmux) |
 | `CLAW_AUTO_MEMORY=0` | Turn off auto memory for this run |

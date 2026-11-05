@@ -1,0 +1,149 @@
+# Infinity engine: multi-threaded asynchronous agents for claw
+
+Status: phase 1 landed (opt-in, `CLAW_ENGINE=infinity`). Started 2026-11-05.
+
+This document records the decision to move claw's agent loop onto the
+[Infinity runtime](https://github.com/hydro-project/infinity)
+(`infinity-agent-core`, Apache-2.0, on crates.io) and the phased plan to get
+there. For the current (default) loop see [`ARCHITECTURE.md`](../ARCHITECTURE.md).
+
+## Why
+
+claw's loop (`runtime::ConversationRuntime::run_turn`) is synchronous:
+
+- `ApiClient::stream` blocks the calling thread until the whole reply has
+  streamed, wrapping async `api` code in `block_on`.
+- A tool call holds the turn open until the tool returns. A 10-minute build
+  keeps the turn blocked for 10 minutes.
+- Parallelism is limited to batches of read-only tools on scoped threads.
+- Sub-agents (`Agent` tool) each get a whole OS thread and a private
+  `ConversationRuntime`. They don't share a scheduler, history store or
+  reporting channel with the parent.
+
+Infinity is built around one invariant: **an execution slice never blocks on
+anything external**.
+
+- Everything that wakes an agent is an `InputMessage` (user text, tool
+  result, child report, timer) carrying a `group_id` (the thread id).
+- A slice loads the thread, runs at most one completion and persists the
+  turn. Then it dispatches one tool call and yields. The tool result comes
+  back later as a new message.
+- Order is FIFO within a thread and threads run concurrently with each
+  other: one `mpsc` channel plus one tokio driver task per thread. An idle
+  thread is only data in the stores.
+- Threads are a built-in: `spawn_thread` (inherits history up to the spawn
+  point, or `fresh_context`), `report_to_parent` and `close_thread`.
+  Reports reach the parent as synthetic tool results.
+- Turn buffering means a half-streamed reply never reaches history. Input is
+  deduplicated by id, and history is compacted automatically at about 3/4
+  of the context window.
+
+## Decision
+
+claw **depends on the Infinity crates** rather than re-implementing them:
+
+| Crate | Use |
+|---|---|
+| `infinity-agent-core` | Agent system, thread drivers, stores, built-in thread/sleep tools |
+| `infinity-provider-protocol` | `ModelProvider`, `CompletionRequest`, `StreamChunk`, message types |
+| `rap-protocol` | ids (`ThreadId`, `ToolCallId`) used in the `Tool` trait |
+
+All the glue goes in a new crate, `rust/crates/claw-engine`. `runtime` stays
+free of the dependency until the old loop is retired (phase 4).
+Consequence: `rap-protocol` brings in `reqwest 0.13` (native-tls) next to
+claw's `reqwest 0.12` (rustls). That costs some build time but nothing at
+run time, since the engine makes no RAP HTTP calls.
+
+## Mapping
+
+```text
+           claw today                         claw on infinity
+  ─────────────────────────────    ─────────────────────────────────────────
+  ConversationRuntime::run_turn    LaunchingSystem + one root ThreadHandle
+  ApiClient (blocking)             ClawModelProvider: impl ModelProvider
+                                     (api::ProviderClient, async, streamed)
+  ToolExecutor::execute            ClawTool: impl Tool<ChannelSender>
+                                     fast tools  → execute_synchronous
+                                                    (inline, loop back)
+                                     slow tools  → execute: spawn_blocking,
+                                                    result → InputMessage
+                                                    (thread yields meanwhile)
+  Agent tool (OS thread)           spawn_thread / report_to_parent /
+                                     close_thread (infinity built-ins)
+  Session (JSONL)                  ConversationStore + StateStore
+                                     (in-memory in phase 1; JSON-file
+                                      store mirroring Session in phase 3)
+  auto-compaction                  infinity compaction threads
+  Ctrl+C abort                     send_user_text interrupts; shutdown()
+```
+
+**Fast and slow tools.** A *fast* tool runs inline in the slice. Examples
+are `read_file`, `glob_search`, `grep_search`, `TodoWrite` and the edit
+tools: they finish in milliseconds and yielding for them would only add a
+round trip. A *slow* tool is dispatched and the thread yields. Examples are
+`bash`, `WebFetch`, `WebSearch`, `Agent` and `REPL`. While it runs, the
+thread's driver is free: user text, child reports and other threads keep
+moving. The list is `claw_engine::tools::ASYNC_TOOLS`.
+
+**Permissions.** `ClawTool` checks each call against a
+`runtime::PermissionPolicy` before it runs. A denied call returns an error
+result, which the model sees and can recover from. Phase 1 has no
+interactive prompter: in `prompt` mode, any call that needs more than
+read-only access is denied with a message saying so. Phase 2 routes these
+through a `UserChoice`-style request to the REPL.
+
+**Several tool calls in one reply.** Infinity runs only the first tool call
+of a completion and ignores the rest. Models often ask for several at once,
+and a model whose second call is silently dropped tends to ask for it again
+and again: claw's mock harness looped forever on exactly this. So the
+engine's provider wrapper (`ClawPrompt`) holds back the reply's calls and
+sends them as one call to the internal `parallel_tools` tool
+(`claw_engine::batch`). That tool is dispatched like any slow tool. Each run
+of consecutive read-only calls runs on parallel OS threads; every other call
+runs alone, in order, as before. The result carries every call's output.
+When history goes back to the provider, the batch is unpacked again, so the
+model only ever sees its own `tool_use` blocks and one `tool_result` for
+each. A single call goes through untouched.
+
+## Phases
+
+1. **Engine crate and headless mode** (done)
+   - `claw-engine`: `ClawModelProvider` (Anthropic and OpenAI-compatible
+     through `api::ProviderClient`, with `ApiError` mapped to `ErrorClass`),
+     `ClawTool` adapters over `tools::GlobalToolRegistry` with policy
+     checks, and the `Engine` facade (`launch`, `run_prompt`, wait until
+     every thread is idle).
+   - `claw -p "…"` / `claw prompt …` runs on the engine when
+     `CLAW_ENGINE=infinity`. The root's reply streams to stdout. One line
+     per finished tool call, child-thread output (`[#1] …`) and a summary
+     go to stderr. `--output-format json` prints a summary object.
+   - `parallel_tools` batching, so a reply's several tool calls all run.
+   - Tests use a scripted `ModelProvider`: text, inline tools, dispatched
+     tools, batches, children reporting back, and permission denial. Six
+     mock-anthropic scenarios also pass end to end through `claw -p`:
+     streaming text, read, grep, write allowed or denied, bash, and a
+     two-call reply.
+2. **Interactive REPL on the engine.** `LiveCli::run_turn` drives a
+   long-lived `ThreadHandle` instead of a fresh `ConversationRuntime`. The
+   renderer consumes `AgentEvent`s. Type-ahead becomes `send_user_text`,
+   which interrupts. Permission prompts and Esc/Ctrl+C go through the
+   handle. Pre- and post-tool hooks run in `ClawTool`. The footer shows
+   live threads (lifecycle events).
+3. **Persistence and parity.** A `ConversationStore`/`StateStore` backed by
+   claw's session directory, so `--resume`, `/rewind` and checkpoints work.
+   MCP tools are bridged through `infinity-mcp-bridge` or claw's own
+   `mcp_tool_bridge`. Plugin tools, image results (`claw-image:`) and usage
+   or cost reporting follow. The `Agent` tool becomes an alias of
+   `spawn_thread` with claw's sub-agent types mapped to thread prompts.
+4. **Flip the default and retire the old loop.** `CLAW_ENGINE=legacy`
+   stays for one release. Then `ConversationRuntime`'s loop is deleted and
+   `runtime` keeps sessions, config, prompt assembly and permissions.
+
+## Phase 1 limitations
+
+- No interactive permission prompts (see above). Use
+  `--permission-mode workspace-write` or `danger-full-access`.
+- History lives only in memory and isn't saved to `~/.claw/sessions`.
+- Hooks, MCP tools, plugin tools and image attachments aren't wired yet.
+- Slow tools run on tokio's blocking pool, so a tool can't be cancelled
+  once it has started. Shutdown waits for running tools to finish.

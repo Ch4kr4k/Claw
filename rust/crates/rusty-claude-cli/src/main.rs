@@ -23,6 +23,7 @@ mod command_actions;
 mod desktop_agent;
 mod diff_panel;
 mod diff_view;
+mod engine_prompt;
 mod init;
 mod input;
 mod keybindings;
@@ -1188,6 +1189,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let resolved_model = resolve_repl_model(model)?;
+            if claw_engine::requested() {
+                return engine_prompt::run(
+                    &effective_prompt,
+                    &resolved_model,
+                    output_format,
+                    allowed_tools,
+                    permission_mode,
+                );
+            }
             let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             // A background session (`/background`) continues a saved one.
