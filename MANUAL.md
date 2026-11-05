@@ -797,12 +797,13 @@ extension in settings:
 removing it.
 
 
-### Asynchronous engine (experimental)
+### Asynchronous engine
 
-`CLAW_ENGINE=infinity` runs turns on the
-[Infinity](https://github.com/hydro-project/infinity) runtime instead of the
-classic loop. This covers interactive REPL turns and one-shot prompts
-(`claw -p "…"`, `claw prompt …`):
+Turns run on the [Infinity](https://github.com/hydro-project/infinity)
+runtime: interactive REPL turns and one-shot prompts (`claw -p "…"`,
+`claw prompt …`). Set `CLAW_ENGINE=legacy` to go back to the previous loop
+for a session (`claw -p` with `--output-format json` keeps the previous
+loop's JSON unless `CLAW_ENGINE=infinity` is set). On the engine:
 
 - **Nothing waits on a slow tool.** `bash`, web fetches and sub-agents run in
   the background, and the agent picks up their results as they arrive.
@@ -815,7 +816,8 @@ classic loop. This covers interactive REPL turns and one-shot prompts
   `close_thread`. Child output is shown on stderr as `[#1] …`.
 
 ```sh
-CLAW_ENGINE=infinity claw --permission-mode workspace-write -p "review src/ in parallel, one thread per module"
+claw --permission-mode workspace-write -p "review src/ in parallel, one thread per module"
+CLAW_ENGINE=legacy claw    # the previous loop
 ```
 
 **In the REPL**, a turn looks as usual, with a few differences:
@@ -831,16 +833,17 @@ CLAW_ENGINE=infinity claw --permission-mode workspace-write -p "review src/ in p
   starts from it and saves what it added.
 
 **With `-p`**, text output looks and is saved like a classic `-p` run.
-With `--output-format json` you get a summary object instead (`engine`,
-`message`, `threads`, `completions`, `usage`).
+With `CLAW_ENGINE=infinity` and `--output-format json` you get the
+engine's summary object instead (`engine`, `message`, `threads`,
+`completions`, `usage`).
 
 MCP tools, images from tools (screenshots), `@image` / `/image`
 attachments and `/effort` work as in the classic loop.
 
 Limitations for now:
 
-- `-p --output-format json` prints the engine's summary instead of the
-  usual JSON, asks no permission questions, and isn't saved as a session.
+- `CLAW_ENGINE=infinity claw -p --output-format json` prints the engine's
+  summary, asks no permission questions, and isn't saved as a session.
 - Child threads last for one turn: they finish (or are stopped) before the
   turn ends. While they run, the status line shows `N threads`.
 
@@ -1461,7 +1464,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_THEME` | Theme, overriding the saved one |
 | `CLAW_DIFF_PANEL=0` | No diff panel this run (`/diffpanel off` saves it) |
 | `CLAW_FULLSCREEN=0` | Inline view instead of the full-screen window (output stays in the terminal's history) |
-| `CLAW_ENGINE=infinity` | Run turns (REPL and `claw -p`) on the asynchronous multi-threaded engine (experimental; see *Asynchronous engine* in section 9) |
+| `CLAW_ENGINE` | Turns run on the asynchronous multi-threaded engine by default (see *Asynchronous engine* in section 9). `legacy` (or `classic`) uses the previous loop; `infinity` also switches `-p --output-format json` to the engine's summary |
 | `CLAW_MERMAID` | `0` prints ```` ```mermaid ```` blocks as code only, `text` always draws them as box-drawing text (default: an image where inline images work, text elsewhere) |
 | `CLAW_INLINE_IMAGES` | `0` never draws reply images in the terminal, `1` always does (default: kitty and Ghostty, not inside tmux) |
 | `CLAW_AUTO_MEMORY=0` | Turn off auto memory for this run |

@@ -1,6 +1,6 @@
 # Infinity engine: multi-threaded asynchronous agents for claw
 
-Status: phases 1–3 landed (opt-in, `CLAW_ENGINE=infinity`). Started 2026-11-05.
+Status: phases 1–3 landed; phase 4 step 1 (engine is the default, `CLAW_ENGINE=legacy` to opt out) landed. Started 2026-11-05.
 
 This document records the decision to move claw's agent loop onto the
 [Infinity runtime](https://github.com/hydro-project/infinity)
@@ -219,9 +219,20 @@ each. A single call goes through untouched.
        `thread_handle`. Turn 2's first request now processes 38 tokens, and
        the turn took 24 s.
 
-4. **Flip the default and retire the old loop.** `CLAW_ENGINE=legacy`
-   stays for one release. Then `ConversationRuntime`'s loop is deleted and
-   `runtime` keeps sessions, config, prompt assembly and permissions.
+4. **Flip the default, then retire the old loop**
+   - Step 1 (done): `claw_engine::requested()` is true unless `CLAW_ENGINE`
+     is `legacy` or `classic`. `-p --output-format json` keeps the classic
+     JSON contract unless `CLAW_ENGINE=infinity` is set explicitly
+     (`explicitly_requested`), because scripts parse it. `--compact` and
+     the prompt-backed commands (`/commit`, `/pr`, …) still use the classic
+     helpers.
+   - Step 2 (next): move the `Agent` sub-agents, JSON output, compact
+     mode and prompt-backed commands onto the engine. Port the CLI
+     executor's tool-name repair and read-pagination nudges into the
+     engine executor.
+   - Step 3: after a release with `CLAW_ENGINE=legacy` available, delete
+     `ConversationRuntime`'s loop. `runtime` keeps sessions, config,
+     prompt assembly and permissions.
 
 ## Current limitations
 
