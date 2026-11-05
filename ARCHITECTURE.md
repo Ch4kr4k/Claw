@@ -600,7 +600,7 @@ directory, the only place the sandbox lets the script reach.
 | User config home | `$CLAW_CONFIG_HOME`, else `~/.claw/` |
 | User settings (theme, provider, …) | `~/.claw/settings.json` (mode 0600) |
 | Prompt history | `~/.claw/history.jsonl` |
-| Auto memory | `~/.claude/projects/<project path, non-alphanumerics → ->/memory/`, shared with Claude Code; `~/.claw/projects/…` when there is no `~/.claude` (`MEMORY.md` index + one file per memory) |
+| Auto memory | `~/.claw/projects/<project path, non-alphanumerics → ->/memory/` (`$CLAW_CONFIG_HOME/projects/…` when set), Claude Code's format but claw's own folder (`MEMORY.md` index + one file per memory) |
 | Sessions | `.claw/sessions/` in the workspace (JSONL, resumable with `--resume`) |
 | Checkpoints | Shadow git repo `~/.claw/checkpoints/<hash>.git` whose work tree is the project; the project's own `.git` is never touched. Disabled for `$HOME`, `/`, huge folders, missing git, or `CLAW_SNAPSHOTS=0` |
 | Background jobs | In memory (`runtime/src/background_jobs.rs`); output buffered up to 1 MB per job; killed when the REPL exits |

@@ -3,9 +3,11 @@
 //! work, corrections, project decisions, where things are).
 //!
 //! Each project has a folder `projects/<project>/memory/` with one markdown
-//! file per memory and an index, `MEMORY.md`, with one line per memory. It
-//! is the same folder and format Claude Code uses (under `~/.claude`), so the
-//! two share what they learn; without `~/.claude` it lives under `~/.claw`. The index and the instructions for keeping memories are added to
+//! file per memory and an index, `MEMORY.md`, with one line per memory, in
+//! claw's own config home (`$CLAW_CONFIG_HOME`, else `~/.claw`). The layout
+//! and format are Claude Code's, but the folder is claw's: claw no longer
+//! writes into `~/.claude`, where its memories got mixed with Claude
+//! Code's. The index and the instructions for keeping memories are added to
 //! the system prompt; the model reads a memory file when it is relevant and
 //! writes memories with the ordinary file tools. The folder is created
 //! when the prompt is built (so the model can write to it, or read from it,
@@ -35,7 +37,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{claude_config_home, default_config_home, RuntimeConfig};
+use crate::config::{default_config_home, RuntimeConfig};
 
 /// When the model should save, in the memory section.
 pub const WHEN_TO_SAVE: &str = "When to save: when the user corrects you or states a preference, when you learn something about the project that will matter later, and when a task failed for a reason worth avoiding next time. Save it right away, with write_file or edit_file.";
@@ -71,10 +73,8 @@ pub fn memory_enabled(config: &RuntimeConfig) -> bool {
 #[must_use]
 pub fn memory_dir(cwd: &Path) -> PathBuf {
     let root = project_root(cwd);
-    let home = claude_config_home()
-        .filter(|claude| claude.is_dir())
-        .unwrap_or_else(default_config_home);
-    home.join("projects")
+    default_config_home()
+        .join("projects")
         .join(project_slug(&root))
         .join("memory")
 }
@@ -659,7 +659,33 @@ mod tests {
     }
 
     #[test]
+    fn memory_lives_in_claws_home_even_when_claude_code_is_installed() {
+        let _env = crate::test_env_lock();
+        let base = std::env::temp_dir().join(format!("claw-memory-home-{}", std::process::id()));
+        let claw = base.join("claw");
+        let claude = base.join("claude");
+        fs::create_dir_all(&claude).expect("claude home");
+        let original = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_claude = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAW_CONFIG_HOME", &claw);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+        let dir = memory_dir(&std::env::current_dir().expect("cwd"));
+        match original {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_claude {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(&base).ok();
+        assert!(dir.starts_with(claw.join("projects")), "{}", dir.display());
+        assert!(!dir.starts_with(&claude));
+    }
+
+    #[test]
     fn memory_paths_are_recognized_without_escapes() {
+        let _env = crate::test_env_lock();
         let cwd = std::env::current_dir().expect("cwd");
         let dir = memory_dir(&cwd);
         let inside = dir.join("note.md").display().to_string();

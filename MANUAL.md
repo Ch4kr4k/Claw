@@ -1252,11 +1252,12 @@ CLAUDE.local.md, `.claude/rules/`, imports) works in claw unchanged.
 claw also keeps notes for itself, so it remembers across sessions what it
 learned: your preferences, corrections you gave it, project decisions, where
 things are. Each project has a folder `projects/<project path>/memory/` with
-one markdown file per memory and an index, `MEMORY.md`. It is Claude Code's
-folder and format: when `~/.claude` exists the folder is
-`~/.claude/projects/<project path>/memory/`, so claw and Claude Code share
-what they learn; otherwise it is under `~/.claw`. The index is loaded into every session; the model
-opens a memory file when it is relevant.
+one markdown file per memory and an index, `MEMORY.md`, in claw's own
+folder: `~/.claw/projects/<project path>/memory/` (`$CLAW_CONFIG_HOME`
+instead of `~/.claw` when set). The format is Claude Code's, but claw no
+longer writes into `~/.claude`, so its memories stay apart from Claude
+Code's. The index is loaded into every session; the model opens a memory
+file when it is relevant.
 
 With the [learning loop](#learning-loop) on (the default), a review after
 each turn that taught something saves memories, so the model does not stop

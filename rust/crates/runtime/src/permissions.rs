@@ -1483,7 +1483,7 @@ mod tests {
         let original = std::env::var_os("CLAW_CONFIG_HOME");
         let original_claude = std::env::var_os("CLAUDE_CONFIG_DIR");
         std::env::set_var("CLAW_CONFIG_HOME", &home);
-        // Not the real ~/.claude: memory would go there when it exists.
+        // Never the real ~/.claude, should memory ever look there again.
         std::env::set_var("CLAUDE_CONFIG_DIR", home.join("no-claude"));
         let dir = crate::memory::memory_dir(&std::env::current_dir().expect("cwd"));
         std::fs::create_dir_all(&dir).expect("create memory dir");
