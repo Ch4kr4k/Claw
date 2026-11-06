@@ -15,6 +15,40 @@ use claw_engine::{AgentEvent, Engine, EngineConfig, EngineEvent, ToolActivity, T
 #[allow(clippy::wildcard_imports)]
 use crate::*;
 
+/// Raw outputs of the calls a turn ran, by (tool, input JSON), so the turn
+/// view can show a call the way the tool reported it: what the model gets
+/// is condensed (bash's stdout as text, an edit as a one-line summary), and
+/// the display formatter reads the tool's JSON.
+static RAW_RESULTS: Mutex<BTreeMap<(String, String), String>> = Mutex::new(BTreeMap::new());
+/// More are dropped (turns that draw nothing, such as `-p` JSON, keep none
+/// for long).
+const MAX_RAW_RESULTS: usize = 64;
+
+/// Notes the raw output of `tool` called with `input` (see [`RAW_RESULTS`]).
+pub(crate) fn keep_raw_result(tool: &str, input: &str, output: &str) {
+    let mut results = RAW_RESULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if results.len() < MAX_RAW_RESULTS {
+        results.insert(
+            (tool.to_string(), normalized_input(input)),
+            output.to_string(),
+        );
+    }
+}
+
+fn take_raw_result(tool: &str, input: &str) -> Option<String> {
+    RAW_RESULTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(tool.to_string(), normalized_input(input)))
+}
+
+fn normalized_input(input: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(input)
+        .map_or_else(|_| input.to_string(), |value| value.to_string())
+}
+
 /// The engine's thread tools: they have no claw tool activity, so their
 /// calls are shown when the model makes them.
 pub(crate) const ENGINE_TOOLS: &[&str] = &[
@@ -48,6 +82,10 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let started = std::time::Instant::now();
+        RAW_RESULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let mut view = TurnView {
             model: self.model.clone(),
             ..TurnView::default()
@@ -444,7 +482,10 @@ impl TurnView {
                 let _ =
                     writeln!(out).and_then(|()| write_folded(&mut out, &brief, full.as_deref()));
                 if *is_error || !matches!(name.as_str(), "read_file" | "Read") {
-                    print_foldable(|| format_tool_result(name, output, *is_error));
+                    let shown = take_raw_result(name, input)
+                        .filter(|_| !*is_error)
+                        .unwrap_or_else(|| output.clone());
+                    print_foldable(|| format_tool_result(name, &shown, *is_error));
                 }
                 if matches!(
                     name.as_str(),

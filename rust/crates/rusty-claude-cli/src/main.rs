@@ -13931,6 +13931,11 @@ impl CliToolExecutor {
         match result {
             Ok(output) => {
                 let is_read = matches!(tool_name, "read_file" | "Read");
+                if !self.emit_output && !is_read {
+                    // An engine turn draws the call itself, from the raw
+                    // output (the model gets the condensed text below).
+                    live_engine::keep_raw_result(tool_name, input, &output);
+                }
                 if self.emit_output && !is_read {
                     print_foldable(|| format_tool_result(tool_name, &output, false));
                 }
