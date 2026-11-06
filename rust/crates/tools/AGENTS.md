@@ -15,7 +15,7 @@ Single-crate tool surface: registry, 60 tool specs, permission-gated dispatch, a
 | 1525–2735 | `run_*` wrappers: deserialize input, call into `execute_*` or runtime fns |
 | ~3184 | `workspace_traversal_guard_tests` mod |
 | 2764–3354 | ~45 private serde IO structs |
-| 3355–6824 | Real implementations: web fetch/search, todo store, skill resolution, agent/subagent spawning (`ProviderRuntimeClient` L5182, `SubagentToolExecutor` L5361), notebook edit, sleep, config, plan-mode, structured output, REPL, PowerShell |
+| 3355–6824 | Real implementations: web fetch/search, todo store, skill resolution, agent/subagent spawning (manifests and jobs; each turn runs through the installed `SubagentRunner`, the engine's, with `run_subagent_tool` for calls), notebook edit, sleep, config, plan-mode, structured output, REPL, PowerShell |
 | 7350–7351 | `pub mod lane_completion; pub mod pdf_extract;` |
 | 7354–end | `mod tests` (~4200 lines) |
 
@@ -26,7 +26,7 @@ Single-crate tool surface: registry, 60 tool specs, permission-gated dispatch, a
 3. Write a `run_<tool>()` wrapper. Deserialize input from a dedicated serde struct.
 4. Implement the actual logic below L3355 (or call into another crate).
 5. Add inline tests in `mod tests`. Follow BDD naming: `given_x_when_y_then_z`.
-6. Permission gating is automatic: `GlobalToolRegistry` / `SubagentToolExecutor` hold an optional `PermissionEnforcer` checked pre-dispatch.
+6. Permission gating is automatic: `GlobalToolRegistry` holds an optional `PermissionEnforcer` checked pre-dispatch; `run_subagent_tool` applies the sub-agent policy.
 
 ## CONVENTIONS
 

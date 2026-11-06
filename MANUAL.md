@@ -876,6 +876,9 @@ Limitations for now:
 - A text-only model gets a note in place of each image (`visionModel`
   descriptions are not sent).
 - Hooks run as before but print no `[hook …]` progress lines.
+- A conversation that no longer fits the context window is not compacted
+  and retried automatically; the turn fails and `/compact` is needed (see
+  *A request doesn't fit the model's context window* in Troubleshooting).
 
 The design and the plan for the remaining work are in
 [`docs/infinity-engine.md`](docs/infinity-engine.md).
@@ -1442,7 +1445,7 @@ file works as a template.
 | `diffPanel` | `"on"` \| `"off"` | Diff panel (`/diffpanel`) |
 | `scrollSpeed` | rows as a string (`"3"`) | Mouse-wheel rows per step |
 | `autoCompactWindow` | tokens as a string (null = from the model) | Auto-compaction threshold (`/autocompact`) |
-| `overflowToolResultChars` | characters as a string, or `"off"` (null = a quarter of the window) | How far tool results are cut after a context overflow |
+| `overflowToolResultChars` | characters as a string, or `"off"` | Not used at the moment (it sized the cut of tool results in the previous loop's overflow retries) |
 | `statusLine` | `{command}` (null) | Command whose output is shown in the status line |
 
 Some user-level settings (theme, provider) are saved by the REPL to
@@ -1499,7 +1502,7 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_AUTO_MEMORY=0` | Turn off auto memory for this run |
 | `CLAW_LEARNING=0` | Turn off the learning loop for this run |
 | `CLAW_VERIFY_ON_STOP=0` | Do not remind the model to check edited code before a turn ends |
-| `CLAW_OVERFLOW_TOOL_RESULT_CHARS` | When a request overflows the context window, longest a tool result may stay (`64k`; at least 1k), or `off` to never cut. Default: about a quarter of the model's window. Also `overflowToolResultChars` in `~/.claw/settings.json` |
+| `CLAW_OVERFLOW_TOOL_RESULT_CHARS` | Not used at the moment (it sized the cut of tool results in the previous loop's overflow retries) |
 | `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` | Context size (input tokens of the last request) at which the session is compacted automatically; default 100000 |
 | `NO_COLOR` | No colours |
 | `CLAW_OUTPUT_FORMAT=json` | Default to JSON output for non-interactive commands |
@@ -1560,18 +1563,19 @@ for the file in parts, or `/compact` to shrink the prompt. Then `/retry`.
 The server dropped the connection mid-reply: it crashed, ran out of memory, or
 a proxy timed out. Check the server's logs, then `/retry`.
 
-**`Auto-compacting session (round N/4 …)`**
-A request didn't fit the model's context window. `claw` compacts the history,
-cuts very large tool results (`Cut N oversized tool result(s)`), and continues
-the same request from where it stopped, without sending your prompt again.
-Esc stops it at any point. With small windows (e.g. llama.cpp's default
-`--ctx-size`), reading a whole large file is the usual cause: ask for line
-ranges instead. Results are cut to about a quarter of the model's window, so
-a large-context model keeps them whole unless one is enormous; set
-`CLAW_OVERFLOW_TOOL_RESULT_CHARS` (or `"overflowToolResultChars"` in
-`~/.claw/settings.json`) to a size such as `"64k"`, or `"off"` to never cut.
+**A request doesn't fit the model's context window**
+`claw` keeps the conversation under the window as it goes: the engine
+compacts its copy of a long turn at 3/4 of the window, and after a turn that
+filled the context past the auto-compaction threshold the session is
+compacted (`/autocompact` sets the threshold). If one tool result is what
+overflowed, it is replaced with a note that it was too large and the request
+is sent again. If the conversation itself no longer fits (for example a
+large session resumed on a model with a smaller window), the turn fails and
+your prompt is not sent: run `/compact`, then send it again. With small
+windows (e.g. llama.cpp's default `--ctx-size`), reading a whole large file
+is the usual cause: ask for line ranges instead.
 
-**`(reply cut off at the N-token limit; asking the model to continue)`**
+**A reply cut off at the token limit**
 The reply reached its token budget. `claw` asks the model to continue where it
 stopped (up to 3 times in a row); a tool call that was cut off is not run, and
 the model is told to send less per call. A `local/` model cut off while still
@@ -1584,13 +1588,6 @@ report it), and the session is compacted once it fills the window less the
 reply budget and a small margin (about 69%)
 unless `/autocompact` sets another size. A server started with a bigger `-c`
 gives both more room.
-
-**`Auto-compacting session … No further compaction possible`**
-The request still failed after the history was compacted, so the history is
-not the problem: either the system prompt plus tools alone exceed the model's
-context window (use a model or server with a larger context, e.g. a bigger
-`--ctx-size` on llama.cpp), or the error isn't really about context. Read the
-error printed after it.
 
 **Local model replies are very slow**
 Check whether it's the model or `claw` by timing the model directly:

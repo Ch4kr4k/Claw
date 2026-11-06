@@ -355,3 +355,10 @@ each. A single call goes through untouched.
 - Infinity compacts its in-memory copy of a long turn at 3/4 of the
   window; that summary is not kept, so the next turn starts from claw's
   session (compacted after the turn when it is full).
+- A context overflow is recovered only when one tool result caused it (it
+  is replaced with a placeholder and the request retried). When the
+  conversation itself no longer fits, Infinity drops the new prompt and the
+  turn fails; the previous loop compacted harder and retried. `/compact`
+  is the way out until claw retries such a turn itself.
+- `CLAW_OVERFLOW_TOOL_RESULT_CHARS` / `overflowToolResultChars` are unused
+  (they sized the previous loop's overflow retries).

@@ -24,7 +24,7 @@ claw-code/
 | Task | Location | Notes |
 |------|----------|-------|
 | CLI subcommands | rust/crates/rusty-claude-cli/src/main.rs | hand-rolled parser; CliAction enum ~L1168; dispatch in run() L1000-1165 |
-| REPL loop / interrupts | rust/crates/rusty-claude-cli/src/main.rs | run_repl ~L7035, LiveCli ~L7147, ignore_ctrl_c_in_repl + HookAbortMonitor ~L7600 |
+| REPL loop / interrupts | rust/crates/rusty-claude-cli/src/main.rs | run_repl, LiveCli, ignore_ctrl_c_in_repl; turn-time keys in runtime/src/turn_keys.rs |
 | Line editor (prompt input) | rust/crates/rusty-claude-cli/src/input.rs | crossterm raw mode; menu, paste, history, Ctrl+C double-press exit |
 | Streaming renderer | rust/crates/rusty-claude-cli/src/render.rs | markdown streaming, tool lines, diffs, themes |
 | REPL-only slash commands | rust/crates/rusty-claude-cli/src/repl_commands.rs | undo/rewind, plan, effort, tasks, theme, image, copy… |

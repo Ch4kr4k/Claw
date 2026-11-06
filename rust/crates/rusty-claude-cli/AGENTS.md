@@ -14,10 +14,11 @@ not by line number.
 |---|---|
 | `main.rs` | Provenance/model types, error taxonomy (`classify_error_kind`), `main()` (error envelope only), `run()` (one flat match over `CliAction`), doctor checks (`check_*_health`), manifests, status/help/config renderers, `run_repl` and `LiveCli`'s struct, constructor and `handle_repl_command` dispatcher, request helpers (`sent_tool_definitions`, `defer_tool_definitions`, `convert_messages`) |
 | `cli_args.rs` | `CliAction` and `parse_args` (the manual token loop) |
-| `live_turn.rs` | `LiveCli` turns: `prepare_turn_runtime`, `run_turn_inner` (Esc/Ctrl+C stop, LeanGate, progressive auto-compact retry), one-shot prompt modes, prompt-backed commands (`/bughunter`, `/commit`, `/pr`, …) |
+| `live_turn.rs` | `LiveCli` turns: `run_turn` (checkpoint, LeanGate rounds, image check) around `run_turn_inner` (an engine turn), one-shot prompt modes, prompt-backed commands (`/bughunter`, `/commit`, `/pr`, …) |
 | `live_session.rs` | `LiveCli` state: persist/resume/clear sessions, `set_model`, `set_permissions`, `rebuild_runtime`, the status line (`refresh_footer_status`), `/session` and `/plugins` actions |
 | `live_reports.rs` | `LiveCli`'s read-only reports: `/status`, `/history`, `/sandbox`, `/cost`, `/config`, `/memory`, `/agents`, `/mcp`, `/skills`, `/plugins`, `/diff`, `/version` |
-| `provider_client.rs` | `AnthropicRuntimeClient`: adapts `api::ProviderClient` to the runtime `ApiClient`, streams events with live rendering, fallback models, aborts on the turn signal |
+| `provider_client.rs` | `AnthropicRuntimeClient`: the session's client for compaction summaries; `turn_client` builds the provider client turns use (prompt cache, retry policy) |
+| `live_engine.rs` | Turns on the engine: `engine_config`, `engine_provider` (reply budget, thinking budget, fallbacks, error wording), the REPL turn view, quiet and side-prompt turns, `after_engine_turn` (usage, auto-compaction) |
 | `tool_executor.rs` | `CliToolExecutor`: allowed-list checks, `ToolSearch` loading, MCP/plugin tools, parallel read-only batches, tool output display, `CLAW_TOOL_RESULT_MAX_CHARS` cap |
 | `permission_prompt.rs` | `CliPermissionPrompter`: `[y]es / [a]lways … / [N]o`, session approvals keyed by `bash_approval_key` |
 | `tests.rs` | `main.rs`'s unit tests (`mod tests;`); smaller test modules stay at the end of `main.rs` |

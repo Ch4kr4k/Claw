@@ -418,52 +418,44 @@ instead of ending the turn silently.
 
 ## Context-window recovery
 
-When a request fails with a context-overflow signature (`context_window`,
-`exceed_context_size`, llama.cpp's "Context size has been exceeded", a
-non-SSE body with no parseable content, or a non-timeout decode error),
-`LiveCli` retries with progressively harder compaction: it keeps 4, then 2, 1, 0
-recent messages, running the Trident pipeline plus summary compaction
-(`runtime/src/trident.rs`, `compact.rs`) before each retry. If the error
-reveals the server's real context window, the auto-compaction threshold is
-reset from it the same way, and for `local/` models the window is remembered
-(`api::note_local_context_window`) so the fresh runtime of the next turn uses
-it too. Timeouts are excluded: compaction cannot fix them.
-Auto-compaction (`maybe_auto_compact`) sizes what it keeps: it estimates the
-prompt overhead (system prompt, tools) from the last request and keeps 4, 2
-or 1 recent messages, cutting large kept tool results last, until the request
-lands halfway between that overhead and the threshold. A fixed 4 messages
-stayed over the threshold on a 32k window and compacted on every step.
-Merged summaries carry earlier user requests and key files once each and drop
-per-chunk bookkeeping, so they stay bounded.
-Each compaction summary carries a "Work done so far" list (one line per tool
-call: tool, path or command, outcome) across later compactions, so a model on
-a small window still knows which edits and builds it already did.
-Each round also cuts tool results longer than about a quarter of the window
-(`truncate_large_tool_results`, limit from `overflow_tool_result_limit`),
-since one whole large file in a kept message can overflow the window alone.
-The window is the one the error reports, else the model's known window
-(`known_context_window`: `api::local_context_window` for `local/` models, else
-`api::model_token_limit`, else `api::hosted_context_window`: the models.dev
+`claw_engine::provider::error_class` maps a context-overflow error
+(`ApiError::is_context_window_failure`: `context_window`,
+`exceed_context_size`, llama.cpp's "Context size has been exceeded") to
+Infinity's `ErrorClass::ContextOverflow`. Infinity then recovers in one of
+two ways (`recover_from_overflow` in `infinity-agent-core`): when the only
+new input is one tool result, it is replaced with a "too large" placeholder
+and the completion retried; otherwise pending tool results are settled as
+interrupted, new user input is dropped and the completion fails, so a
+conversation that no longer fits needs `/compact`. The previous loop's
+progressive compact-and-retry rounds (keeping 4, 2, 1, 0 messages, cutting
+large tool results) went with it. Overflow is prevented rather than
+repaired: Infinity compacts its copy of a turn at 3/4 of the window, and
+`ConversationRuntime::auto_compact` compacts the session after a turn.
+Auto-compaction sizes what it keeps: it estimates the prompt overhead
+(system prompt, tools) from the last request and keeps 4, 2 or 1 recent
+messages, cutting large kept tool results last, until the request lands
+halfway between that overhead and the threshold. A fixed 4 messages stayed
+over the threshold on a 32k window and compacted on every step. Merged
+summaries carry earlier user requests and key files once each and drop
+per-chunk bookkeeping, so they stay bounded. Each compaction summary carries
+a "Work done so far" list (one line per tool call: tool, path or command,
+outcome) across later compactions, so a model on a small window still knows
+which edits and builds it already did. The window comes from
+`known_context_window`: `api::local_context_window` for `local/` models, else
+`api::model_token_limit`, else `api::hosted_context_window` (the models.dev
 catalog in `api::providers::catalog`, cached in `~/.claw/cache/`, then the
 provider's `/models` list). The same catalog supplies the OpenAI-compatible
 providers that `api::all_hosted_providers` lists after the built-in and custom
-ones (`catalog_hosted`, loaded only when a model prefix is not otherwise known), else the size of the request that overflowed, an
-upper bound that shrinks each round; so large-context models are cut only for
-enormous results. `CLAW_OVERFLOW_TOOL_RESULT_CHARS` or the
-`overflowToolResultChars` setting overrides it (`off` never cuts). A round
-that changes nothing is skipped. The retry continues the failed turn
-(`ConversationRuntime::continue_turn`) with the work it already did, rather
-than sending the prompt again; the prompt is re-sent only when compaction
-removed it.
+ones (`catalog_hosted`, loaded only when a model prefix is not otherwise
+known).
 
 Compaction never splits an assistant tool-use message from its tool result.
 
-Automatic compaction (`ConversationRuntime::maybe_auto_compact`) runs after
-each model step when the last request's input (uncached plus cache read and
-write tokens) reached the threshold: 100,000 tokens by default,
+Automatic compaction (`ConversationRuntime::auto_compact`) runs after each
+turn when the turn's last request (its input plus the reply) reached the
+threshold: 100,000 tokens by default,
 `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS` to change it. If it summarizes away the
-prompt of the running turn, that prompt is appended verbatim to the summary
-message so the model can finish the task.
+turn's prompt, that prompt is appended verbatim to the summary message.
 
 ## Permissions
 
@@ -550,8 +542,9 @@ message with background-job notices, `prompt::InstructionWatch::changes`
 (instruction files edited since the system prompt was built) and
 `prompt::time_reminder` (every 10 minutes). `run_turn` hands the finished
 conversation and system prompt to `tools::set_fork_seed`, which a `fork`
-Agent starts from; it also calls `step_stats::begin_turn`, and
-`stream_once`/the tool executor feed `step_stats` for `/stats`. Tools added
+Agent starts from; it also calls `step_stats::begin_turn`, and the engine's
+turn view (each completion's start, first token and usage) and the tool
+executor feed `step_stats` for `/stats`. Tools added
 here: `ExternalAgent` (`tools/src/external_agent.rs`, a `claude -p` or `codex
 exec` child in its own process group, stopped through `runtime::turn_aborted`)
 and `apply_patch` (`tools/src/apply_patch.rs` parses and applies hunks;
@@ -622,12 +615,12 @@ directory, the only place the sandbox lets the script reach.
 `crates/claw-desktop` (Iced) is a front end only. Each open chat starts
 `claw desktop-agent [--resume <session.jsonl>]` (`rusty-claude-cli/src/desktop_agent.rs`)
 in the chat's folder, through the `~/.local/bin/claw` launcher, and talks JSON
-lines over its stdin/stdout. The agent reuses `LiveCli`'s per-turn runtime
-(`prepare_turn_runtime`) with `emit_output = false`; hooks in the stream loop
-(`emit_text`, `emit_thinking`, `emit_tool_call`) and in
-`CliToolExecutor::report_result` (`emit_tool_result`) report the turn as
-events, `DesktopPermissionPrompter` sends approvals to the app and waits for
-the answer, and `cancel` trips the turn's `HookAbortSignal` like Esc. The app
+lines over its stdin/stdout. Each turn runs on the engine with `LiveCli`'s
+`engine_config` (`desktop_engine_attempt`); `EngineView` turns the engine's
+events into the app's (`text`, `thinking`, `tool_call`, `tool_result`, child
+replies as `notice`), `DesktopPermissionPrompter` sends approvals to the app
+and waits for the answer, and `cancel` trips the turn's `HookAbortSignal`
+like Esc. The app
 reads session files directly for the sidebar and history
 (`claw-desktop/src/sessions.rs`), so terminal sessions appear there too.
 

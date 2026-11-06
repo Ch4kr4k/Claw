@@ -60,8 +60,9 @@ Prerequisites before starting:
 - A repeatable task suite with automatic pass/fail checks (session logs in
   `.claw/sessions/` are the raw material; LeanGate's type-check results and
   `RepoSignals` failures can be graders).
-- Explicit hook points in `runtime/src/conversation.rs` for the four
-  lifecycle stages (today: system prompt, hooks, permission prompter, the
-  LeanGate completion gate).
+- Explicit hook points in the engine's turn (`claw-engine`: `ToolHost::run`,
+  `reply.rs`, `guards.rs`) for the four lifecycle stages (today: system
+  prompt, hooks, permission prompter, turn guards, the LeanGate completion
+  gate).
 - A sandboxed runner (bwrap, or a worktree per candidate) so patched
   harnesses cannot touch the real workspace.
