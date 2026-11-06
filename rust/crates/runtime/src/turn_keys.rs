@@ -1131,6 +1131,47 @@ struct Keys {
     interrupts: u32,
 }
 
+/// Caps Lock (64) and Num Lock (128) in a kitty keyboard protocol modifier
+/// field: kitty reports them as modifiers once the protocol is on, so with
+/// Num Lock on Esc arrives as `ESC [ 27 ; 129 u` and Left as `ESC [ 1 ; 129
+/// D`. They change nothing about the key.
+const LOCK_MODIFIERS: u32 = 64 | 128;
+
+/// `params` of a key report (`code;mods[:event]`) without the lock keys in
+/// its modifiers, in the shortest form the legacy encoding uses: an
+/// unmodified `1;129D` becomes `D`'s empty parameters, `3;129~` becomes `3`,
+/// and `1;133H` (Ctrl, Num Lock) becomes `1;5`.
+fn without_lock_modifiers(params: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    let Ok(text) = std::str::from_utf8(params) else {
+        return Cow::Borrowed(params);
+    };
+    let Some((code, rest)) = text.split_once(';') else {
+        return Cow::Borrowed(params);
+    };
+    let (mods, event) = rest
+        .split_once(':')
+        .map_or((rest, None), |(m, e)| (m, Some(e)));
+    let Ok(mods) = mods.parse::<u32>() else {
+        return Cow::Borrowed(params);
+    };
+    let modifiers = mods.saturating_sub(1) & !LOCK_MODIFIERS;
+    let mut out = if modifiers == 0 && event.is_none_or(|event| event == "1") {
+        if code == "1" {
+            String::new()
+        } else {
+            code.to_string()
+        }
+    } else {
+        format!("{code};{}", modifiers + 1)
+    };
+    if let Some(event) = event.filter(|event| *event != "1") {
+        out.push(':');
+        out.push_str(event);
+    }
+    Cow::Owned(out.into_bytes())
+}
+
 /// The key a kitty keyboard protocol report (`ESC [ code ; mods u`) stands
 /// for, as the bytes the legacy encoding would have sent; `None` to drop it.
 fn kitty_key(params: &[u8], keys: &mut Keys) -> Option<u8> {
@@ -1141,7 +1182,7 @@ fn kitty_key(params: &[u8], keys: &mut Keys) -> Option<u8> {
         .next()
         .and_then(|mods| mods.split(':').next()?.parse().ok())
         .unwrap_or(1);
-    let modifiers = mods.saturating_sub(1);
+    let modifiers = mods.saturating_sub(1) & !LOCK_MODIFIERS;
     let (shift, alt, ctrl) = (modifiers & 1 != 0, modifiers & 2 != 0, modifiers & 4 != 0);
     match code {
         27 if modifiers == 0 => {
@@ -1192,7 +1233,8 @@ fn split_keys(bytes: &[u8]) -> Keys {
                 while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
                     end += 1;
                 }
-                let params = &bytes[i + 2..end.min(bytes.len())];
+                let params = without_lock_modifiers(&bytes[i + 2..end.min(bytes.len())]);
+                let params: &[u8] = &params;
                 // Normal and application cursor mode (`ESC O D`), and the
                 // `ESC [ n ~` forms of Home/End/Delete.
                 let csi = bytes[i + 1] == b'[';
@@ -1796,6 +1838,24 @@ pub fn note_tool_input(chars: usize) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn keys_from_kitty_with_num_lock_or_caps_lock_on_still_work() {
+        // What kitty sends in "disambiguate" mode with Num Lock on (128):
+        // Esc, Left, Right, Up, then Home, Delete and Ctrl+Home.
+        let keys = super::split_keys(b"\x1b[27;129u");
+        assert_eq!(keys.escapes, 1, "Esc");
+        let keys = super::split_keys(b"ab\x1b[1;129D\x1b[1;129C\x1b[1;129A");
+        assert_eq!(keys.text, b"ab\x02\x06\x10", "Left, Right, Up");
+        let keys = super::split_keys(b"\x1b[1;65H\x1b[3;129~");
+        assert_eq!(keys.text, b"\x01\x04", "Home with Caps Lock, Delete");
+        let keys = super::split_keys(b"\x1b[1;133H");
+        assert_eq!(keys.scrolls.len(), 1, "Ctrl+Home keeps its Ctrl");
+        let keys = super::split_keys(b"\x1b[99;133u");
+        assert_eq!(keys.interrupts, 1, "Ctrl+C with Num Lock");
+        // A really modified arrow (Shift) is still not a plain one.
+        assert!(super::split_keys(b"\x1b[1;130D").text.is_empty());
+    }
 
     #[test]
     fn the_slash_menu_ranks_commands_and_keeps_its_selection() {
