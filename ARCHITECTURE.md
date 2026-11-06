@@ -36,7 +36,7 @@ claw-code/
 | Crate | Kind | Owns |
 |---|---|---|
 | `rusty-claude-cli` | bin `claw` | Argument parsing, REPL, line editor, streaming renderer, permission prompts, slash-command handlers, doctor/status/JSON surfaces |
-| `runtime` | lib | `ConversationRuntime` (the agent loop), sessions, config, permissions policy, prompt assembly, hooks, MCP, compaction, snapshots, background jobs, turn-time keyboard watcher |
+| `runtime` | lib | `ConversationRuntime` (a session with its client, tool executor, usage and compaction), the turn guards (`turn_guards`, `text_tool_calls`), sessions, config, permissions policy, prompt assembly, hooks, MCP, compaction, snapshots, background jobs, turn-time keyboard watcher |
 | `api` | lib | Provider clients (Anthropic Messages, OpenAI-compatible: OpenAI, xAI, DashScope, Ollama, local servers), SSE parsing, HTTP client/timeouts/proxies, `ApiError` |
 | `tools` | lib | The tool registry: 60 tool specs with JSON schemas and their implementations (`execute_tool`) |
 | `commands` | lib | Slash-command specs (57), parsing, help rendering |
@@ -46,7 +46,7 @@ claw-code/
 | `mock-anthropic-service` | lib+bin | Scripted `/v1/messages` mock used by CLI integration tests and the parity harness |
 | `compat-harness` | lib | Extracts upstream manifests for parity comparison |
 | `claw-analog` | lib+bin | A lean alternate agent loop over `api` + `runtime` |
-| `claw-engine` | lib | claw on the Infinity runtime (`infinity-agent-core`): `ClawModelProvider` (claw's providers as an Infinity `ModelProvider`), `ClawTool` (registry tools with policy checks; fast tools inline, slow ones dispatched so the thread yields), the `parallel_tools` batch, and `Engine` (a local agent system on a `LocalSet`, child threads included). The default turn loop (`CLAW_ENGINE=legacy` for the previous one); see [`docs/infinity-engine.md`](docs/infinity-engine.md) |
+| `claw-engine` | lib | claw on the Infinity runtime (`infinity-agent-core`): `ClawModelProvider` (claw's providers as an Infinity `ModelProvider`), `ClawTool` (registry tools with policy checks; fast tools inline, slow ones dispatched so the thread yields), the `parallel_tools` batch, the turn guards (`guards`, `reply`), and `Engine` (a local agent system on a `LocalSet`, child threads included). Every turn runs here; see [`docs/infinity-engine.md`](docs/infinity-engine.md) |
 | `claw-rag-service` | bin | Standalone axum RAG service (SQLite, optional Qdrant) |
 
 Dependency rules that matter:
@@ -67,10 +67,10 @@ Dependency rules that matter:
 | `repl_commands.rs` | REPL-only commands: checkpoints (`/undo`, `/rewind`), `/plan`, `/effort`, `/usage`, `/context`, `/tasks`, `/files`, `/copy`, `/paste`, `/image`, `/theme`, `/retry`, `/add-dir`, `/rename`, prompt-backed review commands |
 | `init.rs`, `setup_wizard.rs` | `claw init` scaffolding and the first-run provider setup |
 
-## The asynchronous engine (default)
+## The asynchronous engine
 
-Turns run on `claw-engine` (`CLAW_ENGINE=legacy` falls back to
-`ConversationRuntime`'s loop). Every input is a message to a thread. A thread's
+Every turn runs on `claw-engine` (the previous synchronous loop,
+`ConversationRuntime::run_turn`, was removed). Every input is a message to a thread. A thread's
 slice runs one completion and persists the turn, then dispatches its tool
 call and yields; the result comes back as a new message. Threads are FIFO
 inside themselves and concurrent with each other, and the model creates
@@ -82,8 +82,9 @@ REPL / claw -p ──► LiveCli::run_turn_inner ──► live_engine ──►
                  LaunchingSystem ── root thread ── child threads …
                    │ ModelProvider = ClawPrompt(ClawModelProvider)
                    │   strip Infinity's base prompt, pack a reply's calls
-                   │   into `parallel_tools`, unpack them for the provider
-                   │ Tool = ClawTool (policy → tools registry)
+                   │   into `parallel_tools`, unpack them for the provider;
+                   │   check each reply (reply.rs) and tell TurnGuards
+                   │ Tool = ClawTool (hooks → policy → TurnGuards → tool)
                    │   inline: execute_synchronous (spawn_blocking)
                    │   slow:   execute → spawn_blocking → result message
                    ▼
@@ -104,34 +105,34 @@ calls. The design and the phase plan are in
 ```text
 LineEditor::read_line ──► LiveCli::run_turn
                              │ begin_checkpoint      (shadow-git "before" snapshot)
-                             │ prepare_turn_runtime  (fresh runtime + abort signal + Ctrl+C monitor)
-                             │ TurnKeyWatcher::start (Esc / type-ahead while the reply runs)
                              ▼
-                   ConversationRuntime::run_turn  (runtime/src/conversation.rs)
-                     loop:
-                       ApiClient::stream ──► api::ProviderClient ──► provider (SSE)
-                       render streamed text
-                       for tool calls in the reply:
-                         pre-tool hooks → PermissionPolicy (→ prompt user if needed)
-                         group consecutive read-only calls → run in parallel
-                         ToolExecutor::execute(_batch) ──► tools::execute_tool
-                         post-tool hooks → ToolResult back into the session
-                       queued user prompts are injected between steps
-                     until the model stops calling tools
+                   LiveCli::run_engine_turn  (rusty-claude-cli/src/live_engine.rs)
+                     engine_config: provider (session client, reply budget,
+                       thinking budget, fallbacks), registry with MCP tools,
+                       PermissionPolicy, hooks, CliPermissionPrompter,
+                       CliToolExecutor, GuardConfig
+                     TurnKeyWatcher::start (Esc / Ctrl+C / type-ahead)
+                     Engine::run_turn_blocking(session messages, prompt)
+                       root thread: completion → tool calls → results → …
+                       queued prompts go straight to the root thread
+                       guard follow-ups (continue, verify) after a reply
+                     push the turn's messages onto the session
+                     record usage, auto-compact if the context is full
                              ▼
-                   finish_checkpoint (after snapshot) → persist session
+                   LeanGate rounds → finish_checkpoint → persist session
 ```
 
 Key points:
 
-- **A fresh runtime per turn.** `prepare_turn_runtime` rebuilds the
-  `ConversationRuntime` from the current session, re-applying reasoning
-  effort and the abort signal, so per-turn settings never leak.
-- **Parallel tool calls.** `ConversationRuntime` splits a reply's tool calls
-  into groups: each run of consecutive parallel-safe calls (read-only built-ins
-  such as `read_file`, `grep_search`, `WebFetch`) is one batch run on scoped
+- **A fresh engine per turn.** Each turn builds its engine from the current
+  session and settings (model, effort, permission mode), so per-turn
+  settings never leak. The root thread's id is the session id, which keeps
+  the system prompt, and a local server's prompt cache, the same.
+- **Parallel tool calls.** The calls of one reply go to the internal
+  `parallel_tools` tool (`claw_engine::batch`): each run of consecutive
+  read-only calls (`read_file`, `grep_search`, `WebFetch`, …) runs on scoped
   threads; any other call runs alone. Order is preserved, so a write never
-  overtakes a read. Output is printed in the original order.
+  overtakes a read.
 - **Full-screen view.** The REPL draws the whole window (`turn_keys::screen`,
   entered from `run_repl`, `CLAW_FULLSCREEN=0` to skip). For the session,
   stdout and stderr go into a pipe; a relay thread feeds the bytes into a
@@ -156,17 +157,15 @@ Key points:
   alone) in place of the conversation, redrawn while it is open.
 - **Images from tools.** Tool results are text; a tool names a picture with
   an output line `claw-image: /path.png` (`runtime::tool_images`), and the
-  conversation loop attaches it to the tool result message as an image
-  block, keeping only the newest two. The OpenAI-compatible request moves
+  engine attaches it to the tool result as an image part, sending only the
+  newest two (`reply::prepare_history`). The OpenAI-compatible request moves
   such image messages after the whole run of tool results, so parallel tool
   calls stay paired. The `X11` tool (`tools/src/x11.rs`, over xdotool,
   wmctrl, ffmpeg and xclip) uses this for screenshots. A model that takes no
   images (the models.dev catalog's `modalities.input`, or a provider that
   refused one: OpenRouter's "No endpoints found that support image input",
-  llama-server without `mmproj`) gets each image as text instead: what the
-  `visionModel` setting's model says it shows (cached per image), else a
-  note that it was left out (`sends_images`, `images_as_text`). A refusal is
-  retried at once without the image.
+  llama-server without `mmproj`) gets a placeholder for each image
+  (`sends_images`; Infinity substitutes it).
 - **COM automation.** `tools/src/com.rs` keeps one PowerShell process per
   claw session (started with `-EncodedCommand`, `-STA`), so COM objects
   survive between calls. Each call sends a JSON line with base64 PowerShell
@@ -357,17 +356,14 @@ Key points:
 
 ## Interrupts: Esc and Ctrl+C
 
-One `HookAbortSignal` per turn is shared by three parties:
-
-| Source | Sets the signal when |
-|---|---|
-| `TurnKeyWatcher` (`runtime/src/turn_keys.rs`) | Esc is pressed during the turn |
-| `HookAbortMonitor` (`main.rs`) | SIGINT (Ctrl+C) arrives during the turn |
-
-| Consumer | Effect |
-|---|---|
-| `AnthropicRuntimeClient::stream` | `select!`s the request against the signal; dropping the request closes the connection and the turn ends with "reply stopped by user" |
-| `HookRunner` | Running hooks are cancelled |
+One `HookAbortSignal` per turn: `TurnKeyWatcher` (`runtime/src/turn_keys.rs`)
+sets it when Esc or Ctrl+C is pressed during the turn (the desktop app's Stop
+sets it through `desktop_agent`). The engine's control loop sees it, shuts
+the agent system down (running completions are interrupted and their
+partial turns kept) and returns; `ToolHost` enters
+`runtime::TurnAbortScope` around each call, so running shell commands end
+too. A slow tool other than a shell command that has already started
+finishes in the background.
 
 Outside a turn, `ignore_ctrl_c_in_repl` (installed once by `run_repl`) keeps
 SIGINT from killing the process. At the prompt the editor is in raw mode, so
@@ -408,16 +404,17 @@ back to `CLAW_CONTEXT_WINDOW` for servers without `/props`. From it,
 `build_runtime_with_plugin_state` sets the auto-compaction threshold to what
 is left of the window after the reply budget and a 1/16 margin (about 69%)
 unless `/autocompact` or `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`
-set one. `maybe_auto_compact` counts the last reply's output tokens as well
-as its input. The post-tool stall timeout is 120 s for `local/` models
-(10 s otherwise), since a local server sends nothing until it has read the
-whole prompt.
+set one. After a turn, `ConversationRuntime::auto_compact` compacts the
+session when the turn's last request (its input plus the reply) reached the
+threshold; within a turn, Infinity compacts its own copy at 3/4 of the
+window.
 
-A reply that stops at the token limit (`max_tokens` / `length`) is marked
-with `AssistantEvent::OutputLimitReached`. The turn loop then does not run a
-last tool call whose input is unfinished JSON (it gets an error result telling
-the model to send less per call), and a text-only reply is continued with a
-reminder, up to 3 times per turn, instead of ending the turn silently.
+A reply that stops at the token limit (`max_tokens` / `length`) is noted by
+`ClawModelProvider` in the reply's `ReplyFlags` (Infinity's final chunk has
+no stop reason). The reply check then does not run a last tool call whose
+input is unfinished JSON (the thread is told to send less per call), and a
+text-only reply is continued with a reminder, up to 3 times in a row,
+instead of ending the turn silently.
 
 ## Context-window recovery
 
@@ -572,26 +569,32 @@ in the system prompt (`custom_agents_section`).
 
 ### Turn guards
 
-Inside `ConversationRuntime::drive_turn`, besides the repeated-result check
-(`REPEATED_CALL_LIMIT`; a call sent again after it was blocked gets
-`blocked_again_note`, and `BLOCKED_REPEAT_STEPS_LIMIT` steps of only such
-calls end the turn with a closing assistant note; `compact::collapse_repeated_cycles`
-keeps such a cycle once in both compaction summaries):
-`turn_guards::FailureGuard` notes and then blocks calls that keep failing;
-`turn_guards::is_repetition_dominated`/`is_runaway_repetition` replace a
-looped reply's text with `REPETITION_NOTE` and end the turn instead of
-continuing it; `turn_guards::VerifyGuard` pushes one reminder before a turn
-that edited code ends unchecked (`set_verify_on_stop`). `annotate_tool_result`
-appends the failure notes, `threats::tool_result_warning` for web/MCP tools,
-and `context_hints::ContextHints` (subdirectory instruction files, shared
-across a session's turns through an `Arc<Mutex<…>>` the CLI keeps). Before
-the loop, tool input is repaired in the CLI (`repaired_tool_input` →
-`api::repair_json`) and coerced to the tool's schema in
-`tools::coerce_tool_input`; `api::providers::think_scrubber` moves inline
-`<think>` blocks of OpenAI-compatible streams to thinking, and
+`claw_engine::guards::TurnGuards` is shared by a turn's tool host, provider
+wrapper and control loop, with state per thread (the helpers live in
+`runtime::turn_guards`). Before a call (`ToolHost::run`, after hooks and the
+permission check): the repeated-result check (`RepeatGuard`,
+`REPEATED_CALL_LIMIT`; a call sent again after it was blocked gets
+`blocked_again_note`, and `BLOCKED_REPEAT_STEPS_LIMIT` such calls in a row end
+the turn with a closing assistant note; `compact::collapse_repeated_cycles`
+keeps such a cycle once in both compaction summaries), `FailureGuard`
+(notes, then blocks, calls that keep failing) and the broad-search warning.
+After a call: failure notes, `threats::tool_result_warning` for web/MCP
+tools, `context_hints::ContextHints` (subdirectory instruction files, shared
+across a session's turns through an `Arc<Mutex<…>>` the CLI keeps), a short
+note in place of a read the conversation already holds, and, on the root,
+background jobs that finished. After a reply (`claw_engine::reply`): an
+empty reply is requested once more; `is_repetition_dominated`/
+`is_runaway_repetition` mark a looped reply, whose text is replaced with
+`REPETITION_NOTE` in later requests and in the session and which is not
+continued; cut-off replies are continued; `VerifyGuard` sends one reminder
+before a root turn that edited code ends unchecked (`verifyOnStop`). Tool
+input is repaired in the stream (`api::repair_json`) and coerced to the
+tool's schema in `tools::coerce_tool_input`; `api::providers::think_scrubber`
+moves inline `<think>` blocks of OpenAI-compatible streams to thinking, and
 `runtime::text_tool_calls` turns tool calls a local model wrote as text
-(Hermes `<tool_call>` JSON, Qwen3-Coder `<function=…>`) into tool-use blocks
-right after `build_assistant_message`, when the reply has no native call. `tool_spill`
+(Hermes `<tool_call>` JSON, Qwen3-Coder `<function=…>`) into calls when the
+reply has no native call (their markup is left out of later requests).
+`tool_spill`
 saves long output (bash over 16 KiB, capped results) under
 `~/.claw/tool-output/`, which `classify_read_path_permission` treats like the
 workspace. `ExecuteCode` (`tools/src/code_exec.rs`) serves read-only tools to

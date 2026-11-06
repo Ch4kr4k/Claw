@@ -13,21 +13,6 @@ fn context_window_comes_from_the_window_not_the_request() {
     );
 }
 
-#[test]
-fn overflow_tool_result_limit_scales_with_the_window() {
-    use super::overflow_tool_result_limit_from as limit;
-    // Known window: a quarter of it, in characters.
-    assert_eq!(limit(None, Some(16_384), 40_000), Some(16_384));
-    assert_eq!(limit(None, Some(1_000_000), 1_200_000), Some(1_000_000));
-    // Unknown window: bounded by the request that overflowed.
-    assert_eq!(limit(None, None, 300_000), Some(300_000));
-    assert_eq!(limit(None, None, 100), Some(2_000));
-    // The user's setting wins, in either direction.
-    assert_eq!(limit(Some("64k"), Some(16_384), 40_000), Some(64_000));
-    assert_eq!(limit(Some("off"), Some(16_384), 40_000), None);
-    assert_eq!(limit(Some("junk"), Some(16_384), 40_000), Some(16_384));
-}
-
 use super::{
     acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
     classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
@@ -41,12 +26,12 @@ use super::{
     format_unknown_slash_command_message, format_user_visible_api_error, merge_prompt_with_stdin,
     normalize_permission_mode, parse_args, parse_export_args, parse_git_status_branch,
     parse_git_status_metadata_for, parse_git_workspace_summary, parse_history_count,
-    permission_policy, print_help_to, push_output_block, render_config_report, render_diff_report,
+    permission_policy, print_help_to, render_config_report, render_diff_report,
     render_diff_report_for, render_diff_summary_for, render_full, render_help_topic,
     render_help_topic_json, render_memory_report, render_prompt_history_report, render_repl_help,
     render_resume_usage, render_session_list, render_session_markdown, resolve_model_alias,
     resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
-    response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+    resume_supported_slash_commands, run_resume_command, short_tool_id,
     slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
     status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
     validate_no_args, with_plan_mode_section, write_mcp_server_fixture, CliAction, CliOutputFormat,
@@ -60,7 +45,7 @@ use plugins::{
     PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
 };
 use runtime::{
-    load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
+    load_oauth_credentials, save_oauth_credentials, ConfigLoader, ContentBlock,
     ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
 };
 use serde_json::json;
@@ -4862,8 +4847,7 @@ fn tool_calls_by_other_agents_names_reach_claws_tools() {
 }
 
 #[test]
-fn fallback_triggers_and_empty_replies() {
-    use runtime::AssistantEvent;
+fn fallback_triggers() {
     for error in [
         "api returned 429 Too Many Requests",
         "api returned 402 Payment Required: requires more credits",
@@ -4881,18 +4865,6 @@ fn fallback_triggers_and_empty_replies() {
     ] {
         assert!(!super::is_fallback_worthy(error), "{error}");
     }
-    assert!(super::is_empty_reply(&[AssistantEvent::MessageStop]));
-    assert!(super::is_empty_reply(&[
-        AssistantEvent::TextDelta("  ".to_string()),
-        AssistantEvent::MessageStop
-    ]));
-    assert!(!super::is_empty_reply(&[
-        AssistantEvent::TextDelta("ok".to_string()),
-        AssistantEvent::MessageStop
-    ]));
-    assert!(!super::is_empty_reply(&[
-        AssistantEvent::OutputLimitReached
-    ]));
 }
 
 #[test]
@@ -4979,105 +4951,24 @@ fn broken_images_in_a_reply_are_sent_back_to_the_model() {
 }
 
 #[test]
-fn images_go_to_a_text_only_model_as_text() {
-    // No `visionModel` from the developer's own settings: describing the
-    // image would call (and could start) their real model server.
-    let _config = CleanConfig::enter();
-    assert!(super::is_image_refusal(
-        r#"api returned 404 Not Found: {"error":{"message":"No endpoints found that support image input"}}"#
-    ));
-    assert!(super::is_image_refusal(
-            "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
-        ));
-    assert!(!super::is_image_refusal("api returned 429 rate limit"));
-
-    let model = "openrouter/test/text-only-model";
-    assert!(super::sends_images(model));
-    super::note_no_images(model);
-    assert!(!super::sends_images(model));
-
-    let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    let mut messages = vec![super::InputMessage {
-        role: "user".to_string(),
-        content: vec![
-            super::InputContentBlock::Text {
-                text: "screenshot taken".to_string(),
-            },
-            super::InputContentBlock::Image {
-                source: super::ImageSource::base64("image/png".to_string(), "AAAA".to_string()),
-            },
-        ],
-    }];
-    super::images_as_text(&runtime, &mut messages, model);
-    assert!(messages[0]
-        .content
-        .iter()
-        .all(|block| !matches!(block, super::InputContentBlock::Image { .. })));
-    assert!(matches!(
-        &messages[0].content[1],
-        super::InputContentBlock::Text { text } if text.contains("takes no images")
-    ));
-}
-
-#[test]
-fn a_402_naming_an_affordable_budget_lowers_the_reply_budget() {
-    let model = "openrouter/test/affordable-model";
-    let full = super::reply_budget(model);
-    assert!(!super::note_affordable_reply_budget(
-        model,
-        "api returned 500"
-    ));
-    assert!(!super::note_affordable_reply_budget(
-        model,
-        "This request requires more credits, or fewer max_tokens. You requested up to \
-             64000 tokens, but can only afford 900."
-    ));
-    assert!(super::note_affordable_reply_budget(
-        model,
-        "This request requires more credits, or fewer max_tokens. You requested up to \
-             64000 tokens, but can only afford 20000. To increase, visit …"
-    ));
-    assert_eq!(super::reply_budget(model), full.min(18_000));
-    // Other models keep their budget.
-    assert_eq!(
-        super::reply_budget("openrouter/test/other-model"),
-        super::max_tokens_for_model("openrouter/test/other-model")
-    );
-}
-
-#[test]
 fn local_models_answer_without_thinking_after_a_thinking_cut_off() {
-    let request = |text: &str| runtime::ApiRequest {
-        system_prompt: Vec::new(),
-        messages: vec![runtime::ConversationMessage::user_text(text.to_string())],
-    };
-    let after_cut_off = request(&format!(
-        "{}: nothing was shown",
-        runtime::THINKING_CUT_OFF_PROMPT
-    ));
-    let body = super::local_thinking_controls("local/qwen36-35b-a3b", &after_cut_off);
+    let body = super::local_thinking_extra_body("local/qwen36-35b-a3b", true);
     assert_eq!(
         body["chat_template_kwargs"],
         serde_json::json!({ "enable_thinking": false })
     );
     assert!(!body.contains_key("thinking_budget_tokens"));
-    assert!(super::local_thinking_controls("openrouter/a/b:free", &after_cut_off).is_empty());
-    assert!(super::local_thinking_controls("openrouter/a/b:free", &request("fix it")).is_empty());
+    assert!(super::local_thinking_extra_body("openrouter/a/b:free", true).is_empty());
+    assert!(super::local_thinking_extra_body("openrouter/a/b:free", false).is_empty());
 }
 
 #[test]
 fn local_models_get_a_thinking_budget_inside_the_reply_budget() {
     let _guard = env_lock();
     std::env::remove_var("CLAW_THINKING_BUDGET");
-    let request = runtime::ApiRequest {
-        system_prompt: Vec::new(),
-        messages: vec![runtime::ConversationMessage::user_text(
-            "fix it".to_string(),
-        )],
-    };
     let model = "local/qwen36-35b-a3b";
     let reply = i64::from(super::reply_budget(model));
-    let budget = super::local_thinking_controls(model, &request)["thinking_budget_tokens"]
+    let budget = super::local_thinking_extra_body(model, false)["thinking_budget_tokens"]
         .as_i64()
         .expect("budget sent");
     assert!(
@@ -5086,9 +4977,9 @@ fn local_models_get_a_thinking_budget_inside_the_reply_budget() {
     );
 
     std::env::set_var("CLAW_THINKING_BUDGET", "-1");
-    assert!(super::local_thinking_controls(model, &request).is_empty());
+    assert!(super::local_thinking_extra_body(model, false).is_empty());
     std::env::set_var("CLAW_THINKING_BUDGET", "999999999");
-    let capped = super::local_thinking_controls(model, &request)["thinking_budget_tokens"]
+    let capped = super::local_thinking_extra_body(model, false)["thinking_budget_tokens"]
         .as_i64()
         .expect("budget sent");
     assert_eq!(capped, reply - 1_024);
@@ -5625,176 +5516,6 @@ fn describe_tool_progress_summarizes_known_tools() {
 }
 
 #[test]
-fn push_output_block_renders_markdown_text() {
-    let mut out = Vec::new();
-    let mut events = Vec::new();
-    let mut pending_tool = None;
-    let mut block_has_thinking_summary = false;
-
-    push_output_block(
-        OutputContentBlock::Text {
-            text: "# Heading".to_string(),
-        },
-        &mut out,
-        &mut events,
-        &mut pending_tool,
-        false,
-        &mut block_has_thinking_summary,
-    )
-    .expect("text block should render");
-
-    let rendered = String::from_utf8(out).expect("utf8");
-    assert!(rendered.contains("Heading"));
-    assert!(rendered.contains('\u{1b}'));
-}
-
-#[test]
-fn push_output_block_skips_empty_object_prefix_for_tool_streams() {
-    let mut out = Vec::new();
-    let mut events = Vec::new();
-    let mut pending_tool = None;
-    let mut block_has_thinking_summary = false;
-
-    push_output_block(
-        OutputContentBlock::ToolUse {
-            id: "tool-1".to_string(),
-            name: "read_file".to_string(),
-            input: json!({}),
-        },
-        &mut out,
-        &mut events,
-        &mut pending_tool,
-        true,
-        &mut block_has_thinking_summary,
-    )
-    .expect("tool block should accumulate");
-
-    assert!(events.is_empty());
-    assert_eq!(
-        pending_tool,
-        Some(("tool-1".to_string(), "read_file".to_string(), String::new(),))
-    );
-}
-
-#[test]
-fn response_to_events_preserves_empty_object_json_input_outside_streaming() {
-    let mut out = Vec::new();
-    let events = response_to_events(
-        MessageResponse {
-            id: "msg-1".to_string(),
-            kind: "message".to_string(),
-            model: "anthropic/claude-opus-4-6".to_string(),
-            role: "assistant".to_string(),
-            content: vec![OutputContentBlock::ToolUse {
-                id: "tool-1".to_string(),
-                name: "read_file".to_string(),
-                input: json!({}),
-            }],
-            stop_reason: Some("tool_use".to_string()),
-            stop_sequence: None,
-            usage: Usage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            },
-            request_id: None,
-        },
-        &mut out,
-    )
-    .expect("response conversion should succeed");
-
-    assert!(matches!(
-        &events[0],
-        AssistantEvent::ToolUse { name, input, .. }
-            if name == "read_file" && input == "{}"
-    ));
-}
-
-#[test]
-fn response_to_events_preserves_non_empty_json_input_outside_streaming() {
-    let mut out = Vec::new();
-    let events = response_to_events(
-        MessageResponse {
-            id: "msg-2".to_string(),
-            kind: "message".to_string(),
-            model: "anthropic/claude-opus-4-6".to_string(),
-            role: "assistant".to_string(),
-            content: vec![OutputContentBlock::ToolUse {
-                id: "tool-2".to_string(),
-                name: "read_file".to_string(),
-                input: json!({ "path": "rust/Cargo.toml" }),
-            }],
-            stop_reason: Some("tool_use".to_string()),
-            stop_sequence: None,
-            usage: Usage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            },
-            request_id: None,
-        },
-        &mut out,
-    )
-    .expect("response conversion should succeed");
-
-    assert!(matches!(
-        &events[0],
-        AssistantEvent::ToolUse { name, input, .. }
-            if name == "read_file" && input == "{\"path\":\"rust/Cargo.toml\"}"
-    ));
-}
-
-#[test]
-fn response_to_events_renders_collapsed_thinking_summary() {
-    let mut out = Vec::new();
-    let events = response_to_events(
-        MessageResponse {
-            id: "msg-3".to_string(),
-            kind: "message".to_string(),
-            model: "anthropic/claude-opus-4-6".to_string(),
-            role: "assistant".to_string(),
-            content: vec![
-                OutputContentBlock::Thinking {
-                    thinking: "step 1".to_string(),
-                    signature: Some("sig_123".to_string()),
-                },
-                OutputContentBlock::Text {
-                    text: "Final answer".to_string(),
-                },
-            ],
-            stop_reason: Some("end_turn".to_string()),
-            stop_sequence: None,
-            usage: Usage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            },
-            request_id: None,
-        },
-        &mut out,
-    )
-    .expect("response conversion should succeed");
-
-    assert!(matches!(
-        &events[0],
-        AssistantEvent::Thinking {
-            thinking,
-            signature
-        } if thinking == "step 1" && signature.as_deref() == Some("sig_123")
-    ));
-    assert!(matches!(
-        &events[1],
-        AssistantEvent::TextDelta(text) if text == "Final answer"
-    ));
-    let rendered = String::from_utf8(out).expect("utf8");
-    assert!(rendered.contains("(thinking: 6 chars hidden)"));
-    assert!(!rendered.contains("step 1"));
-}
-
-#[test]
 fn build_runtime_plugin_state_merges_plugin_hooks_into_runtime_features() {
     let config_home = temp_dir();
     let workspace = temp_dir();
@@ -6024,12 +5745,9 @@ fn build_runtime_runs_plugin_lifecycle_init_and_shutdown() {
         Session::new(),
         "runtime-plugin-lifecycle",
         DEFAULT_MODEL.to_string(),
-        vec!["test system prompt".to_string()],
-        true,
         false,
         None,
         PermissionMode::DangerFullAccess,
-        None,
         runtime_plugin_state,
     )
     .expect("runtime should build");

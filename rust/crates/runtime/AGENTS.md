@@ -2,13 +2,13 @@
 
 ## OVERVIEW
 
-Core crate of `claw`: session persistence, permissions, prompt assembly, MCP plumbing, tool-facing file ops, conversation loop. 50 flat modules in src/, ~330 pub symbols, ~170 re-exported flat from lib.rs.
+Core crate of `claw`: session persistence, permissions, prompt assembly, MCP plumbing, tool-facing file ops, turn guards (the turn loop itself is `claw-engine`). 50 flat modules in src/, ~330 pub symbols, ~170 re-exported flat from lib.rs.
 
 ## WHERE TO LOOK
 
 | Group | Files | Entry points |
 |---|---|---|
-| session/conversation | session.rs, session_control.rs, conversation.rs, compact.rs, trident.rs, summary_compression.rs, usage.rs | `Session` (L124), `SessionStore`, `ConversationRuntime` (L174), `ApiClient`/`ToolExecutor` traits (`can_run_in_parallel`/`execute_batch` for read-only batches) |
+| session/conversation | session.rs, session_control.rs, conversation.rs, compact.rs, trident.rs, summary_compression.rs, usage.rs | `Session` (L124), `SessionStore`, `ConversationRuntime` (L125: a session with its client and tools, `auto_compact`, `record_usage`), `ApiClient` (compaction summaries)/`ToolExecutor` traits; `turn_guards.rs` (repeat/failure/verify guards, cut-off prompts) and `text_tool_calls.rs`, used by `claw-engine` |
 | config | config.rs, config_validate.rs, bootstrap.rs | `ConfigLoader` (L412), `default_config_home`, `read_user_setting`/save helpers, type-export heaviest file; MCP server config enums live here |
 | MCP (6-file split) | mcp.rs, mcp_client.rs, mcp_stdio.rs, mcp_server.rs, mcp_tool_bridge.rs, mcp_lifecycle_hardened.rs | `McpServerManager` (L488 in mcp_stdio.rs), JSON-RPC spawn |
 | hooks/plugins | hooks.rs, plugin_lifecycle.rs | `HookRunner` (L155), abort signal, healthcheck, degraded mode |
@@ -21,7 +21,7 @@ Core crate of `claw`: session persistence, permissions, prompt assembly, MCP plu
 | turn input | turn_keys.rs | `TurnKeyWatcher` (Esc → abort signal, type-ahead, queued prompts, scroll keys), full-screen view (`turn_keys/screen.rs` session/relay/draw thread, `turn_keys/vt.rs` cell emulator), the inline block under the output (`turn_keys/live.rs`: stdout/stderr relayed through a pipe; animated activity row + input box + status line; activity API `begin_model_request`/`note_text`/`note_reasoning`/`begin_tool`/`end_tool`), `pause()` guard for prompts that read the keyboard mid-turn |
 | misc | json.rs, sse.rs, g004_conformance.rs, green_contract.rs, recovery_recipes.rs, report_schema.rs, trident.rs | Report v1 + redaction |
 
-Largest files by line count: config.rs (3894), mcp_stdio.rs (2969), lane_events.rs (2561), worker_boot.rs (2441), session.rs (1961), conversation.rs (1878).
+Largest files by line count: config.rs (3894), mcp_stdio.rs (2969), lane_events.rs (2561), worker_boot.rs (2441), session.rs (1961); conversation.rs is 576.
 
 ## CONVENTIONS
 

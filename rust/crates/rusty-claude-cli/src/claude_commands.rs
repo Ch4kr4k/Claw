@@ -16,11 +16,8 @@ use runtime::turn_keys::screen::{self, ScreenGuard};
 use runtime::{ContentBlock, MessageRole};
 
 use crate::render::TerminalRenderer;
-use crate::{
-    build_runtime, build_system_prompt, effective_auto_compaction_threshold, final_assistant_text,
-    report_repl_turn_error,
-};
-use crate::{CliPermissionPrompter, LiveCli};
+use crate::LiveCli;
+use crate::{build_system_prompt, effective_auto_compaction_threshold, report_repl_turn_error};
 
 type CommandResult = Result<bool, Box<dyn std::error::Error>>;
 
@@ -363,25 +360,7 @@ impl LiveCli {
         ) {
             return Ok(answer);
         }
-        if claw_engine::requested() {
-            return self.run_engine_side_prompt(prompt, false, None);
-        }
-        let session = self.runtime.session().clone().without_persistence();
-        let mut runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.effective_system_prompt(),
-            false,
-            false,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(prompt, Some(&mut permission_prompter));
-        runtime.shutdown_plugins()?;
-        Ok(final_assistant_text(&result?).trim().to_string())
+        self.run_engine_side_prompt(prompt, false, None)
     }
 
     fn print_side_answer(question: &str, answer: &str) -> io::Result<()> {

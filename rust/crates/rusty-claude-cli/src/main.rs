@@ -50,32 +50,29 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
+use std::thread::{self};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::debug;
 
 use api::{
     detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    AuthSource, ImageSource, InputContentBlock, InputMessage, MessageRequest, OutputContentBlock,
+    PromptCache, ProviderClient as ApiProviderClient, ProviderKind, ToolDefinition,
     ToolResultContentBlock,
 };
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
     handle_mcp_slash_command, handle_mcp_slash_command_json, handle_plugins_slash_command,
-    handle_skills_slash_command, handle_skills_slash_command_json, render_slash_command_help,
+    handle_skills_slash_command, handle_skills_slash_command_json,
     render_slash_command_help_filtered, resolve_skill_invocation, resume_supported_slash_commands,
-    slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
-    SlashCommand,
+    slash_command_specs, PluginsCommandResult, SkillSlashDispatch, SlashCommand,
 };
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
@@ -83,18 +80,18 @@ use render::{MarkdownStreamState, Spinner, StopThinkingOnWrite, TerminalRenderer
 use runtime::{
     check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
     load_system_prompt, load_system_prompt_with_context, pricing_for_model, resolve_expected_base,
-    resolve_sandbox_status, ApiClient, ApiRequest, AssistantEvent, BaseCommitState,
-    CompactionConfig, ConfigFileReport, ConfigLoader, ConfigSource, ContentBlock, ContextFile,
-    ConversationMessage, ConversationRuntime, McpConfigCollection, McpInvalidServerConfig,
-    McpServer, McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    resolve_sandbox_status, ApiClient, BaseCommitState, CompactionConfig, ConfigFileReport,
+    ConfigLoader, ConfigSource, ContentBlock, ContextFile, ConversationMessage,
+    ConversationRuntime, McpConfigCollection, McpInvalidServerConfig, McpServer, McpServerManager,
+    McpServerSpec, McpTool, MessageRole, PermissionMode, PermissionPolicy, ProjectContext,
+    ResolvedPermissionMode, RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
     canonical_allowed_tool_name, execute_tool, mvp_tool_specs, GlobalToolRegistry,
-    RuntimeToolDefinition, ToolSearchOutput,
+    RuntimeToolDefinition,
 };
 
 const DEFAULT_MODEL: &str = "anthropic/claude-opus-4-7";
@@ -334,20 +331,8 @@ const GIT_COMMIT_DATE: Option<&str> = option_env!("GIT_COMMIT_DATE");
 const GIT_COMMIT_TIMESTAMP: Option<&str> = option_env!("GIT_COMMIT_TIMESTAMP");
 const RUSTC_VERSION: Option<&str> = option_env!("RUSTC_VERSION");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-/// How long a hosted model may stay silent after a tool result before the
-/// request is dropped and sent again. 10s cut off large-context requests
-/// (the provider reads hundreds of thousands of tokens before the first
-/// byte) and queued free models, restarting their work and, on paid
-/// models, paying for the prompt twice.
-const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// A local server sends nothing until it has read the whole prompt: a full
-/// 32k context takes over five minutes at ~100 tokens/s on a small GPU, and
-/// 120s cut such requests off (ending the turn) before the first token.
-const LOCAL_POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(900);
 /// Error text for a reply stopped with Esc or Ctrl+C.
 const INTERRUPTED_BY_USER: &str = "reply stopped by user";
-/// How often an in-flight model request checks whether Esc was pressed.
-const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
@@ -1111,11 +1096,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
     apply_saved_provider_credentials();
-    // `Agent` sub-agents run on the engine too, unless the classic loop
-    // was asked for.
-    if claw_engine::requested() {
-        tools::set_subagent_runner(Some(claw_engine::subagent::runner()));
-    }
+    // `Agent` sub-agents run on the engine, with this session's provider
+    // setup (thinking budget, fallbacks).
+    tools::set_subagent_runner(Some(claw_engine::subagent::runner(Arc::new(
+        |model: &str, agent_id: &str| {
+            live_engine::engine_provider(model, agent_id).map_err(|error| error.to_string())
+        },
+    ))));
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -5641,16 +5628,6 @@ fn verify_on_stop_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// A tool call's input with small JSON mistakes repaired (see
-/// [`api::repair_json`]), so the session keeps valid JSON and the call
-/// runs; unchanged when it is valid, or cut off and not repairable.
-fn repaired_tool_input(input: String) -> String {
-    if input.trim().is_empty() || serde_json::from_str::<serde_json::Value>(&input).is_ok() {
-        return input;
-    }
-    api::repair_json(&input).map_or(input, |value| value.to_string())
-}
-
 /// `text` without the tool calls a local model writes out as text
 /// (`<tool_call>…</tool_call>`, `<function=…>…</function>`), trimmed.
 fn without_tool_call_markup(text: &str) -> String {
@@ -7604,15 +7581,6 @@ impl BuiltRuntime {
         }
     }
 
-    fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing hook abort signal");
-        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
-        self
-    }
-
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -8016,69 +7984,6 @@ fn ignore_ctrl_c_in_repl() {
         });
 }
 
-struct HookAbortMonitor {
-    abort_signal: runtime::HookAbortSignal,
-    stop_tx: Option<Sender<()>>,
-    join_handle: Option<JoinHandle<()>>,
-}
-
-impl HookAbortMonitor {
-    fn spawn(abort_signal: runtime::HookAbortSignal) -> Self {
-        Self::spawn_with_waiter(abort_signal, move |stop_rx, abort_signal| {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-
-            runtime.block_on(async move {
-                let wait_for_stop = tokio::task::spawn_blocking(move || {
-                    let _ = stop_rx.recv();
-                });
-
-                tokio::select! {
-                    result = tokio::signal::ctrl_c() => {
-                        if result.is_ok() {
-                            abort_signal.abort();
-                        }
-                    }
-                    _ = wait_for_stop => {}
-                }
-            });
-        })
-    }
-
-    fn spawn_with_waiter<F>(abort_signal: runtime::HookAbortSignal, wait_for_interrupt: F) -> Self
-    where
-        F: FnOnce(Receiver<()>, runtime::HookAbortSignal) + Send + 'static,
-    {
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let thread_signal = abort_signal.clone();
-        let join_handle = thread::spawn(move || wait_for_interrupt(stop_rx, thread_signal));
-
-        Self {
-            abort_signal,
-            stop_tx: Some(stop_tx),
-            join_handle: Some(join_handle),
-        }
-    }
-
-    /// The signal Ctrl+C sets; also stops the streaming reply.
-    fn signal(&self) -> runtime::HookAbortSignal {
-        self.abort_signal.clone()
-    }
-
-    fn stop(mut self) {
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-        if let Some(join_handle) = self.join_handle.take() {
-            let _ = join_handle.join();
-        }
-    }
-}
-
 impl LiveCli {
     fn new(
         model: String,
@@ -8098,12 +8003,9 @@ impl LiveCli {
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
             model.clone(),
-            system_prompt.clone(),
-            enable_tools,
             true,
             allowed_tools.clone(),
             permission_mode,
-            None,
         )?;
         let cli = Self {
             model,
@@ -8133,10 +8035,7 @@ impl LiveCli {
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
-        self.reasoning_effort.clone_from(&effort);
-        if let Some(rt) = self.runtime.runtime.as_mut() {
-            rt.api_client_mut().set_reasoning_effort(effort);
-        }
+        self.reasoning_effort = effort;
     }
 
     fn startup_banner(&self) -> String {
@@ -12124,47 +12023,38 @@ fn build_runtime(
     session: Session,
     session_id: &str,
     model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state()?;
     build_runtime_with_plugin_state(
         session,
         session_id,
         model,
-        system_prompt,
-        enable_tools,
         emit_output,
         allowed_tools,
         permission_mode,
-        progress_reporter,
         runtime_plugin_state,
     )
 }
 
+/// The session's runtime: its client (compaction summaries), its tool
+/// executor and registry (with MCP), and its permission policy.
 #[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
     mut session: Session,
     session_id: &str,
     model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
         session.model = Some(model.clone());
     }
-    let system_prompt = with_plan_mode_section(system_prompt, permission_mode);
     let RuntimePluginState {
         feature_config,
         tool_registry,
@@ -12172,71 +12062,22 @@ fn build_runtime_with_plugin_state(
         mcp_state,
     } = runtime_plugin_state;
     plugin_registry.initialize()?;
-    let model_for_threshold = model.clone();
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let mut runtime = ConversationRuntime::new_with_features(
+    let executor =
+        CliToolExecutor::new(allowed_tools, emit_output, tool_registry, mcp_state.clone())
+            .with_model(&model);
+    let threshold = window_auto_compaction_threshold(&model);
+    let mut runtime = ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(
-            session_id,
-            model,
-            enable_tools,
-            emit_output,
-            allowed_tools.clone(),
-            tool_registry.clone(),
-            progress_reporter,
-        )?,
-        CliToolExecutor::new(
-            allowed_tools.clone(),
-            emit_output,
-            tool_registry.clone(),
-            mcp_state.clone(),
-        )
-        .with_model(&model_for_threshold),
+        AnthropicRuntimeClient::new(session_id, model, emit_output)?,
+        executor,
         policy,
-        system_prompt,
-        &feature_config,
     );
-    if let Some(threshold) = window_auto_compaction_threshold(&model_for_threshold) {
+    if let Some(threshold) = threshold {
         runtime = runtime.with_auto_compaction_input_tokens_threshold(threshold);
     }
-    if emit_output {
-        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
-    }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
-}
-
-struct CliHookProgressReporter;
-
-impl runtime::HookProgressReporter for CliHookProgressReporter {
-    fn on_event(&mut self, event: &runtime::HookProgressEvent) {
-        match event {
-            runtime::HookProgressEvent::Started {
-                event,
-                tool_name,
-                command,
-            } => eprintln!(
-                "[hook {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-            runtime::HookProgressEvent::Completed {
-                event,
-                tool_name,
-                command,
-            } => eprintln!(
-                "[hook done {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-            runtime::HookProgressEvent::Cancelled {
-                event,
-                tool_name,
-                command,
-            } => eprintln!(
-                "[hook cancelled {event_name}] {tool_name}: {command}",
-                event_name = event.as_str()
-            ),
-        }
-    }
 }
 
 /// Approvals given with "always (this session)": `tool:key`, where the key is
@@ -12359,32 +12200,6 @@ fn approval_request(
         subject,
         note: request.reason.clone(),
         session_scope: session_scope.to_string(),
-    }
-}
-
-/// What a reply cut off with Ctrl+Enter is kept as, so the model sees why
-/// it ended and that the message after it came in while it was writing.
-const SENT_NOW_REPLY: &str = "[My reply was cut off here: the user sent the next message \
-     while I was writing it.]";
-
-/// Resolves once Ctrl+Enter asked to send the queued messages now; never
-/// when `watch` is false (a reply that is not shown cannot be steered).
-async fn wait_for_send_now(watch: bool) {
-    if !watch {
-        return std::future::pending().await;
-    }
-    while !runtime::turn_keys::send_now_requested() {
-        tokio::time::sleep(ABORT_POLL_INTERVAL).await;
-    }
-}
-
-/// Resolves once `abort_signal` is set; never resolves when there is none.
-async fn wait_for_abort(abort_signal: Option<runtime::HookAbortSignal>) {
-    let Some(abort_signal) = abort_signal else {
-        return std::future::pending().await;
-    };
-    while !abort_signal.is_aborted() {
-        tokio::time::sleep(ABORT_POLL_INTERVAL).await;
     }
 }
 
@@ -12556,10 +12371,6 @@ const NEVER_SENT_TOOLS: &[&str] = &["TestingPermission"];
 /// Models that refused an image in this process (the catalog did not say,
 /// or was wrong); later requests send them images as text.
 static NO_IMAGE_MODELS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-/// What `visionModel` said about each image (by a hash of its data), so an
-/// image that stays in the conversation is described once, not per request.
-static IMAGE_DESCRIPTIONS: Mutex<std::collections::BTreeMap<u64, String>> =
-    Mutex::new(std::collections::BTreeMap::new());
 
 /// Whether requests to `model` carry images: not when the catalog lists it
 /// as text only, or it refused one before. A screenshot sent to Nemotron 3
@@ -12573,121 +12384,6 @@ fn sends_images(model: &str) -> bool {
         return false;
     }
     api::hosted_accepts_images(model) != Some(false)
-}
-
-fn note_no_images(model: &str) {
-    if let Ok(mut models) = NO_IMAGE_MODELS.lock() {
-        models.insert(model.to_string());
-    }
-}
-
-/// An error saying the model or server takes no images (OpenRouter's 404,
-/// llama-server without a vision projector, OpenAI-style 400s).
-fn is_image_refusal(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    [
-        "support image input",
-        "image input is not supported",
-        "does not support image",
-        "images are not supported",
-        "image_url is not supported",
-        "mmproj",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-/// Replaces the images in `messages` with text for a model that takes none:
-/// what `visionModel` (a model that reads images, set in settings) says each
-/// shows, or a note that the image was left out.
-fn images_as_text(runtime: &tokio::runtime::Runtime, messages: &mut [InputMessage], model: &str) {
-    for message in messages.iter_mut() {
-        for block in &mut message.content {
-            let InputContentBlock::Image { source } = block else {
-                continue;
-            };
-            let text = describe_image(runtime, source).map_or_else(
-                || {
-                    format!(
-                        "[An image was attached here, but {model} takes no images, so it was \
-                         left out. Work from the text of the tool result; claw can describe \
-                         images when `visionModel` is set in settings to a model that reads them.]"
-                    )
-                },
-                |description| {
-                    format!(
-                        "[An image was attached here; {model} takes no images, so this is \
-                             a description of it by another model:]\n{description}"
-                    )
-                },
-            );
-            *block = InputContentBlock::Text { text };
-        }
-    }
-}
-
-/// What the `visionModel` setting's model says the image shows; `None`
-/// when no vision model is set or it fails.
-fn describe_image(runtime: &tokio::runtime::Runtime, source: &ImageSource) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.data.hash(&mut hasher);
-    let key = hasher.finish();
-    if let Some(known) = IMAGE_DESCRIPTIONS
-        .lock()
-        .ok()
-        .and_then(|known| known.get(&key).cloned())
-    {
-        return Some(known);
-    }
-    let vision_model = runtime::read_user_setting("visionModel")
-        .map(|model| resolve_model_alias_with_config(model.trim()))
-        .filter(|model| !model.is_empty())?;
-    runtime::model_server::ensure_for_model(&vision_model);
-    let client = ApiProviderClient::from_model_with_anthropic_auth(&vision_model, None).ok()?;
-    let request = MessageRequest {
-        model: vision_model.clone(),
-        max_tokens: max_tokens_for_model(&vision_model).min(2_000),
-        messages: vec![InputMessage {
-            role: "user".to_string(),
-            content: vec![
-                InputContentBlock::Text {
-                    text: "Describe this image for an assistant that cannot see it: what it \
-                           shows, any text in it word for word, and the layout (what is where). \
-                           Be concrete and complete; no preamble."
-                        .to_string(),
-                },
-                InputContentBlock::Image {
-                    source: source.clone(),
-                },
-            ],
-        }],
-        stream: false,
-        ..Default::default()
-    };
-    let response = runtime
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), client.send_message(&request)).await
-        })
-        .ok()?
-        .ok()?;
-    let text = response
-        .content
-        .into_iter()
-        .filter_map(|block| match block {
-            OutputContentBlock::Text { text } => Some(text),
-            _ => None,
-        })
-        .collect::<String>()
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        return None;
-    }
-    if let Ok(mut known) = IMAGE_DESCRIPTIONS.lock() {
-        known.insert(key, text.clone());
-    }
-    Some(text)
 }
 
 /// Reply budgets lowered to what the account can pay for (OpenRouter's 402
@@ -12706,60 +12402,18 @@ fn reply_budget(model: &str) -> u32 {
         .map_or(budget, |affordable| budget.min(affordable))
 }
 
-/// Records the reply budget a 402 says the account can afford, so the
-/// request can be sent again within it. A 64k budget on an OpenRouter key
-/// with little credit failed outright, and the turn went to the fallback
-/// model for ten minutes. `false` when `error` is not such a 402 or the
-/// amount is too small to be worth a reply.
-fn note_affordable_reply_budget(model: &str, error: &str) -> bool {
-    const MIN_USEFUL: u32 = 2_048;
-    let Some((_, rest)) = error.split_once("can only afford") else {
-        return false;
-    };
-    let digits = rest
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    let Ok(affordable) = digits.parse::<u32>() else {
-        return false;
-    };
-    // A little under, as the price of the prompt moves with every step.
-    let affordable = affordable.saturating_mul(9) / 10;
-    if affordable < MIN_USEFUL || affordable >= reply_budget(model) {
-        return false;
-    }
-    AFFORDABLE_REPLY_BUDGETS
-        .lock()
-        .map(|mut budgets| {
-            budgets.insert(model.to_string(), affordable);
-        })
-        .is_ok()
-}
-
-/// Thinking controls for a request to a local model (llama-server).
-///
-/// Every request carries `thinking_budget_tokens`: llama-server's reasoning
-/// budget sampler then closes the thinking block itself once the budget is
-/// spent, so the reply always has room left for the answer or tool call.
-/// Without it Qwen thought up to the whole reply limit (a quarter of the
-/// window), the reply was cut off, and the next step reasoned it all out
-/// again. `CLAW_THINKING_BUDGET` sets the budget in tokens (`-1` sends none);
-/// the default is half the reply budget.
-///
-/// The request after a cut-off still goes with thinking off (the chat
-/// template's `enable_thinking`), for servers without the budget sampler:
-/// asked to think only briefly, Qwen still thought up to the 8k reply limit
-/// again, four times in one run, and the turn ended with nothing done.
-fn local_thinking_controls(
+/// A local server's thinking controls: a thinking budget (half the reply
+/// budget, `CLAW_THINKING_BUDGET` to change), and thinking off for a request
+/// that follows a reply cut off mid-thought.
+fn local_thinking_extra_body(
     model: &str,
-    request: &ApiRequest,
+    follows_thinking_cut_off: bool,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut extra_body = std::collections::BTreeMap::new();
     if !model.starts_with("local/") {
         return extra_body;
     }
-    if request.follows_thinking_cut_off() {
+    if follows_thinking_cut_off {
         extra_body.insert(
             "chat_template_kwargs".to_string(),
             serde_json::json!({ "enable_thinking": false }),
@@ -12884,6 +12538,158 @@ struct FallbackSwitch {
 }
 
 static FALLBACK: Mutex<Option<FallbackSwitch>> = Mutex::new(None);
+
+fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
+    if error.is_context_window_failure() {
+        format_context_window_blocked_error(session_id, error)
+    } else if error.is_generic_fatal_wrapper() {
+        let mut qualifiers = vec![format!("session {session_id}")];
+        if let Some(request_id) = error.request_id() {
+            qualifiers.push(format!("trace {request_id}"));
+        }
+        format!(
+            "{} ({}): {}",
+            error.safe_failure_class(),
+            qualifiers.join(", "),
+            error
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
+    let mut lines = vec![
+        "Context window blocked".to_string(),
+        "  Failure class    context_window_blocked".to_string(),
+        format!("  Session          {session_id}"),
+    ];
+
+    if let Some(request_id) = error.request_id() {
+        lines.push(format!("  Trace            {request_id}"));
+    }
+
+    match error {
+        api::ApiError::ContextWindowExceeded {
+            model,
+            estimated_input_tokens,
+            requested_output_tokens,
+            estimated_total_tokens,
+            context_window_tokens,
+        } => {
+            lines.push(format!("  Model            {model}"));
+            lines.push(format!(
+                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!(
+                "  Requested output {requested_output_tokens} tokens"
+            ));
+            lines.push(format!(
+                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
+            ));
+            lines.push(format!("  Context window   {context_window_tokens} tokens"));
+        }
+        api::ApiError::Api { message, body, .. } => {
+            let detail = message.as_deref().unwrap_or(body).trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        api::ApiError::RetriesExhausted { last_error, .. } => {
+            let detail = match last_error.as_ref() {
+                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
+                other => return format_context_window_blocked_error(session_id, other),
+            }
+            .trim();
+            if !detail.is_empty() {
+                lines.push(format!(
+                    "  Detail           {}",
+                    truncate_for_summary(detail, 120)
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    lines.push(String::new());
+    lines.push("Recovery".to_string());
+    lines.push("  Compact          /compact".to_string());
+    lines.push(format!(
+        "  Resume compact   claw --resume {session_id} /compact"
+    ));
+    lines.push("  Fresh session    /clear --confirm".to_string());
+    lines.push(
+        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
+            .to_string(),
+    );
+    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
+
+    lines.join("\n")
+}
+
+/// Extract the server-reported context window size from an error message.
+/// Returns `None` if no window size can be parsed.  The server must
+/// mention something like "context size (81920 tokens)" or "available
+/// context size (81920 tokens)" — the number inside parens after the
+/// parenthesised phrase is taken as the window.
+///
+/// Known formats:
+///   - "exceeds the available context size (81920 tokens)"
+///   - "context size (128000 tokens)"
+///   - "maximum context length is 200000 tokens"
+fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
+    // Pattern: "(NNNNNN tokens)" appearing after context-size markers
+    for line in error_str.lines() {
+        let lowered = line.to_ascii_lowercase();
+        let marker = ["context size", "context length", "context window"]
+            .iter()
+            .filter_map(|marker| lowered.find(marker))
+            .min();
+        if let Some(marker) = marker {
+            // Try parenthesised form: (81920 tokens). Only after the marker:
+            // llama.cpp puts the request's size first, "request (40010
+            // tokens) exceeds the available context size (16384 tokens)".
+            if let Some(start) = lowered[marker..].find('(').map(|i| marker + i) {
+                if let Some(end) = lowered[start..].find(')').map(|i| start + i) {
+                    if start < end {
+                        let inner = &line[start + 1..end];
+                        let digits: String =
+                            inner.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if let Ok(n) = digits.parse::<u32>() {
+                            if n > 1000 {
+                                return Some(n);
+                            }
+                        }
+                    }
+                }
+            }
+            // Try "maximum context length is NNNNNN tokens"
+            if let Some(pos) = lowered[marker..].find("is ").map(|i| marker + i) {
+                let rest = &line[pos + 3..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    if n > 1000 {
+                        return Some(n);
+                    }
+                }
+            }
+            // Try "configured limit of NNNNNN tokens"
+            if let Some(pos) = lowered[marker..].find("of ").map(|i| marker + i) {
+                let rest = &line[pos + 3..];
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    if n > 1000 {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 /// The fallback models for `model`: `providerFallbacks.fallbacks` in
 /// settings, aliases resolved, without `model` itself.
@@ -13020,17 +12826,6 @@ fn is_fallback_worthy(error: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// A reply with nothing in it: no text, no thinking, no tool call, and not
-/// cut off at the output limit (that one is continued instead).
-fn is_empty_reply(events: &[AssistantEvent]) -> bool {
-    !events.iter().any(|event| match event {
-        AssistantEvent::TextDelta(text) => !text.trim().is_empty(),
-        AssistantEvent::Thinking { thinking, .. } => !thinking.trim().is_empty(),
-        AssistantEvent::ToolUse { .. } | AssistantEvent::OutputLimitReached => true,
-        _ => false,
-    })
-}
-
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     Ok(resolve_cli_auth_source_for_cwd()?)
 }
@@ -13038,47 +12833,6 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 #[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
-}
-
-/// Returns `true` when the conversation ends with a tool-result message,
-/// meaning the model is expected to continue after tool execution.
-fn request_ends_with_tool_result(request: &ApiRequest) -> bool {
-    request
-        .messages
-        .last()
-        .is_some_and(|message| message.role == MessageRole::Tool)
-}
-
-/// Env var (and `overflowToolResultChars` in settings) that sets how long a
-/// tool result may stay when a request overflows the context window: a size
-/// like `64k`, or `off` to never cut.
-const OVERFLOW_TOOL_RESULT_CHARS_ENV: &str = "CLAW_OVERFLOW_TOOL_RESULT_CHARS";
-
-/// Smallest cut: below this a result says too little to be useful.
-const MIN_OVERFLOW_TOOL_RESULT_CHARS: usize = 2_000;
-
-/// How long a tool result may stay after a request overflowed the context
-/// window, in characters; `None` leaves results whole. About a quarter of
-/// the window (a token is roughly 4 characters), so the limit grows with
-/// the model and a large-context model is cut only when a result alone is
-/// enormous. The window is the one the server reported, else the model's
-/// known window ([`known_context_window`]), else the size of the request that overflowed (the window
-/// is at most that, and it shrinks round by round). The user's setting
-/// overrides all of it.
-fn overflow_tool_result_limit(
-    overflow_error: &str,
-    model: &str,
-    session: &runtime::Session,
-) -> Option<usize> {
-    let configured = std::env::var(OVERFLOW_TOOL_RESULT_CHARS_ENV)
-        .ok()
-        .or_else(|| runtime::read_user_setting("overflowToolResultChars"));
-    overflow_tool_result_limit_from(
-        configured.as_deref(),
-        extract_context_window_tokens_from_error(overflow_error)
-            .or_else(|| known_context_window(model)),
-        runtime::estimate_session_tokens(session),
-    )
 }
 
 /// The model's context window in tokens: for a `local/` model, what the
@@ -13093,178 +12847,6 @@ fn known_context_window(model: &str) -> Option<u32> {
             .map(|limit| limit.context_window_tokens)
             .or_else(|| api::hosted_context_window(model))
     }
-}
-
-fn overflow_tool_result_limit_from(
-    configured: Option<&str>,
-    window_tokens: Option<u32>,
-    overflowed_tokens: usize,
-) -> Option<usize> {
-    if let Some(value) = configured.map(str::trim).filter(|value| !value.is_empty()) {
-        if matches!(
-            value.to_ascii_lowercase().as_str(),
-            "off" | "none" | "0" | "false"
-        ) {
-            return None;
-        }
-        if let Some(chars) = claude_commands::parse_token_count(value) {
-            return Some(chars as usize);
-        }
-    }
-    let window = window_tokens.map_or(overflowed_tokens, |window| window as usize);
-    Some(window.max(MIN_OVERFLOW_TOOL_RESULT_CHARS))
-}
-
-/// Extract the server-reported context window size from an error message.
-/// Returns `None` if no window size can be parsed.  The server must
-/// mention something like "context size (81920 tokens)" or "available
-/// context size (81920 tokens)" — the number inside parens after the
-/// parenthesised phrase is taken as the window.
-///
-/// Known formats:
-///   - "exceeds the available context size (81920 tokens)"
-///   - "context size (128000 tokens)"
-///   - "maximum context length is 200000 tokens"
-fn extract_context_window_tokens_from_error(error_str: &str) -> Option<u32> {
-    // Pattern: "(NNNNNN tokens)" appearing after context-size markers
-    for line in error_str.lines() {
-        let lowered = line.to_ascii_lowercase();
-        let marker = ["context size", "context length", "context window"]
-            .iter()
-            .filter_map(|marker| lowered.find(marker))
-            .min();
-        if let Some(marker) = marker {
-            // Try parenthesised form: (81920 tokens). Only after the marker:
-            // llama.cpp puts the request's size first, "request (40010
-            // tokens) exceeds the available context size (16384 tokens)".
-            if let Some(start) = lowered[marker..].find('(').map(|i| marker + i) {
-                if let Some(end) = lowered[start..].find(')').map(|i| start + i) {
-                    if start < end {
-                        let inner = &line[start + 1..end];
-                        let digits: String =
-                            inner.chars().take_while(|c| c.is_ascii_digit()).collect();
-                        if let Ok(n) = digits.parse::<u32>() {
-                            if n > 1000 {
-                                return Some(n);
-                            }
-                        }
-                    }
-                }
-            }
-            // Try "maximum context length is NNNNNN tokens"
-            if let Some(pos) = lowered[marker..].find("is ").map(|i| marker + i) {
-                let rest = &line[pos + 3..];
-                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = digits.parse::<u32>() {
-                    if n > 1000 {
-                        return Some(n);
-                    }
-                }
-            }
-            // Try "configured limit of NNNNNN tokens"
-            if let Some(pos) = lowered[marker..].find("of ").map(|i| marker + i) {
-                let rest = &line[pos + 3..];
-                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(n) = digits.parse::<u32>() {
-                    if n > 1000 {
-                        return Some(n);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> String {
-    if error.is_context_window_failure() {
-        format_context_window_blocked_error(session_id, error)
-    } else if error.is_generic_fatal_wrapper() {
-        let mut qualifiers = vec![format!("session {session_id}")];
-        if let Some(request_id) = error.request_id() {
-            qualifiers.push(format!("trace {request_id}"));
-        }
-        format!(
-            "{} ({}): {}",
-            error.safe_failure_class(),
-            qualifiers.join(", "),
-            error
-        )
-    } else {
-        error.to_string()
-    }
-}
-
-fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) -> String {
-    let mut lines = vec![
-        "Context window blocked".to_string(),
-        "  Failure class    context_window_blocked".to_string(),
-        format!("  Session          {session_id}"),
-    ];
-
-    if let Some(request_id) = error.request_id() {
-        lines.push(format!("  Trace            {request_id}"));
-    }
-
-    match error {
-        api::ApiError::ContextWindowExceeded {
-            model,
-            estimated_input_tokens,
-            requested_output_tokens,
-            estimated_total_tokens,
-            context_window_tokens,
-        } => {
-            lines.push(format!("  Model            {model}"));
-            lines.push(format!(
-                "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
-            ));
-            lines.push(format!(
-                "  Requested output {requested_output_tokens} tokens"
-            ));
-            lines.push(format!(
-                "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
-            ));
-            lines.push(format!("  Context window   {context_window_tokens} tokens"));
-        }
-        api::ApiError::Api { message, body, .. } => {
-            let detail = message.as_deref().unwrap_or(body).trim();
-            if !detail.is_empty() {
-                lines.push(format!(
-                    "  Detail           {}",
-                    truncate_for_summary(detail, 120)
-                ));
-            }
-        }
-        api::ApiError::RetriesExhausted { last_error, .. } => {
-            let detail = match last_error.as_ref() {
-                api::ApiError::Api { message, body, .. } => message.as_deref().unwrap_or(body),
-                other => return format_context_window_blocked_error(session_id, other),
-            }
-            .trim();
-            if !detail.is_empty() {
-                lines.push(format!(
-                    "  Detail           {}",
-                    truncate_for_summary(detail, 120)
-                ));
-            }
-        }
-        _ => {}
-    }
-
-    lines.push(String::new());
-    lines.push("Recovery".to_string());
-    lines.push("  Compact          /compact".to_string());
-    lines.push(format!(
-        "  Resume compact   claw --resume {session_id} /compact"
-    ));
-    lines.push("  Fresh session    /clear --confirm".to_string());
-    lines.push(
-        "  Reduce scope     remove large pasted context/files or ask for a smaller slice"
-            .to_string(),
-    );
-    lines.push("  Retry            rerun after compacting or reducing the request".to_string());
-
-    lines.join("\n")
 }
 
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
@@ -14277,179 +13859,6 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     }
     preview
 }
-
-fn render_thinking_block_summary(
-    out: &mut (impl Write + ?Sized),
-    char_count: Option<usize>,
-    redacted: bool,
-) -> Result<(), RuntimeError> {
-    // While streaming the size is not known yet (0); the thinking animation
-    // already shows that the model is thinking, so print nothing.
-    if !redacted && char_count == Some(0) {
-        return Ok(());
-    }
-    let summary = if redacted {
-        "\n\x1b[2m(thinking hidden by provider)\x1b[0m\n".to_string()
-    } else if let Some(char_count) = char_count {
-        format!("\n\x1b[2m(thinking: {char_count} chars hidden)\x1b[0m\n")
-    } else {
-        "\n\x1b[2m(thinking hidden)\x1b[0m\n".to_string()
-    };
-    write!(out, "{summary}")
-        .and_then(|()| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
-/// A finished thinking block in full-screen mode: one dim line, which a
-/// click or Ctrl+O expands to the whole reasoning.
-fn render_thinking_fold(
-    out: &mut (impl Write + ?Sized),
-    thinking: &str,
-) -> Result<(), RuntimeError> {
-    let thinking = thinking.trim();
-    if thinking.is_empty() {
-        return Ok(());
-    }
-    let chars = thinking.chars().count();
-    let brief = format!("{TOOL_DIM_STYLE}∴ thinking: {chars} chars {EXPAND_HINT}{STYLE_RESET}");
-    let full = format!(
-        "{TOOL_DIM_STYLE}∴ thinking:{STYLE_RESET}\n{}",
-        thinking
-            .lines()
-            .map(|line| format!("{TOOL_DIM_STYLE}{RESULT_PREFIX}{line}{STYLE_RESET}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    writeln!(out)
-        .and_then(|()| write_folded(out, &brief, Some(&full)))
-        .map_err(|error| RuntimeError::new(error.to_string()))
-}
-
-fn push_output_block(
-    block: OutputContentBlock,
-    out: &mut (impl Write + ?Sized),
-    events: &mut Vec<AssistantEvent>,
-    pending_tool: &mut Option<(String, String, String)>,
-    streaming_tool_input: bool,
-    block_has_thinking_summary: &mut bool,
-) -> Result<(), RuntimeError> {
-    match block {
-        OutputContentBlock::Text { text } => {
-            if !text.is_empty() {
-                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
-                write!(out, "{rendered}")
-                    .and_then(|()| out.flush())
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                events.push(AssistantEvent::TextDelta(text));
-            }
-        }
-        OutputContentBlock::ToolUse { id, name, input } => {
-            // During streaming, the initial content_block_start has an empty input ({}).
-            // The real input arrives via input_json_delta events. In
-            // non-streaming responses, preserve a legitimate empty object.
-            let initial_input = if streaming_tool_input
-                && input.is_object()
-                && input.as_object().is_some_and(serde_json::Map::is_empty)
-            {
-                String::new()
-            } else {
-                input.to_string()
-            };
-            *pending_tool = Some((id, name, initial_input));
-        }
-        OutputContentBlock::Thinking {
-            thinking,
-            signature,
-        } => {
-            if runtime::turn_keys::screen::active() {
-                render_thinking_fold(out, &thinking)?;
-            } else {
-                render_thinking_block_summary(out, Some(thinking.chars().count()), false)?;
-            }
-            events.push(AssistantEvent::Thinking {
-                thinking,
-                signature,
-            });
-            *block_has_thinking_summary = true;
-        }
-        OutputContentBlock::RedactedThinking { .. } => {
-            render_thinking_block_summary(out, None, true)?;
-            *block_has_thinking_summary = true;
-        }
-    }
-    Ok(())
-}
-
-fn response_to_events(
-    response: MessageResponse,
-    out: &mut (impl Write + ?Sized),
-) -> Result<Vec<AssistantEvent>, RuntimeError> {
-    let mut events = Vec::new();
-    let mut pending_tool = None;
-
-    for block in response.content {
-        let mut block_has_thinking_summary = false;
-        push_output_block(
-            block,
-            out,
-            &mut events,
-            &mut pending_tool,
-            false,
-            &mut block_has_thinking_summary,
-        )?;
-        if let Some((id, name, input)) = pending_tool.take() {
-            let input = repaired_tool_input(input);
-            events.push(AssistantEvent::ToolUse { id, name, input });
-        }
-    }
-
-    if response
-        .stop_reason
-        .as_deref()
-        .is_some_and(runtime::is_output_limit_stop_reason)
-    {
-        events.push(AssistantEvent::OutputLimitReached);
-    }
-    events.push(AssistantEvent::Usage(response.usage.token_usage()));
-    events.push(AssistantEvent::MessageStop);
-    Ok(events)
-}
-
-fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
-    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
-    // to the Anthropic variant and returns `None` for OpenAI-compat /
-    // xAI variants, which do not have a prompt cache. So this helper
-    // remains a no-op on non-Anthropic providers without any extra
-    // branching here.
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
-}
-
-fn prompt_cache_record_to_runtime_event(
-    record: api::PromptCacheRecord,
-) -> Option<PromptCacheEvent> {
-    let cache_break = record.cache_break?;
-    Some(PromptCacheEvent {
-        unexpected: cache_break.unexpected,
-        reason: cache_break.reason,
-        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
-        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
-        token_drop: cache_break.token_drop,
-    })
-}
-
-/// Built-in tools that only read (files, search, the web) and keep no
-/// mutable state, so several calls can run at the same time.
-const PARALLEL_SAFE_TOOLS: &[&str] = &[
-    "read_file",
-    "glob_search",
-    "grep_search",
-    "web_fetch",
-    "web_search",
-];
 
 impl CliToolExecutor {
     /// The tool a call means: models trained on other agents call claw's
@@ -15545,10 +14954,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod sandbox_report_tests {
-    use super::{format_sandbox_report, HookAbortMonitor};
-    use runtime::HookAbortSignal;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use super::format_sandbox_report;
 
     #[test]
     fn sandbox_report_renders_expected_fields() {
@@ -15557,45 +14963,6 @@ mod sandbox_report_tests {
         assert!(report.contains("Enabled"));
         assert!(report.contains("Filesystem mode"));
         assert!(report.contains("Fallback reason"));
-    }
-
-    #[test]
-    fn hook_abort_monitor_stops_without_aborting() {
-        let abort_signal = HookAbortSignal::new();
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let monitor = HookAbortMonitor::spawn_with_waiter(
-            abort_signal.clone(),
-            move |stop_rx, abort_signal| {
-                ready_tx.send(()).expect("ready signal");
-                let _ = stop_rx.recv();
-                assert!(!abort_signal.is_aborted());
-            },
-        );
-
-        ready_rx.recv().expect("waiter should be ready");
-        monitor.stop();
-
-        assert!(!abort_signal.is_aborted());
-    }
-
-    #[test]
-    fn hook_abort_monitor_propagates_interrupt() {
-        let abort_signal = HookAbortSignal::new();
-        let (done_tx, done_rx) = mpsc::channel();
-        let monitor = HookAbortMonitor::spawn_with_waiter(
-            abort_signal.clone(),
-            move |_stop_rx, abort_signal| {
-                abort_signal.abort();
-                done_tx.send(()).expect("done signal");
-            },
-        );
-
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("interrupt should complete");
-        monitor.stop();
-
-        assert!(abort_signal.is_aborted());
     }
 }
 

@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use runtime::{AssistantEvent, TokenUsage};
+use runtime::TokenUsage;
 
 const KEEP_STEPS: usize = 500;
 
@@ -66,20 +66,12 @@ pub(crate) fn mark_first_token() {
     }
 }
 
-/// The request finished with `events`.
-pub(crate) fn end_step(model: &str, events: &[AssistantEvent]) {
+/// The request finished, using `usage`.
+pub(crate) fn end_step(model: &str, usage: TokenUsage) {
     let mut state = state();
     let Some(started) = state.started.take() else {
         return;
     };
-    let usage = events
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            AssistantEvent::Usage(usage) => Some(*usage),
-            _ => None,
-        })
-        .unwrap_or_default();
     let step = Step {
         turn: state.turn,
         model: model.to_string(),

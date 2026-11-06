@@ -9,6 +9,11 @@
 //!   with the same result are handled in `conversation.rs`.)
 //! - **Verify before finishing**: a turn that edited code and is about to
 //!   end without having run anything since gets one reminder to check it.
+//! - **Repeated calls**: a call that keeps returning the same result is no
+//!   longer run, and a model that keeps sending it anyway ends the turn
+//!   ([`RepeatGuard`]).
+//! - **Cut-off replies**: the prompts that continue a reply cut off at the
+//!   output limit or mid-thought, and the note for a cut-off tool call.
 
 use std::collections::BTreeMap;
 
@@ -432,10 +437,191 @@ fn is_code_path(path: &str) -> bool {
     }
 }
 
+// ------------------------------------------------------------ repeated calls
+
+/// How many times in a row one call (same tool, same input) may return the
+/// same result in a turn before it is no longer run. Repeating a call that
+/// changed nothing is a loop; `cargo test` after an edit gives a new result
+/// and is never stopped.
+pub const REPEATED_CALL_LIMIT: u32 = 3;
+pub const REPEATED_CALL_NOTE: &str =
+    "Not run: you already made this exact call several times this \
+     turn and it returned the same result each time. Repeating it will not change anything. \
+     Use the result you have, try a different approach, or answer the user with what you \
+     found.";
+/// How many calls in a row may be ones the repeat guard already blocked
+/// before the turn is ended. The guard only refuses the call; a local model
+/// (cybertiel 35B-A3B) wrote "I'm stuck in a loop, let me run a fresh
+/// command" and then sent the same blocked `BashOutput` call again, 127
+/// times, for half an hour, until the user interrupted.
+pub const BLOCKED_REPEAT_STEPS_LIMIT: u32 = 3;
+
+/// Sent instead of [`REPEATED_CALL_NOTE`] once the model repeats a call that
+/// was already blocked: it names the call, so the model cannot miss which.
+#[must_use]
+pub fn blocked_again_note(tool_name: &str, input: &str) -> String {
+    let shown: String = input.chars().take(200).collect();
+    format!(
+        "Not run, again: `{tool_name}` with input {shown} is disabled for the rest of this turn. \
+         It was already blocked and it will be blocked every time. Do not send it again. Your \
+         next reply must be a different tool call, or your answer to the user with what you \
+         found and what is still unknown. If it refers to a background job or id, that job is \
+         gone: do not poll it."
+    )
+}
+
+/// What a model stuck on a blocked call is told when the turn is ended for
+/// it; kept in the session, so the next turn knows the loop was cut off.
+#[must_use]
+pub fn stopped_looping_note(tool_name: &str) -> String {
+    format!(
+        "(I stopped this turn: I kept repeating a `{tool_name}` call that was blocked as a \
+         repeat and could not change anything. Next time I will not make that call again.)"
+    )
+}
+
+/// Calls that keep returning the same result, within one turn.
+#[derive(Debug, Default)]
+pub struct RepeatGuard {
+    /// (tool, input) -> (hash of its last result, times in a row it was that).
+    calls: BTreeMap<(String, String), (u64, u32)>,
+    /// Calls already blocked once.
+    blocked: std::collections::BTreeSet<(String, String)>,
+    /// Blocked-again calls since a call last ran.
+    blocked_only: u32,
+    /// The tool of the last blocked-again call.
+    stuck_on: Option<String>,
+}
+
+impl RepeatGuard {
+    /// Why `tool` with `input` is not run, if it is not.
+    pub fn check(&mut self, tool: &str, input: &str) -> Option<String> {
+        let key = (tool.to_string(), input.to_string());
+        let repeated = self
+            .calls
+            .get(&key)
+            .is_some_and(|(_, times)| *times >= REPEATED_CALL_LIMIT);
+        if !repeated {
+            return None;
+        }
+        if self.blocked.insert(key) {
+            return Some(REPEATED_CALL_NOTE.to_string());
+        }
+        self.blocked_only += 1;
+        self.stuck_on = Some(tool.to_string());
+        Some(blocked_again_note(tool, input))
+    }
+
+    /// Records the result of a call that ran.
+    pub fn record(&mut self, tool: &str, input: &str, output: &str, is_error: bool) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        output.hash(&mut hasher);
+        is_error.hash(&mut hasher);
+        let result = hasher.finish();
+        self.blocked_only = 0;
+        let entry = self
+            .calls
+            .entry((tool.to_string(), input.to_string()))
+            .or_insert((result, 0));
+        if entry.0 == result {
+            entry.1 += 1;
+        } else {
+            *entry = (result, 1);
+        }
+    }
+
+    /// The tool the model keeps sending although it is blocked, once the
+    /// turn should end for it.
+    #[must_use]
+    pub fn stuck(&self) -> Option<&str> {
+        (self.blocked_only >= BLOCKED_REPEAT_STEPS_LIMIT)
+            .then_some(self.stuck_on.as_deref())
+            .flatten()
+    }
+}
+
+/// Sent instead of a `read_file` result the conversation already holds.
+pub const UNCHANGED_READ_NOTE: &str = "[Unchanged: your earlier read of these same lines is still \
+     in this conversation, above. Use it instead of reading again; to see other lines, pass a \
+     different offset and limit.]";
+/// Reads shorter than this are sent again as they are.
+pub const UNCHANGED_READ_MIN_CHARS: usize = 600;
+
+// ---------------------------------------------------------- cut-off replies
+
+/// How many times in a row one turn asks the model to go on after a reply
+/// was cut off at the output-token limit, before the turn ends anyway.
+pub const MAX_CUT_OFF_CONTINUATIONS: usize = 3;
+pub const CUT_OFF_CONTINUE_PROMPT: &str =
+    "<system-reminder>\nYour previous reply was cut off at the \
+     output-token limit. Continue exactly where it stopped, without repeating what you already \
+     wrote. Keep each reply and each tool call smaller.\n</system-reminder>";
+pub const CUT_OFF_TOOL_CALL_RESULT: &str = "This tool call was cut off: the reply reached the \
+     output-token limit before the tool input was complete, so it was not run. Send less in \
+     one call: for a large file, write the first part with write_file and add the rest in \
+     further edit_file calls.";
+/// Starts the prompt sent after a reply that ended while still thinking
+/// (cut off at the token limit, or stopped with nothing but thinking);
+/// clients can switch thinking off for that one request.
+pub const THINKING_CUT_OFF_PROMPT: &str =
+    "<system-reminder>\nYour previous reply ended while you were still thinking";
+
+/// How many characters of a cut-off reply's thinking are quoted back.
+pub const THINKING_TAIL_CHARS: usize = 1_500;
+
+/// The prompt after a reply that ended in its thinking, with no answer and
+/// no call; `tail` is the end of that thinking. After such a cut-off a bare
+/// "continue" made models start the same reasoning over (their thinking is
+/// not shown back to them), so they ran into the limit again.
+#[must_use]
+pub fn thinking_cut_off_prompt(tail: &str) -> String {
+    if is_repetition_dominated(tail) {
+        // Its tail is a loop: quoting it would restart it.
+        format!(
+            "{THINKING_CUT_OFF_PROMPT}, without an answer or a tool call: your thinking got \
+             stuck repeating the same passage. Do not think it over again. Act now: call the \
+             next tool or give the answer, with at most a sentence of thought first.\n\
+             </system-reminder>"
+        )
+    } else {
+        format!(
+            "{THINKING_CUT_OFF_PROMPT}, without an answer or a tool call: nothing was shown or \
+             done. Your thinking ended with:\n\n…{tail}\n\nDo not start that reasoning over. \
+             Decide now and act on it: call the next tool or give the answer, with only a short \
+             thought first.\n</system-reminder>"
+        )
+    }
+}
+
+/// Whether `text` (the last message of a request) follows a reply cut off
+/// mid-thought or a cut-off tool call: such a request is best sent with
+/// thinking off. Models asked to think briefly still thought up to the
+/// limit again; Qwen thought 36k characters before an edit, the edit was cut
+/// off, and the retry thought at length again.
+#[must_use]
+pub fn follows_thinking_cut_off(text: &str) -> bool {
+    text.starts_with(THINKING_CUT_OFF_PROMPT) || text.starts_with(CUT_OFF_TOOL_CALL_RESULT)
+}
+
+/// Whether a reply's text is a repetition loop: a cut-off reply on the
+/// usual threshold, a finished one only at runaway size.
+#[must_use]
+pub fn is_looped_reply(text: &str, cut_off: bool) -> bool {
+    if cut_off {
+        is_repetition_dominated(text)
+    } else {
+        is_runaway_repetition(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        is_repetition_dominated, is_runaway_repetition, CallVerdict, FailureGuard, VerifyGuard,
+        follows_thinking_cut_off, is_repetition_dominated, is_runaway_repetition,
+        thinking_cut_off_prompt, CallVerdict, FailureGuard, RepeatGuard, VerifyGuard,
+        BLOCKED_REPEAT_STEPS_LIMIT, CUT_OFF_CONTINUE_PROMPT, CUT_OFF_TOOL_CALL_RESULT,
+        REPEATED_CALL_LIMIT, REPEATED_CALL_NOTE,
     };
 
     #[test]
@@ -516,5 +702,47 @@ mod tests {
             .reminder()
             .is_some_and(|text| text.contains("src/lib.rs")));
         assert_eq!(guard.reminder(), None);
+    }
+
+    #[test]
+    fn repeat_guard_blocks_a_call_that_keeps_returning_the_same_result() {
+        let mut guard = RepeatGuard::default();
+        for _ in 0..REPEATED_CALL_LIMIT {
+            assert_eq!(guard.check("bash", "ls"), None);
+            guard.record("bash", "ls", "a b", false);
+        }
+        assert_eq!(
+            guard.check("bash", "ls").as_deref(),
+            Some(REPEATED_CALL_NOTE)
+        );
+        assert!(guard.stuck().is_none());
+        for _ in 0..BLOCKED_REPEAT_STEPS_LIMIT {
+            assert!(guard
+                .check("bash", "ls")
+                .unwrap()
+                .contains("Not run, again"));
+        }
+        assert_eq!(guard.stuck(), Some("bash"));
+        // A call that runs resets the count.
+        guard.record("read_file", "x", "y", false);
+        assert!(guard.stuck().is_none());
+    }
+
+    #[test]
+    fn a_changing_result_is_never_blocked() {
+        let mut guard = RepeatGuard::default();
+        for round in 0..10 {
+            assert_eq!(guard.check("bash", "cargo test"), None);
+            guard.record("bash", "cargo test", &format!("run {round}"), false);
+        }
+    }
+
+    #[test]
+    fn thinking_prompts_follow_a_cut_off() {
+        let prompt = thinking_cut_off_prompt("so the answer is");
+        assert!(follows_thinking_cut_off(&prompt));
+        assert!(prompt.contains("so the answer is"));
+        assert!(follows_thinking_cut_off(CUT_OFF_TOOL_CALL_RESULT));
+        assert!(!follows_thinking_cut_off(CUT_OFF_CONTINUE_PROMPT));
     }
 }

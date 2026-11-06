@@ -37,6 +37,42 @@ pub struct ClawModelProvider {
     entry: ModelEntry,
     /// `/effort`: sent as `reasoning_effort` (each backend maps it).
     reasoning_effort: Option<String>,
+    extra_body: Option<ExtraBody>,
+    fallbacks: Option<Fallbacks>,
+    observer: Option<RequestObserver>,
+    error_text: Option<ErrorText>,
+}
+
+/// How a provider error reads to the user (recovery steps, request ids);
+/// `ApiError`'s own text otherwise.
+pub type ErrorText = std::sync::Arc<dyn Fn(&ApiError) -> String + Send + Sync>;
+
+/// Sees each request as it is sent, with the client sending it (the CLI
+/// keeps the last one to answer `/btw` side questions from).
+pub type RequestObserver = std::sync::Arc<dyn Fn(&ProviderClient, &MessageRequest) + Send + Sync>;
+
+/// Extra request fields for a model (a local server's thinking budget);
+/// the flag says the request follows a reply cut off mid-thought, which is
+/// best sent with thinking off.
+pub type ExtraBody =
+    std::sync::Arc<dyn Fn(&str, bool) -> BTreeMap<String, serde_json::Value> + Send + Sync>;
+
+/// Another model, with its client.
+pub type FallbackModel = (String, ProviderClient);
+/// See [`Fallbacks::next`].
+pub type NextFallback =
+    std::sync::Arc<dyn Fn(&str, &[String]) -> Option<FallbackModel> + Send + Sync>;
+
+/// Where requests go when the model fails (claw's `providerFallbacks`).
+#[derive(Clone)]
+pub struct Fallbacks {
+    /// The fallback currently in use instead of the model, if any (a switch
+    /// lasts a while, then the model is tried again).
+    pub active: std::sync::Arc<dyn Fn() -> Option<FallbackModel> + Send + Sync>,
+    /// The next fallback after `error`, skipping the models in `failed`.
+    pub next: NextFallback,
+    /// Whether an error is worth switching for (rate limits, outages).
+    pub worthy: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 impl ClawModelProvider {
@@ -67,7 +103,43 @@ impl ClawModelProvider {
             client,
             entry,
             reasoning_effort: None,
+            extra_body: None,
+            fallbacks: None,
+            observer: None,
+            error_text: None,
         }
+    }
+
+    /// Words provider errors with `error_text`.
+    #[must_use]
+    pub fn with_error_text(mut self, error_text: ErrorText) -> Self {
+        self.error_text = Some(error_text);
+        self
+    }
+
+    fn completion_error(&self, error: &ApiError) -> CompletionError {
+        completion_error(error, self.error_text.as_ref())
+    }
+
+    /// Shows each request to `observer` as it is sent.
+    #[must_use]
+    pub fn with_request_observer(mut self, observer: RequestObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Adds `extra_body`'s fields to every request.
+    #[must_use]
+    pub fn with_extra_body(mut self, extra_body: ExtraBody) -> Self {
+        self.extra_body = Some(extra_body);
+        self
+    }
+
+    /// Sends requests to `fallbacks` when the model fails.
+    #[must_use]
+    pub fn with_fallbacks(mut self, fallbacks: Fallbacks) -> Self {
+        self.fallbacks = Some(fallbacks);
+        self
     }
 
     /// Sends `effort` (`low`, `medium`, `high`, …) with every request.
@@ -118,16 +190,113 @@ impl ModelProvider for ClawModelProvider {
                 || api::max_tokens_for_model(model_id),
                 |tokens| u32::try_from(tokens).unwrap_or(u32::MAX),
             );
+        let follows_cut_off = crate::reply::follows_thinking_cut_off(&request);
         let mut message_request = to_message_request(model_id, max_tokens, request);
         message_request
             .reasoning_effort
             .clone_from(&self.reasoning_effort);
-        let message_stream = self
-            .client
-            .stream_message(&message_request)
-            .await
-            .map_err(|error| to_completion_error(&error))?;
-        Ok(into_chunk_stream(message_stream))
+        let flags = crate::reply::REPLY_FLAGS
+            .try_with(std::sync::Arc::clone)
+            .ok();
+        let fallback = self
+            .fallbacks
+            .as_ref()
+            .and_then(|fallbacks| (fallbacks.active)());
+        if let Some(fallback) = fallback {
+            return self
+                .stream_through_fallbacks(fallback, message_request, follows_cut_off, flags)
+                .await;
+        }
+        let mut primary = message_request.clone();
+        self.add_extra_body(&mut primary, follows_cut_off);
+        if let Some(observer) = &self.observer {
+            observer(&self.client, &primary);
+        }
+        match self.client.stream_message(&primary).await {
+            Ok(message_stream) => Ok(into_chunk_stream(
+                message_stream,
+                flags,
+                self.error_text.clone(),
+            )),
+            Err(error) => {
+                let Some(fallbacks) = &self.fallbacks else {
+                    return Err(self.completion_error(&error));
+                };
+                let text = error.to_string();
+                match (fallbacks.worthy)(&text)
+                    .then(|| (fallbacks.next)(&text, &[]))
+                    .flatten()
+                {
+                    Some(fallback) => {
+                        self.stream_through_fallbacks(
+                            fallback,
+                            message_request,
+                            follows_cut_off,
+                            flags,
+                        )
+                        .await
+                    }
+                    None => Err(self.completion_error(&error)),
+                }
+            }
+        }
+    }
+}
+
+impl ClawModelProvider {
+    fn add_extra_body(&self, request: &mut MessageRequest, follows_cut_off: bool) {
+        if let Some(extra_body) = &self.extra_body {
+            request
+                .extra_body
+                .extend(extra_body(&request.model, follows_cut_off));
+        }
+    }
+
+    /// `request` on `fallback`; when that one fails the same way, on the
+    /// next fallback, until one answers or none is left.
+    async fn stream_through_fallbacks(
+        &self,
+        mut fallback: FallbackModel,
+        request: MessageRequest,
+        follows_cut_off: bool,
+        flags: Option<std::sync::Arc<crate::reply::ReplyFlags>>,
+    ) -> Result<ModelStream, CompletionError> {
+        let fallbacks = self
+            .fallbacks
+            .as_ref()
+            .expect("bug: fallback without a fallback chain");
+        let mut failed = Vec::new();
+        loop {
+            let (model, client) = fallback;
+            let mut attempt = request.clone();
+            attempt.model = api::resolve_model_alias(&model);
+            attempt.max_tokens = attempt
+                .max_tokens
+                .min(api::max_tokens_for_model(&attempt.model));
+            self.add_extra_body(&mut attempt, follows_cut_off);
+            if let Some(observer) = &self.observer {
+                observer(&client, &attempt);
+            }
+            let error = match client.stream_message(&attempt).await {
+                Ok(message_stream) => {
+                    return Ok(into_chunk_stream(
+                        message_stream,
+                        flags,
+                        self.error_text.clone(),
+                    ))
+                }
+                Err(error) => error,
+            };
+            let text = error.to_string();
+            failed.push(model.clone());
+            match (fallbacks.worthy)(&text)
+                .then(|| (fallbacks.next)(&format!("{model}: {text}"), &failed))
+                .flatten()
+            {
+                Some(next) => fallback = next,
+                None => return Err(self.completion_error(&error)),
+            }
+        }
     }
 }
 
@@ -170,6 +339,10 @@ pub struct ClawPrompt {
     pub max_completions: Option<usize>,
     /// Model calls made so far, shared with the engine.
     pub completions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The turn's guards: each reply is reported to them.
+    pub guards: Option<std::sync::Arc<crate::guards::TurnGuards>>,
+    /// Reply text replaced in later requests (see [`crate::reply`]).
+    pub rewrites: crate::reply::Rewrites,
 }
 
 /// See [`ClawPrompt::resolve_name`].
@@ -206,15 +379,25 @@ impl ModelProvider for ClawPrompt {
             .completions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
+        // A thread stuck sending a blocked call gets no more replies; the
+        // engine ends the turn with a note.
+        if let Some(tool) = self.guards.as_ref().and_then(|guards| guards.stuck()) {
+            return Err(CompletionError::provider(
+                ErrorClass::Fatal,
+                format!("stopped: the model kept repeating a blocked `{tool}` call"),
+            ));
+        }
         if let Some(max) = self.max_completions.filter(|max| made > *max) {
             return Err(CompletionError::provider(
                 ErrorClass::Fatal,
                 format!("stopped: the turn reached its limit of {max} model replies"),
             ));
         }
+        let thread = crate::reply::thread_of(request.preamble.as_deref());
         request.preamble = request
             .preamble
             .map(|preamble| strip_base_prompt(&preamble));
+        crate::reply::prepare_history(&mut request.chat_history, &self.rewrites);
         if let Some(tool_list) = &self.tool_list {
             let mut tools = tool_list();
             tools.extend(
@@ -228,69 +411,30 @@ impl ModelProvider for ClawPrompt {
         if !self.offer_tools {
             request.tools.clear();
         }
-        let inner = self.inner.invoke_model(model_id, request).await?;
-        Ok(pack_tool_calls(inner, self.resolve_name.clone()))
+        let flags = std::sync::Arc::new(crate::reply::ReplyFlags::default());
+        let retry = crate::reply::Retry {
+            provider: std::sync::Arc::clone(&self.inner),
+            model_id: model_id.to_string(),
+            request: request.clone(),
+        };
+        let inner = crate::reply::REPLY_FLAGS
+            .scope(
+                std::sync::Arc::clone(&flags),
+                self.inner.invoke_model(model_id, request),
+            )
+            .await?;
+        Ok(crate::reply::reply_stream(
+            inner,
+            crate::reply::ReplyContext {
+                thread,
+                resolve_name: self.resolve_name.clone(),
+                guards: self.guards.clone(),
+                rewrites: std::sync::Arc::clone(&self.rewrites),
+                flags,
+                retry: Some(retry),
+            },
+        ))
     }
-}
-
-/// `inner` with its tool calls packed into one, sent just before `Final`
-/// (or at the end of the stream).
-fn pack_tool_calls(inner: ModelStream, resolve_name: Option<NameResolver>) -> ModelStream {
-    use futures_util::StreamExt;
-    struct State {
-        inner: ModelStream,
-        calls: Vec<ToolCall>,
-        resolve_name: Option<NameResolver>,
-        pending: VecDeque<Result<StreamChunk, CompletionError>>,
-        done: bool,
-    }
-    let state = State {
-        inner,
-        calls: Vec::new(),
-        resolve_name,
-        pending: VecDeque::new(),
-        done: false,
-    };
-    Box::pin(stream::unfold(state, |mut state| async move {
-        loop {
-            if let Some(item) = state.pending.pop_front() {
-                return Some((item, state));
-            }
-            if state.done {
-                return None;
-            }
-            match state.inner.next().await {
-                Some(Ok(StreamChunk::ToolCall(mut call))) => {
-                    if let Some(resolve) = &state.resolve_name {
-                        call.function.name = resolve(&call.function.name);
-                    }
-                    state.calls.push(call);
-                }
-                Some(Ok(StreamChunk::Final(final_response))) => {
-                    let packed = batch::pack(std::mem::take(&mut state.calls));
-                    state
-                        .pending
-                        .extend(packed.map(|call| Ok(StreamChunk::ToolCall(call))));
-                    state
-                        .pending
-                        .push_back(Ok(StreamChunk::Final(final_response)));
-                }
-                // An error discards the reply; held calls go with it.
-                Some(Err(error)) => {
-                    state.calls.clear();
-                    state.pending.push_back(Err(error));
-                }
-                Some(Ok(chunk)) => state.pending.push_back(Ok(chunk)),
-                None => {
-                    state.done = true;
-                    let packed = batch::pack(std::mem::take(&mut state.calls));
-                    state
-                        .pending
-                        .extend(packed.map(|call| Ok(StreamChunk::ToolCall(call))));
-                }
-            }
-        }
-    }))
 }
 
 /// Infinity's request in claw's wire form. Batches of tool calls (see
@@ -485,8 +629,9 @@ pub fn error_class(error: &ApiError) -> ErrorClass {
     }
 }
 
-fn to_completion_error(error: &ApiError) -> CompletionError {
-    CompletionError::provider(error_class(error), error.to_string())
+fn completion_error(error: &ApiError, error_text: Option<&ErrorText>) -> CompletionError {
+    let text = error_text.map_or_else(|| error.to_string(), |words| words(error));
+    CompletionError::provider(error_class(error), text)
 }
 
 /// A content block being streamed.
@@ -511,9 +656,20 @@ pub struct ChunkFolder {
     blocks: BTreeMap<u32, OpenBlock>,
     usage: ClawUsage,
     finished: bool,
+    /// Where the reply's stop reason and malformed calls are noted.
+    flags: Option<std::sync::Arc<crate::reply::ReplyFlags>>,
 }
 
 impl ChunkFolder {
+    /// A folder that notes a cut-off and malformed calls in `flags`.
+    #[must_use]
+    pub fn with_flags(flags: Option<std::sync::Arc<crate::reply::ReplyFlags>>) -> Self {
+        Self {
+            flags,
+            ..Self::default()
+        }
+    }
+
     /// The chunks `event` produces.
     pub fn push(&mut self, event: StreamEvent) -> Vec<StreamChunk> {
         match event {
@@ -522,6 +678,18 @@ impl ChunkFolder {
                 Vec::new()
             }
             StreamEvent::MessageDelta(delta) => {
+                if let Some(flags) = &self.flags {
+                    if delta
+                        .delta
+                        .stop_reason
+                        .as_deref()
+                        .is_some_and(runtime::is_output_limit_stop_reason)
+                    {
+                        flags
+                            .cut_off
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 let usage = delta.usage;
                 // Providers report running totals here; keep the largest.
                 self.usage.input_tokens = self.usage.input_tokens.max(usage.input_tokens);
@@ -655,6 +823,17 @@ impl ChunkFolder {
                 json,
                 initial,
             }) => {
+                if let Some(flags) = &self.flags {
+                    if !json.trim().is_empty()
+                        && serde_json::from_str::<serde_json::Value>(&json).is_err()
+                    {
+                        flags
+                            .malformed_calls
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(id.clone());
+                    }
+                }
                 let arguments = parse_tool_input(&json, initial);
                 vec![StreamChunk::ToolCall(ToolCall::new(id, name, arguments))]
             }
@@ -704,16 +883,22 @@ fn to_usage(usage: &ClawUsage) -> Usage {
     }
 }
 
-fn into_chunk_stream(message_stream: MessageStream) -> ModelStream {
+fn into_chunk_stream(
+    message_stream: MessageStream,
+    flags: Option<std::sync::Arc<crate::reply::ReplyFlags>>,
+    error_text: Option<ErrorText>,
+) -> ModelStream {
     struct State {
         stream: MessageStream,
         folder: ChunkFolder,
+        error_text: Option<ErrorText>,
         pending: VecDeque<StreamChunk>,
         done: bool,
     }
     let state = State {
         stream: message_stream,
-        folder: ChunkFolder::default(),
+        folder: ChunkFolder::with_flags(flags),
+        error_text,
         pending: VecDeque::new(),
         done: false,
     };
@@ -733,7 +918,10 @@ fn into_chunk_stream(message_stream: MessageStream) -> ModelStream {
                 }
                 Err(error) => {
                     state.done = true;
-                    return Some((Err(to_completion_error(&error)), state));
+                    return Some((
+                        Err(completion_error(&error, state.error_text.as_ref())),
+                        state,
+                    ));
                 }
             }
         }

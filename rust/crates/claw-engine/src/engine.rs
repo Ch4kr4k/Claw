@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tools::GlobalToolRegistry;
 
+use crate::guards::{GuardConfig, TurnGuards};
 use crate::history;
 use crate::provider::{ClawModelProvider, ClawPrompt, NameResolver, ToolList};
 use crate::tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
@@ -87,6 +88,9 @@ pub struct EngineConfig {
     /// Model calls the turn may make, child threads included; past it the
     /// turn ends as interrupted (see [`ClawPrompt::max_completions`]).
     pub max_completions: Option<usize>,
+    /// What the turn's guards do beyond the always-on checks (see
+    /// [`crate::guards`]).
+    pub guards: GuardConfig,
 }
 
 impl EngineConfig {
@@ -114,6 +118,7 @@ impl EngineConfig {
             resolve_tool_name: None,
             offer_tools: true,
             max_completions: None,
+            guards: GuardConfig::default(),
         })
     }
 
@@ -142,6 +147,7 @@ impl EngineConfig {
             resolve_tool_name: None,
             offer_tools: true,
             max_completions: None,
+            guards: GuardConfig::default(),
         }
     }
 }
@@ -156,6 +162,9 @@ pub struct RunSummary {
     /// Model completions across all threads.
     pub completions: usize,
     pub usage: Usage,
+    /// What the root's last request sent plus its reply, in tokens: how full
+    /// the context is for the next request.
+    pub last_context_tokens: u64,
 }
 
 /// How the caller steers a running turn.
@@ -187,6 +196,9 @@ pub struct TurnOutcome {
     pub messages: Vec<ConversationMessage>,
     /// Whether the turn was stopped through [`TurnControl::abort`].
     pub interrupted: bool,
+    /// The tool the model kept calling although every call was blocked as
+    /// a repeat: the turn was ended for it (a note says so in `messages`).
+    pub stopped_looping: Option<String>,
 }
 
 /// Errors starting or running the engine.
@@ -302,6 +314,12 @@ impl Engine {
         if self.config.runtime_tools {
             host = host.with_runtime_tools();
         }
+        let guards = Arc::new(TurnGuards::new(self.config.guards));
+        host = host.with_guards(Arc::clone(&guards));
+        if let Some(abort) = &control.abort {
+            host = host.with_abort(abort.clone());
+        }
+        let rewrites = crate::reply::Rewrites::default();
         let host = Arc::new(host);
         let tools = ClawTool::all(&host, self.config.allowed_tools.as_ref());
         let completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -313,6 +331,8 @@ impl Engine {
                 offer_tools: self.config.offer_tools,
                 max_completions: self.config.max_completions,
                 completions: Arc::clone(&completions),
+                guards: Some(Arc::clone(&guards)),
+                rewrites: Arc::clone(&rewrites),
             }),
             &self.config.model,
         )
@@ -350,6 +370,7 @@ impl Engine {
         };
         let root_id = root.thread_id().to_owned();
         let root_name = root_id.as_str().to_string();
+        guards.begin(&root_name, history);
         // The conversation so far, before the thread's first slice loads it.
         let attachments = runtime::ConversationMessage {
             role: runtime::MessageRole::User,
@@ -375,6 +396,7 @@ impl Engine {
         let mut summary = RunSummary::default();
         let mut seen_live = false;
         let mut interrupted = false;
+        let mut stopped_looping = None;
         let mut root_text = String::new();
         // When every driver has exited, a message one of them sent last (a
         // child's report) may not have restarted its target yet: the run is
@@ -406,6 +428,20 @@ impl Engine {
                 Some(event) = events_rx.recv() => {
                     record(&event, &root_name, &mut root_text, &mut summary);
                     on_event(&event);
+                    // What the guards want a thread sent once its reply is
+                    // done: a continuation of a cut-off reply, a reminder.
+                    if let EngineEvent::Agent {
+                        thread,
+                        event: AgentEvent::CompletionFinished { .. },
+                        ..
+                    } = &event
+                    {
+                        for text in guards.take_followups(thread) {
+                            idle_deadline = None;
+                            let target = ThreadId::from(thread.clone());
+                            send_user_text(&sender, &target, text).await?;
+                        }
+                    }
                 }
                 () = sleep_until_or_never(idle_deadline) => {
                     if system.is_idle() {
@@ -416,6 +452,12 @@ impl Engine {
                 _ = poll.tick() => {
                     if control.abort.as_ref().is_some_and(HookAbortSignal::is_aborted) {
                         interrupted = true;
+                        break;
+                    }
+                    // A model that keeps sending a call already blocked as a
+                    // repeat is not going to stop by itself.
+                    if let Some(tool) = guards.stuck() {
+                        stopped_looping = Some(tool);
                         break;
                     }
                     if let Some(queued) = control.queued_prompts.as_mut() {
@@ -429,6 +471,9 @@ impl Engine {
         }
         // Interrupts running completions and flushes their partial turns.
         system.shutdown().await;
+        if stopped_looping.is_none() {
+            stopped_looping = guards.stuck();
+        }
         if self
             .config
             .max_completions
@@ -441,6 +486,13 @@ impl Engine {
             record(&event, &root_name, &mut root_text, &mut summary);
             on_event(&event);
         }
+        // Infinity reports one finished completion per slice, and a slice
+        // loops over inline tools: count the model calls themselves.
+        let requested = completions.load(std::sync::atomic::Ordering::Relaxed);
+        summary.completions = summary.completions.max(match self.config.max_completions {
+            Some(max) => requested.min(max),
+            None => requested,
+        });
         summary.threads = attached.len();
         let entries = store
             .load_history_up_to(&root_id, None, None)
@@ -448,6 +500,18 @@ impl Engine {
             .map_err(|error| EngineError::Store(error.to_string()))?;
         let added = entries.get(seeded..).unwrap_or_default();
         let mut messages = history::from_infinity(added);
+        crate::reply::rewrite_messages(&mut messages, &rewrites);
+        summary.final_text = crate::reply::rewrite_text(&summary.final_text, &rewrites);
+        if let Some(tool) = &stopped_looping {
+            eprintln!(
+                "\n\x1b[2m(stopped: the model kept repeating a blocked `{tool}` call)\x1b[0m"
+            );
+            messages.push(ConversationMessage::assistant(vec![
+                runtime::ContentBlock::Text {
+                    text: runtime::turn_guards::stopped_looping_note(tool),
+                },
+            ]));
+        }
         if let Some(last) = messages
             .iter_mut()
             .rev()
@@ -459,6 +523,7 @@ impl Engine {
             summary,
             messages,
             interrupted,
+            stopped_looping,
         })
     }
 }
@@ -516,6 +581,9 @@ fn record(event: &EngineEvent, root_id: &str, root_text: &mut String, summary: &
             }
             if is_root && !root_text.trim().is_empty() {
                 summary.final_text.clone_from(root_text);
+            }
+            if let (true, Some(usage)) = (is_root, usage) {
+                summary.last_context_tokens = usage.input_tokens + usage.output_tokens;
             }
         }
         _ => {}

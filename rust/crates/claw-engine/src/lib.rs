@@ -16,8 +16,10 @@
 
 pub mod batch;
 pub mod engine;
+pub mod guards;
 pub mod history;
 pub mod provider;
+pub mod reply;
 pub mod subagent;
 pub mod tools;
 
@@ -25,17 +27,11 @@ pub use engine::{
     Engine, EngineConfig, EngineError, EngineEvent, RunSummary, TurnControl, TurnOutcome,
     ENGINE_PROMPT,
 };
+pub use guards::{GuardConfig, ReplyReport, TurnGuards};
 pub use infinity_agent_core::system::AgentEvent;
 pub use infinity_provider_protocol::ToolDefinition;
-pub use provider::{ClawModelProvider, NameResolver, ToolList, THREAD_TOOLS};
+pub use provider::{
+    ClawModelProvider, ErrorText, ExtraBody, FallbackModel, Fallbacks, NameResolver, NextFallback,
+    RequestObserver, ToolList, THREAD_TOOLS,
+};
 pub use tools::{ClawTool, Executor, SharedPrompter, ToolActivity, ToolHost};
-
-/// Whether turns run on the Infinity engine: the default, unless
-/// `CLAW_ENGINE` is `legacy` or `classic` (the previous loop).
-#[must_use]
-pub fn requested() -> bool {
-    !std::env::var("CLAW_ENGINE").is_ok_and(|value| {
-        let value = value.trim();
-        value.eq_ignore_ascii_case("legacy") || value.eq_ignore_ascii_case("classic")
-    })
-}

@@ -10,18 +10,14 @@ use std::thread;
 use std::time::Duration;
 
 use super::{
-    agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-    classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-    extract_recovery_outcome, final_assistant_text, global_cron_registry, maybe_commit_provenance,
-    mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-    run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-    ProviderRuntimeClient, SubagentToolExecutor,
+    allowed_tools_for_subagent, build_agent_system_prompt, classify_lane_failure,
+    derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
+    global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+    persist_agent_terminal_state, run_subagent_tool, run_task_packet, AgentInput, AgentJob,
+    GlobalToolRegistry, LaneEventName, LaneFailureClass,
 };
-use api::OutputContentBlock;
-use runtime::ProviderFallbackConfig;
 use runtime::{
-    permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-    PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+    permission_enforcer::PermissionEnforcer, PermissionMode, PermissionPolicy, Session, TaskPacket,
 };
 use serde_json::json;
 
@@ -912,28 +908,15 @@ fn global_tool_registry_denies_blocked_tool_before_dispatch() {
 }
 
 #[test]
-fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
-    // given
-    let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-    let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
-        .with_enforcer(PermissionEnforcer::new(policy));
-
-    // when
-    let error = executor
-        .execute(
-            "write_file",
-            &json!({
-                "path": "blocked.txt",
-                "content": "blocked"
-            })
-            .to_string(),
-        )
-        .expect_err("subagent write tool should be denied before dispatch");
-
-    // then
-    assert!(error
-        .to_string()
-        .contains("requires 'workspace-write' permission"));
+fn a_subagent_tool_outside_its_set_is_refused() {
+    let allowed = BTreeSet::from([String::from("read_file")]);
+    let error = run_subagent_tool(
+        &allowed,
+        "write_file",
+        &json!({ "path": "blocked.txt", "content": "blocked" }),
+    )
+    .expect_err("write_file is not this agent's");
+    assert!(error.contains("not enabled for this sub-agent"));
 }
 
 #[test]
@@ -1393,66 +1376,6 @@ fn web_search_decodes_protocol_relative_duckduckgo_redirect_urls() {
     assert_eq!(content.len(), 1);
     assert_eq!(content[0]["title"], "Tokio Docs");
     assert_eq!(content[0]["url"], "https://docs.rs/tokio");
-}
-
-#[test]
-fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
-    let mut events = Vec::new();
-    let mut pending_tools = BTreeMap::new();
-    let mut pending_thinking = BTreeMap::new();
-
-    push_output_block(
-        OutputContentBlock::ToolUse {
-            id: "tool-1".to_string(),
-            name: "read_file".to_string(),
-            input: json!({}),
-        },
-        1,
-        &mut events,
-        &mut pending_tools,
-        &mut pending_thinking,
-        true,
-    );
-    push_output_block(
-        OutputContentBlock::ToolUse {
-            id: "tool-2".to_string(),
-            name: "grep_search".to_string(),
-            input: json!({}),
-        },
-        2,
-        &mut events,
-        &mut pending_tools,
-        &mut pending_thinking,
-        true,
-    );
-
-    pending_tools
-        .get_mut(&1)
-        .expect("first tool pending")
-        .2
-        .push_str("{\"path\":\"src/main.rs\"}");
-    pending_tools
-        .get_mut(&2)
-        .expect("second tool pending")
-        .2
-        .push_str("{\"pattern\":\"TODO\"}");
-
-    assert_eq!(
-        pending_tools.remove(&1),
-        Some((
-            "tool-1".to_string(),
-            "read_file".to_string(),
-            "{\"path\":\"src/main.rs\"}".to_string(),
-        ))
-    );
-    assert_eq!(
-        pending_tools.remove(&2),
-        Some((
-            "tool-2".to_string(),
-            "grep_search".to_string(),
-            "{\"pattern\":\"TODO\"}".to_string(),
-        ))
-    );
 }
 
 #[test]
@@ -2824,85 +2747,6 @@ fn subagent_system_prompt_uses_resolved_model_identity() {
     fs::remove_dir_all(root).expect("cleanup temp workspace");
 }
 
-#[derive(Debug)]
-struct MockSubagentApiClient {
-    calls: usize,
-    input_path: String,
-}
-
-impl runtime::ApiClient for MockSubagentApiClient {
-    fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        self.calls += 1;
-        match self.calls {
-            1 => {
-                assert_eq!(request.messages.len(), 1);
-                Ok(vec![
-                    AssistantEvent::ToolUse {
-                        id: "tool-1".to_string(),
-                        name: "read_file".to_string(),
-                        input: json!({ "path": self.input_path }).to_string(),
-                    },
-                    AssistantEvent::MessageStop,
-                ])
-            }
-            2 => {
-                assert!(request.messages.len() >= 3);
-                Ok(vec![
-                    AssistantEvent::TextDelta("Scope: completed mock review".to_string()),
-                    AssistantEvent::MessageStop,
-                ])
-            }
-            _ => unreachable!("extra mock stream call"),
-        }
-    }
-}
-
-#[test]
-fn subagent_runtime_executes_tool_loop_with_isolated_session() {
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let root = temp_path("subagent-runtime");
-    std::fs::create_dir_all(&root).expect("create root");
-    let path = root.join("subagent-input.txt");
-    std::fs::write(&path, "hello from child").expect("write input file");
-    let original_dir = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(&root).expect("set cwd");
-
-    let mut runtime = ConversationRuntime::new(
-        Session::new(),
-        MockSubagentApiClient {
-            calls: 0,
-            input_path: path.display().to_string(),
-        },
-        SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
-        agent_permission_policy(),
-        vec![String::from("system prompt")],
-    );
-
-    let summary = runtime
-        .run_turn("Inspect the delegated file", None)
-        .expect("subagent loop should succeed");
-
-    assert_eq!(
-        final_assistant_text(&summary),
-        "Scope: completed mock review"
-    );
-    assert!(runtime
-        .session()
-        .messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .any(|block| matches!(
-            block,
-            runtime::ContentBlock::ToolResult { output, .. }
-                if output.contains("hello from child")
-        )));
-
-    std::env::set_current_dir(&original_dir).expect("restore cwd");
-    let _ = std::fs::remove_dir_all(root);
-}
-
 #[test]
 fn agent_rejects_blank_required_fields() {
     let missing_description = execute_tool(
@@ -4084,149 +3928,6 @@ fn given_no_enforcer_when_bash_then_executes_normally() {
         .expect("bash should succeed without enforcer");
     let output: serde_json::Value = serde_json::from_str(&result).expect("json");
     assert_eq!(output["stdout"], "ok");
-}
-
-#[test]
-fn provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured() {
-    // given
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-    std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-    let fallback_config = ProviderFallbackConfig::default();
-
-    // when
-    let client = ProviderRuntimeClient::new_with_fallback_config(
-        "claude-sonnet-4-6".to_string(),
-        BTreeSet::new(),
-        &fallback_config,
-    )
-    .expect("primary-only chain should construct");
-
-    // then
-    assert_eq!(client.chain.len(), 1);
-    assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-
-    match original_anthropic {
-        Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-        None => std::env::remove_var("ANTHROPIC_API_KEY"),
-    }
-}
-
-#[test]
-fn provider_runtime_client_chain_appends_configured_fallbacks_in_order() {
-    // given
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-    let original_xai = std::env::var_os("XAI_API_KEY");
-    std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-    std::env::set_var("XAI_API_KEY", "xai-test-key");
-    let fallback_config =
-        ProviderFallbackConfig::new(None, vec!["grok-3".to_string(), "grok-3-mini".to_string()]);
-
-    // when
-    let client = ProviderRuntimeClient::new_with_fallback_config(
-        "claude-sonnet-4-6".to_string(),
-        BTreeSet::new(),
-        &fallback_config,
-    )
-    .expect("chain with fallbacks should construct");
-
-    // then
-    assert_eq!(client.chain.len(), 3);
-    assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-    assert_eq!(client.chain[1].model, "grok-3");
-    assert_eq!(client.chain[2].model, "grok-3-mini");
-
-    match original_anthropic {
-        Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-        None => std::env::remove_var("ANTHROPIC_API_KEY"),
-    }
-    match original_xai {
-        Some(value) => std::env::set_var("XAI_API_KEY", value),
-        None => std::env::remove_var("XAI_API_KEY"),
-    }
-}
-
-#[test]
-fn provider_runtime_client_chain_primary_override_replaces_constructor_model() {
-    // given
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-    let original_xai = std::env::var_os("XAI_API_KEY");
-    std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-    std::env::set_var("XAI_API_KEY", "xai-test-key");
-    let fallback_config = ProviderFallbackConfig::new(
-        Some("grok-3".to_string()),
-        vec!["claude-sonnet-4-6".to_string()],
-    );
-
-    // when
-    let client = ProviderRuntimeClient::new_with_fallback_config(
-        "claude-haiku-4-5-20251213".to_string(),
-        BTreeSet::new(),
-        &fallback_config,
-    )
-    .expect("chain with primary override should construct");
-
-    // then
-    assert_eq!(client.chain.len(), 2);
-    assert_eq!(client.chain[0].model, "grok-3");
-    assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
-
-    match original_anthropic {
-        Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-        None => std::env::remove_var("ANTHROPIC_API_KEY"),
-    }
-    match original_xai {
-        Some(value) => std::env::set_var("XAI_API_KEY", value),
-        None => std::env::remove_var("XAI_API_KEY"),
-    }
-}
-
-#[test]
-fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
-    // given
-    let _guard = env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
-    let original_xai = std::env::var_os("XAI_API_KEY");
-    std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
-    std::env::remove_var("XAI_API_KEY");
-    let fallback_config = ProviderFallbackConfig::new(
-        None,
-        vec![
-            "grok-3".to_string(),
-            "claude-haiku-4-5-20251213".to_string(),
-        ],
-    );
-
-    // when
-    let client = ProviderRuntimeClient::new_with_fallback_config(
-        "claude-sonnet-4-6".to_string(),
-        BTreeSet::new(),
-        &fallback_config,
-    )
-    .expect("chain construction should not fail when only some fallbacks are unavailable");
-
-    // then
-    assert_eq!(client.chain.len(), 2);
-    assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
-    assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
-
-    match original_anthropic {
-        Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
-        None => std::env::remove_var("ANTHROPIC_API_KEY"),
-    }
-    if let Some(value) = original_xai {
-        std::env::set_var("XAI_API_KEY", value);
-    }
 }
 
 #[test]

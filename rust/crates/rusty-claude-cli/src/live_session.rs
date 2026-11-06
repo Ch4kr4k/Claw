@@ -72,12 +72,9 @@ impl LiveCli {
             session,
             &self.session.id,
             model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
@@ -171,12 +168,9 @@ impl LiveCli {
             session,
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)
     }
@@ -325,12 +319,9 @@ impl LiveCli {
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)?;
         runtime::turn_keys::screen::clear_conversation();
@@ -350,12 +341,9 @@ impl LiveCli {
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)?;
         Ok(previous)
@@ -379,12 +367,9 @@ impl LiveCli {
             session_state.with_persistence_path(self.session.path.clone()),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)?;
         println!(
@@ -422,12 +407,9 @@ impl LiveCli {
             session,
             &handle.id,
             self.model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)?;
         self.session = SessionHandle {
@@ -498,12 +480,9 @@ impl LiveCli {
                     session,
                     &handle.id,
                     self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
-                    None,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = SessionHandle {
@@ -533,12 +512,9 @@ impl LiveCli {
                     forked,
                     &handle.id,
                     self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
-                    None,
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
@@ -627,12 +603,9 @@ impl LiveCli {
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
-            true,
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
-            None,
         )?;
         self.replace_runtime(runtime)?;
         self.persist_session()

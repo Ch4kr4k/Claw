@@ -34,9 +34,9 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use crate::{
-    final_assistant_text, known_context_window, permission_request_approval_key,
-    resolve_model_alias_with_config, resolve_repl_model, tool_result_for_model, AllowedToolSet,
-    LiveCli, PermissionMode, INTERRUPTED_BY_USER, SESSION_APPROVALS,
+    known_context_window, permission_request_approval_key, resolve_model_alias_with_config,
+    resolve_repl_model, tool_result_for_model, AllowedToolSet, LiveCli, PermissionMode,
+    SESSION_APPROVALS,
 };
 
 /// Set while this process runs as a desktop agent; the stream and tool hooks
@@ -741,11 +741,7 @@ impl LiveCli {
         drain_replies();
         TEXT_SENT.store(false, Ordering::Relaxed);
         emit(&json!({"ev": "turn_start"}));
-        let status = if claw_engine::requested() {
-            self.desktop_engine_attempt(input)
-        } else {
-            self.desktop_classic_attempt(input)
-        };
+        let status = self.desktop_engine_attempt(input);
         if INCOGNITO.load(Ordering::Relaxed) {
             // Nothing is saved.
         } else if let Err(error) = self.persist_session() {
@@ -764,70 +760,6 @@ impl LiveCli {
         emit(&json!({"ev": "turn_end", "status": status}));
         self.emit_context();
         status
-    }
-
-    /// A turn on the classic loop (`CLAW_ENGINE=legacy`).
-    fn desktop_classic_attempt(&mut self, input: &str) -> &'static str {
-        let (mut runtime, monitor) = match self.prepare_turn_runtime(false) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                emit(&json!({"ev": "error", "message": error.to_string()}));
-                return "error";
-            }
-        };
-        *CURRENT_ABORT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(monitor.signal());
-        let prompt = Self::with_job_notices(input);
-        let mut prompter = DesktopPermissionPrompter;
-        let attachments = crate::repl_commands::attached_images(input);
-        let result = runtime.run_turn_with_attachments(&prompt, attachments, Some(&mut prompter));
-        monitor.stop();
-        *CURRENT_ABORT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        match result {
-            Ok(summary) => {
-                if !TEXT_SENT.load(Ordering::Relaxed) {
-                    // Providers that do not stream text: send the reply whole.
-                    emit_text(&final_assistant_text(&summary));
-                }
-                let usage = summary.usage;
-                if let Err(error) = self.replace_runtime(runtime) {
-                    emit(&json!({"ev": "error", "message": error.to_string()}));
-                }
-                // As in the terminal: review the turn for memories and skills.
-                let added = 1 + summary.assistant_messages.len() + summary.tool_results.len();
-                let messages = &self.runtime.session().messages;
-                crate::learning::after_turn(
-                    messages,
-                    &messages[messages.len().saturating_sub(added)..],
-                );
-                emit(&json!({
-                    "ev": "usage",
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                }));
-                "done"
-            }
-            Err(error) if error.to_string().contains(INTERRUPTED_BY_USER) => {
-                // Keep what the turn did, as the REPL does after Esc.
-                if let Some(rt) = runtime.runtime.as_mut() {
-                    let _ = rt
-                        .session_mut()
-                        .push_user_text("[Request interrupted by user]");
-                }
-                if let Err(error) = self.replace_runtime(runtime) {
-                    emit(&json!({"ev": "error", "message": error.to_string()}));
-                }
-                "stopped"
-            }
-            Err(error) => {
-                let _ = runtime.shutdown_plugins();
-                emit(&json!({"ev": "error", "message": error.to_string()}));
-                "error"
-            }
-        }
     }
 
     /// A turn on the Infinity engine: the session's messages seed the root
@@ -892,6 +824,9 @@ impl LiveCli {
         }
         let messages = &self.runtime.session().messages;
         crate::learning::after_turn(messages, &messages[messages.len().saturating_sub(added)..]);
+        if let Some(event) = self.after_engine_turn(input, &outcome) {
+            emit(&json!({"ev": "notice", "text": crate::auto_compaction_notice(&event)}));
+        }
         let usage = crate::live_engine::turn_summary(&outcome).usage;
         emit(&json!({
             "ev": "usage",

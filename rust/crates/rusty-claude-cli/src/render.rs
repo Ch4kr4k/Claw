@@ -1,5 +1,5 @@
 use std::fmt::Write as FmtWrite;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};

@@ -75,10 +75,13 @@ thread_local! {
     static HOST_APPROVAL: std::cell::RefCell<Option<(BashCommandInput, std::path::PathBuf)>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct HostExecutionScope;
+/// While it lives, an approved call to run a command outside the sandbox
+/// may do so (once, for that exact command, on this thread).
+pub struct HostExecutionScope;
 
 impl HostExecutionScope {
-    pub(crate) fn for_authorized_call(tool_name: &str, input: &str) -> Self {
+    #[must_use]
+    pub fn for_authorized_call(tool_name: &str, input: &str) -> Self {
         let grant = if crate::permissions::is_host_execution_request(tool_name, input) {
             serde_json::from_str::<BashCommandInput>(input)
                 .ok()

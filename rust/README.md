@@ -227,7 +227,7 @@ rust/
 - **compat-harness** — compatibility and parity helpers for comparing behavior with upstream fixtures
 - **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs
 - **plugins** — plugin metadata, install/enable/disable/update flows, plugin tool definitions, hook integration surfaces
-- **runtime** — `ConversationRuntime` (with parallel read-only tool batches), config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking, checkpoints (`snapshots.rs`), background jobs, turn-time key watcher (`turn_keys.rs`)
+- **runtime** — `ConversationRuntime` (session, client, tools, compaction), turn guards, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking, checkpoints (`snapshots.rs`), background jobs, turn-time key watcher (`turn_keys.rs`)
 - **rusty-claude-cli** — REPL and line editor (`input.rs`), streaming markdown display (`render.rs`), REPL-only slash commands (`repl_commands.rs`), one-shot prompt, direct CLI subcommands, CLI argument parsing
 - **documents** — reading Office files, PDFs and notebooks as text; writing `.docx`/`.pptx` and editing `.xlsx`
 - **claw-analog**, **claw-rag-service** — alternate lean agent binary and a standalone RAG service

@@ -152,6 +152,7 @@ fn config_with_images(
         resolve_tool_name: None,
         offer_tools: true,
         max_completions: None,
+        guards: claw_engine::GuardConfig::default(),
     };
     (config, requests)
 }
@@ -749,4 +750,166 @@ fn a_subagent_that_never_finishes_is_stopped() {
     let error = result.expect_err("stopped");
     assert!(error.contains("3 model replies"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+// ------------------------------------------------------- turn guards
+
+fn mark_cut_off() {
+    claw_engine::reply::REPLY_FLAGS
+        .try_with(|flags| {
+            flags
+                .cut_off
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+        .expect("requested through the engine");
+}
+
+fn finished_tools(events: &[EngineEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Tool(ToolActivity::Finished { name, .. }) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_reply_cut_off_at_the_output_limit_is_continued() {
+    let run = run(PermissionMode::ReadOnly, "write a lot", |request| {
+        if last_input(request).contains("cut off at the output-token limit") {
+            return text("…and the rest.");
+        }
+        mark_cut_off();
+        text("The first half")
+    });
+    assert_eq!(run.requests.len(), 2);
+    assert_eq!(run.summary.final_text, "…and the rest.");
+}
+
+#[test]
+fn a_reply_that_only_thinks_is_asked_to_act() {
+    let run = run(PermissionMode::ReadOnly, "decide", |request| {
+        let input = last_input(request);
+        if runtime::turn_guards::follows_thinking_cut_off(&input) {
+            assert!(input.contains("so the plan is"), "tail quoted: {input}");
+            return text("Done deciding.");
+        }
+        vec![StreamChunk::ReasoningDelta {
+            id: None,
+            text: "Let me think, so the plan is".to_string(),
+        }]
+    });
+    assert_eq!(run.requests.len(), 2);
+    assert_eq!(run.summary.final_text, "Done deciding.");
+}
+
+#[test]
+fn a_cut_off_tool_call_is_not_run() {
+    let run = run(PermissionMode::DangerFullAccess, "write it", |request| {
+        if last_input(request).starts_with(runtime::turn_guards::CUT_OFF_TOOL_CALL_RESULT) {
+            return text("I will write it in parts.");
+        }
+        mark_cut_off();
+        claw_engine::reply::REPLY_FLAGS
+            .try_with(|flags| {
+                flags
+                    .malformed_calls
+                    .lock()
+                    .unwrap()
+                    .push("cut-call".to_string());
+            })
+            .unwrap();
+        vec![StreamChunk::ToolCall(ToolCall::new(
+            "cut-call",
+            "write_file",
+            json!({"path": "/tmp/claw-never-written.txt", "_raw": "{\"path"}),
+        ))]
+    });
+    assert!(finished_tools(&run.events).is_empty(), "nothing ran");
+    assert_eq!(run.summary.final_text, "I will write it in parts.");
+}
+
+#[test]
+fn an_empty_reply_is_asked_for_again() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let run = run(PermissionMode::ReadOnly, "hi", move |_| {
+        if seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            Vec::new()
+        } else {
+            text("hello")
+        }
+    });
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(run.summary.final_text, "hello");
+}
+
+#[test]
+fn tool_calls_written_as_text_are_run_and_their_markup_is_not_sent_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("note.txt");
+    std::fs::write(&path, "the secret is 42\n").expect("write note");
+    let path_text = path.display().to_string();
+    let run = run(PermissionMode::ReadOnly, "read it", move |request| {
+        if last_input(request).contains("the secret is 42") {
+            let history = format!("{:?}", request.chat_history);
+            assert!(!history.contains("<tool_call>"), "markup kept: {history}");
+            return text("It says 42.");
+        }
+        text(&format!(
+            "Reading.\n<tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"{path_text}\"}}}}</tool_call>"
+        ))
+    });
+    assert_eq!(finished_tools(&run.events), ["read_file"]);
+    assert!(run.summary.final_text.ends_with("It says 42."));
+    assert!(!run.summary.final_text.contains("<tool_call>"));
+}
+
+#[test]
+fn a_model_repeating_a_blocked_call_ends_the_turn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("same.txt");
+    std::fs::write(&path, "unchanging\n").expect("write");
+    let path_text = path.display().to_string();
+    let (config, requests) = config(PermissionMode::ReadOnly, move |_| {
+        call("read_file", json!({ "path": path_text }))
+    });
+    let outcome = Engine::new(config)
+        .run_turn_blocking(&[], "loop", TurnControl::default(), |_| {})
+        .expect("turn");
+    assert_eq!(outcome.stopped_looping.as_deref(), Some("read_file"));
+    let note = outcome.messages.last().expect("note");
+    assert_eq!(note.role, MessageRole::Assistant);
+    assert!(
+        matches!(&note.blocks[0], ContentBlock::Text { text } if text.contains("I stopped this turn"))
+    );
+    let sent = requests.lock().unwrap().len();
+    assert!(sent < 12, "stopped soon, after {sent} requests");
+}
+
+#[test]
+fn edited_code_is_checked_before_the_turn_ends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("lib.rs");
+    let path_text = path.display().to_string();
+    let (mut config, requests) = config(PermissionMode::DangerFullAccess, move |request| {
+        let input = last_input(request);
+        if input.contains("You changed code") {
+            return text("Checked it.");
+        }
+        if input.contains("write it") {
+            return call(
+                "write_file",
+                json!({ "path": path_text, "content": "fn main() {}\n" }),
+            );
+        }
+        text("Written.")
+    });
+    config.guards.verify_on_stop = true;
+    let summary = Engine::new(config)
+        .run_prompt_blocking("write it", |_| {})
+        .expect("turn");
+    assert_eq!(summary.final_text, "Checked it.");
+    assert_eq!(requests.lock().unwrap().len(), 3);
 }

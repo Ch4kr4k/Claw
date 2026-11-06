@@ -263,66 +263,6 @@ pub(crate) fn run_mcp_tool(
 }
 
 impl ToolExecutor for CliToolExecutor {
-    fn can_run_in_parallel(&self, tool_name: &str) -> bool {
-        PARALLEL_SAFE_TOOLS.contains(&tool_name)
-            && !self.tool_registry.has_runtime_tool(tool_name)
-            && self.check_allowed(tool_name).is_ok()
-    }
-
-    /// Runs read-only calls on scoped threads. The threads only borrow the
-    /// registry immutably and return their results; printing and everything
-    /// else that touches shared state happens here, in the original order.
-    fn execute_batch(&mut self, calls: &[(String, String)]) -> Vec<Result<String, ToolError>> {
-        let _timer = self.emit_output.then(step_stats::ToolTimer::start);
-        let calls = calls
-            .iter()
-            .map(|(tool_name, input)| (self.resolve_tool_name(tool_name), input.clone()))
-            .collect::<Vec<_>>();
-        let calls = calls.as_slice();
-        if calls
-            .iter()
-            .any(|(tool_name, _)| !self.can_run_in_parallel(tool_name))
-        {
-            return calls
-                .iter()
-                .map(|(tool_name, input)| self.execute(tool_name, input))
-                .collect();
-        }
-        if self.emit_output {
-            runtime::turn_keys::begin_tool(&format!("Running {} tools in parallel", calls.len()));
-            render::start_thinking(&format!("running {} tools in parallel", calls.len()));
-        }
-        let registry = &self.tool_registry;
-        let results = std::thread::scope(|scope| {
-            let workers = calls
-                .iter()
-                .map(|(tool_name, input)| {
-                    scope.spawn(move || {
-                        let value = serde_json::from_str(input).map_err(|error| {
-                            ToolError::new(format!("invalid tool input JSON: {error}"))
-                        })?;
-                        registry.execute(tool_name, &value).map_err(ToolError::new)
-                    })
-                })
-                .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .map(|worker| {
-                    worker
-                        .join()
-                        .unwrap_or_else(|_| Err(ToolError::new("tool panicked while running")))
-                })
-                .collect::<Vec<_>>()
-        });
-        render::stop_thinking();
-        runtime::turn_keys::end_tool();
-        calls
-            .iter()
-            .zip(results)
-            .map(|((tool_name, input), result)| self.report_result(tool_name, input, result))
-            .collect()
-    }
-
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         self.run_call(tool_name, input)
     }

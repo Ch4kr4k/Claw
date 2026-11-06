@@ -1,6 +1,5 @@
-//! `claw desktop-agent` against the mock Anthropic service, on the Infinity
-//! engine (the default) and on the classic loop (`CLAW_ENGINE=legacy`): the
-//! app's event stream must be the same on both.
+//! `claw desktop-agent` against the mock Anthropic service: the app's event
+//! stream for text, a two-call batch, and bash approved and denied.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -22,7 +21,7 @@ struct Agent {
 }
 
 impl Agent {
-    fn start(root: &Path, base_url: &str, engine: &str, mode: &str, tools: &str) -> Self {
+    fn start(root: &Path, base_url: &str, mode: &str, tools: &str) -> Self {
         let config_home = root.join("config-home");
         let home = root.join("home");
         fs::create_dir_all(&config_home).unwrap();
@@ -41,7 +40,6 @@ impl Agent {
             .env("HOME", &home)
             .env("NO_COLOR", "1")
             .env("PATH", "/usr/bin:/bin")
-            .env("CLAW_ENGINE", engine)
             .args([
                 "--model",
                 "sonnet",
@@ -190,15 +188,16 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn desktop_agent_streams_the_same_events_on_engine_and_classic_loop() {
+fn desktop_agent_streams_turn_events_to_the_app() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let server = runtime.block_on(MockAnthropicService::spawn()).unwrap();
     let base_url = server.base_url();
 
-    for engine in ["infinity", "legacy"] {
+    {
+        let engine = "engine";
         // Plain streamed text.
         let root = temp_dir("text");
-        let mut agent = Agent::start(&root, &base_url, engine, "read-only", "read_file");
+        let mut agent = Agent::start(&root, &base_url, "read-only", "read_file");
         let events = agent.turn("streaming_text", "deny");
         assert_eq!(of(&events, "turn_start").len(), 1, "{engine}");
         assert_eq!(of(&events, "turn_end")[0]["status"], "done", "{engine}");
@@ -214,13 +213,7 @@ fn desktop_agent_streams_the_same_events_on_engine_and_classic_loop() {
             "alpha parity line\nbeta line\ngamma parity line\n",
         )
         .unwrap();
-        let mut agent = Agent::start(
-            &root,
-            &base_url,
-            engine,
-            "read-only",
-            "read_file,grep_search",
-        );
+        let mut agent = Agent::start(&root, &base_url, "read-only", "read_file,grep_search");
         let events = agent.turn("multi_tool_turn_roundtrip", "deny");
         assert_eq!(
             names(&events, "tool_call"),
@@ -243,18 +236,11 @@ fn desktop_agent_streams_the_same_events_on_engine_and_classic_loop() {
             ("bash_permission_prompt_denied", "deny", "declined"),
         ] {
             let root = temp_dir("bash");
-            let mut agent = Agent::start(&root, &base_url, engine, "workspace-write", "bash");
+            let mut agent = Agent::start(&root, &base_url, "workspace-write", "bash");
             let events = agent.turn(scenario, decision);
             assert_eq!(of(&events, "permission").len(), 1, "{engine} {scenario}");
             assert_eq!(names(&events, "tool_call"), ["bash"], "{engine} {scenario}");
             let results = of(&events, "tool_result");
-            if engine == "legacy" && decision == "deny" {
-                // The classic loop never shows a denied call's result: the
-                // app's tool row stays open. The engine reports it.
-                assert!(results.is_empty(), "{scenario}: {events:#?}");
-                assert!(text(&events).contains(expect), "{scenario}");
-                continue;
-            }
             assert_eq!(results.len(), 1, "{engine} {scenario}: {events:#?}");
             assert!(
                 results[0]["output"]

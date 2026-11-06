@@ -799,10 +799,9 @@ removing it.
 
 ### Asynchronous engine
 
-Turns run on the [Infinity](https://github.com/hydro-project/infinity)
-runtime: interactive REPL turns and one-shot prompts (`claw -p "…"`,
-`claw prompt …`). Set `CLAW_ENGINE=legacy` to go back to the previous loop
-for a session. On the engine:
+Every turn runs on the [Infinity](https://github.com/hydro-project/infinity)
+runtime: interactive REPL turns, one-shot prompts (`claw -p "…"`,
+`claw prompt …`), sub-agents and the desktop app's chats. On the engine:
 
 - **Nothing waits on a slow tool.** `bash`, web fetches and sub-agents run in
   the background, and the agent picks up their results as they arrive.
@@ -816,7 +815,6 @@ for a session. On the engine:
 
 ```sh
 claw --permission-mode workspace-write -p "review src/ in parallel, one thread per module"
-CLAW_ENGINE=legacy claw    # the previous loop
 ```
 
 **In the REPL**, a turn looks as usual, with a few differences:
@@ -831,18 +829,39 @@ CLAW_ENGINE=legacy claw    # the previous loop
   learning work as usual: the session is still claw's own, and each turn
   starts from it and saves what it added.
 
-**With `-p`** (and `--compact`), text and JSON output look like a classic
-`-p` run (the JSON has the same fields and values), and the run is saved as
-a session.
+**With `-p`** (and `--compact`), the JSON output has the usual fields
+(message, tool uses and results, iterations, usage, cost), and the run is
+saved as a session.
 
 **Sub-agents** (`Agent`) run on the engine too, each on its own, limited to
-its type's tools and stopped after 32 model replies, as before. With a
-`providerFallbacks` chain configured they keep the classic loop, which
-retries down the chain. `/btw` side answers also run on the engine, without
-tools and without touching the conversation.
+its type's tools and stopped after 32 model replies, and they use the same
+`providerFallbacks` chain as the session. `/btw` side answers also run on
+the engine, without tools and without touching the conversation.
 
 MCP tools, images from tools (screenshots), `@image` / `/image`
-attachments and `/effort` work as in the classic loop.
+attachments, `/effort`, the fallback chain and a local server's thinking
+budget (`CLAW_THINKING_BUDGET`) apply to every turn.
+
+**Turn guards.** Each turn watches what the model does, mostly for small
+local models:
+
+- A call that keeps returning the same result is no longer run, and a
+  model that keeps sending it anyway ends the turn with a note.
+- A call that keeps failing gets a note to change approach, then is no
+  longer run; a broad filesystem search (`find /`) gets one warning.
+- A reply cut off at the output limit, or one that stops with nothing but
+  thinking, is continued (3 times in a row at most); a tool call cut off
+  mid-input is not run, and the model is asked to send less per call.
+- A reply stuck repeating itself is stopped and its text not sent back.
+- Tool calls a local server's parser missed, left in the reply text, are
+  run (`CLAW_TEXT_TOOL_CALLS=0` turns that off).
+- A turn that edited code and is about to end without running anything is
+  reminded once to check it (`verifyOnStop`).
+- A read of lines the conversation already holds gets a short note
+  instead; injected instructions in web or MCP output get a warning; a
+  directory's `AGENTS.md` comes with the first call that works there;
+  background jobs that finished are reported with the next tool result.
+- An empty reply is asked for once more.
 
 The desktop app's chats run on the engine too. Messages sent while claw
 works reach the running turn, Stop ends it, and a call you decline still
@@ -852,6 +871,11 @@ Limitations for now:
 
 - Child threads last for one turn: they finish (or are stopped) before the
   turn ends. While they run, the status line shows `N threads`.
+- A model that goes silent mid-turn is not given up on early: the request
+  waits for the HTTP idle timeout (`CLAW_API_REQUEST_TIMEOUT`), or Esc.
+- A text-only model gets a note in place of each image (`visionModel`
+  descriptions are not sent).
+- Hooks run as before but print no `[hook …]` progress lines.
 
 The design and the plan for the remaining work are in
 [`docs/infinity-engine.md`](docs/infinity-engine.md).
@@ -1470,7 +1494,6 @@ Hooks, MCP servers and plugins are described in [`USAGE.md`](./USAGE.md).
 | `CLAW_THEME` | Theme, overriding the saved one |
 | `CLAW_DIFF_PANEL=0` | No diff panel this run (`/diffpanel off` saves it) |
 | `CLAW_FULLSCREEN=0` | Inline view instead of the full-screen window (output stays in the terminal's history) |
-| `CLAW_ENGINE` | Turns run on the asynchronous multi-threaded engine by default (see *Asynchronous engine* in section 9). `legacy` (or `classic`) uses the previous loop |
 | `CLAW_MERMAID` | `0` prints ```` ```mermaid ```` blocks as code only, `text` always draws them as box-drawing text (default: an image where inline images work, text elsewhere) |
 | `CLAW_INLINE_IMAGES` | `0` never draws reply images in the terminal, `1` always does (default: kitty and Ghostty, not inside tmux) |
 | `CLAW_AUTO_MEMORY=0` | Turn off auto memory for this run |
@@ -1502,15 +1525,13 @@ learn across sessions:
   `modelServers.local.stopOnExit` it stops again when claw exits. A session that
   falls back to a local model uses the launcher's short tool list. With a
   fallback set, a failing provider is retried twice instead of eight times.
-  A 402 that names the reply size the account can afford (OpenRouter's "can
-  only afford N") is first retried with that smaller reply budget, which
-  then holds for that model until claw exits.
 - **`visionModel`**: a model that reads images, e.g. the local
   `"local/cybertiel-35b-a3b"` (llama-gpu loads its `mmproj`, as for the desktop's
   Attach) or `"openrouter/nvidia/nemotron-3.5-super-vl:free"`. When the model in use
   takes no images (screenshots from `Browser` or `X11`, `vision_analyze`),
-  claw sends it this model's description of each image instead. Unset, such
-  a model gets a note that the image was left out. Images go to this model's
+  claw used to send it this model's description of each image; turns on the
+  engine send a note that the image was left out instead (the setting is
+  kept for when descriptions return). Images go to this model's
   provider, so pick one you are happy to send screenshots to.
 - **`auxiliaryModel`**: the model for side tasks (compaction summaries,
   `/btw`, `/recap`, learning), so they do not spend the main model's quota and

@@ -520,11 +520,16 @@ fn assert_grep_chunk_assembly(_: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("grep_search".to_string())
     );
+    // The input as JSON: its keys may come back in another order.
+    let input: Value = serde_json::from_str(
+        run.response["tool_uses"][0]["input"]
+            .as_str()
+            .expect("input text"),
+    )
+    .expect("input JSON");
     assert_eq!(
-        run.response["tool_uses"][0]["input"],
-        Value::String(
-            r#"{"pattern":"parity","path":"fixture.txt","output_mode":"count"}"#.to_string()
-        )
+        input,
+        json!({"pattern": "parity", "path": "fixture.txt", "output_mode": "count"})
     );
     assert!(run.response["message"]
         .as_str()

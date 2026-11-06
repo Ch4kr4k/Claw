@@ -90,7 +90,10 @@ pub use approval_tokens::{
     ApprovalTokenGrant, ApprovalTokenLedger, ApprovalTokenStatus,
 };
 pub use background_jobs::{global_background_jobs, BackgroundJobs, JobRead, JobState, JobSummary};
-pub use bash::{execute_bash, shell_program, turn_aborted, BashCommandInput, BashCommandOutput};
+pub use bash::{
+    execute_bash, shell_program, turn_aborted, BashCommandInput, BashCommandOutput,
+    HostExecutionScope, TurnAbortScope,
+};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use branch_lock::{detect_branch_lock_collisions, BranchLockCollision, BranchLockIntent};
 pub use compact::{
@@ -116,9 +119,9 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, configured_auto_compaction_threshold,
-    is_output_limit_stop_reason, set_auto_compaction_threshold_override, ApiClient, ApiRequest,
-    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-    StaticToolExecutor, ToolError, ToolExecutor, TurnSummary, THINKING_CUT_OFF_PROMPT,
+    is_output_limit_stop_reason, set_auto_compaction_threshold_override, ApiClient,
+    AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+    ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
     edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
@@ -235,6 +238,7 @@ pub use task_registry::{LaneBoard, LaneBoardEntry, LaneFreshness, LaneHeartbeat}
 pub use tool_spill::is_spill_path;
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
+pub use turn_guards::THINKING_CUT_OFF_PROMPT;
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };

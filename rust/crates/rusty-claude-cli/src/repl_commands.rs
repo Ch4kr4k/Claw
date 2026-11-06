@@ -66,6 +66,8 @@ impl LiveCli {
         if self.plan_mode_previous.is_some() {
             prompt.push(PLAN_MODE_PROMPT.to_string());
         }
+        // `--permission-mode read-only`: say up front that writes are denied.
+        let mut prompt = crate::with_plan_mode_section(prompt, self.permission_mode);
         if let Some(style) = &self.output_style {
             prompt.push(crate::claude_commands::output_style_section(style));
         }

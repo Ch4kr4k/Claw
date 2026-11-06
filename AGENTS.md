@@ -49,13 +49,14 @@ claw-code/
 | ConfigLoader | struct | runtime/src/config.rs:412 | 83 | config schema/load |
 | PluginManager | struct | plugins/src/lib.rs | 48 | plugin install/registry |
 | PermissionEnforcer | struct | runtime/src/permission_enforcer.rs:27 | 35 | pre-dispatch permission gate |
-| ConversationRuntime | struct | runtime/src/conversation.rs:174 | 32 | conversation loop driver |
+| ConversationRuntime | struct | runtime/src/conversation.rs:125 | 32 | session + client + tools, usage, compaction |
+| Engine | struct | claw-engine/src/engine.rs | — | the turn loop (Infinity runtime), guards in guards.rs/reply.rs |
 | McpServerManager | struct | runtime/src/mcp_stdio.rs:488 | 30 | MCP JSON-RPC processes |
 | HookRunner | struct | runtime/src/hooks.rs:155 | 25 | shell hook execution |
 | CliAction | enum | rusty-claude-cli/src/main.rs:1168 | — | 25 subcommand variants |
 | mvp_tool_specs | fn | tools/src/lib.rs:485 | — | static 60-tool table |
 | SLASH_COMMAND_SPECS | const | commands/src/lib.rs | — | 57 slash commands |
-| LiveCli | struct | rusty-claude-cli/src/main.rs:7147 | — | REPL session state, run_turn, auto-compact retry |
+| LiveCli | struct | rusty-claude-cli/src/main.rs | — | REPL session state; turns via live_engine.rs |
 | LineEditor | struct | rusty-claude-cli/src/input.rs | — | prompt input editor |
 | TurnKeyWatcher | struct | runtime/src/turn_keys.rs | — | Esc + type-ahead during a turn |
 

@@ -13,7 +13,7 @@ This file provides guidance to Claw Code (clawcode.dev) when working with code i
 
 ## Where things are
 - `crates/rusty-claude-cli` builds the `claw` binary: `main.rs` (args, REPL loop, provider/tool adapters), `input.rs` (line editor), `render.rs` (streaming markdown), `repl_commands.rs` (REPL-only slash commands).
-- `crates/runtime` holds the agent loop (`conversation.rs`), permissions, prompt assembly, sessions, snapshots, background jobs and the turn-time key watcher (`turn_keys.rs`).
+- `crates/claw-engine` runs every turn (Infinity runtime; guards in `guards.rs`/`reply.rs`); `crates/runtime` holds sessions (`conversation.rs`), the guard helpers (`turn_guards.rs`), permissions, prompt assembly, snapshots, background jobs and the turn-time key watcher (`turn_keys.rs`).
 - `crates/api` holds provider clients and the HTTP layer; `crates/tools` the tool registry; `crates/documents` Office/PDF/notebook I/O.
 - See `AGENTS.md` here and in each crate, and `../ARCHITECTURE.md` for the full picture. User-facing behavior is documented in `../MANUAL.md`; keep it in sync.
 

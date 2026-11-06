@@ -89,6 +89,10 @@ pub struct ToolHost {
     /// executor can run them.
     runtime_tools: bool,
     activity: Option<ActivitySink>,
+    /// The turn's guards (see [`crate::guards`]).
+    guards: Option<Arc<crate::guards::TurnGuards>>,
+    /// The turn's stop signal: shell commands end when it is set.
+    abort: Option<runtime::HookAbortSignal>,
 }
 
 impl ToolHost {
@@ -102,7 +106,23 @@ impl ToolHost {
             executor: None,
             runtime_tools: false,
             activity: None,
+            guards: None,
+            abort: None,
         }
+    }
+
+    /// Checks calls and annotates results with the turn's `guards`.
+    #[must_use]
+    pub fn with_guards(mut self, guards: Arc<crate::guards::TurnGuards>) -> Self {
+        self.guards = Some(guards);
+        self
+    }
+
+    /// Ends shell commands when `abort` is set (Esc, Ctrl+C, Stop).
+    #[must_use]
+    pub fn with_abort(mut self, abort: runtime::HookAbortSignal) -> Self {
+        self.abort = Some(abort);
+        self
     }
 
     #[must_use]
@@ -173,11 +193,28 @@ impl ToolHost {
             },
             None => self.authorize(name, &effective_input, pre.as_ref()),
         };
+        // An allowed call the turn's guards stop (a repeat, a call that keeps
+        // failing, a broad search) is refused like a denied one.
+        let outcome = match (outcome, &self.guards) {
+            (PermissionOutcome::Allow, Some(guards)) => guards
+                .before_call(thread, name, &effective_input)
+                .map_or(PermissionOutcome::Allow, |reason| PermissionOutcome::Deny {
+                    reason,
+                }),
+            (outcome, _) => outcome,
+        };
+        let ran = outcome == PermissionOutcome::Allow;
         let (mut output, mut is_error) = match outcome {
             PermissionOutcome::Deny { reason } => (format!("Error: {reason}"), true),
             PermissionOutcome::Allow => {
                 let value =
                     serde_json::from_str(&effective_input).unwrap_or_else(|_| input.clone());
+                // Stop ends the shell commands this call runs; an approved
+                // call outside the sandbox may leave it, once, for this
+                // exact command (both are per worker thread).
+                let _abort = self.abort.as_ref().map(runtime::TurnAbortScope::enter);
+                let _host =
+                    runtime::HostExecutionScope::for_authorized_call(name, &effective_input);
                 let result = match &self.executor {
                     Some(executor) => executor(name, &value),
                     None => self.registry.execute(name, &value),
@@ -200,6 +237,9 @@ impl ToolHost {
             let stopped = hook_stop(&post).is_some();
             is_error |= stopped;
             output = merge_hook_feedback(post.messages(), output, stopped);
+        }
+        if let (true, Some(guards)) = (ran, &self.guards) {
+            guards.after_call(thread, name, &effective_input, &mut output, is_error);
         }
         self.report(ToolActivity::Finished {
             thread: thread.to_string(),

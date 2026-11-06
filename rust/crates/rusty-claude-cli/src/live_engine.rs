@@ -48,7 +48,10 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let started = std::time::Instant::now();
-        let mut view = TurnView::default();
+        let mut view = TurnView {
+            model: self.model.clone(),
+            ..TurnView::default()
+        };
         let result = Engine::new(config)
             .run_turn_blocking(&history, input, control, |event| view.show(event));
         view.flush();
@@ -75,6 +78,7 @@ impl LiveCli {
             messages,
             &messages[messages.len().saturating_sub(outcome.messages.len())..],
         );
+        let compaction = self.after_engine_turn(input, &outcome);
         let threads = if outcome.summary.threads > 1 {
             format!(", {} threads", outcome.summary.threads)
         } else {
@@ -90,8 +94,32 @@ impl LiveCli {
         };
         spinner.finish(&label, TerminalRenderer::new().color_theme(), &mut stdout)?;
         println!();
+        if let Some(event) = compaction {
+            println!("{}", auto_compaction_notice(&event));
+        }
         self.persist_session()?;
         Ok(())
+    }
+
+    /// After an engine turn: its usage is recorded (`/cost`), and when its
+    /// last request filled the context past the threshold the session is
+    /// compacted, as the classic loop did between steps.
+    pub(crate) fn after_engine_turn(
+        &mut self,
+        input: &str,
+        outcome: &claw_engine::TurnOutcome,
+    ) -> Option<runtime::AutoCompactionEvent> {
+        let rt = self.runtime.runtime.as_mut()?;
+        if let Some(usage) = outcome
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.usage)
+        {
+            rt.record_usage(usage);
+        }
+        let context = u32::try_from(outcome.summary.last_context_tokens).unwrap_or(u32::MAX);
+        rt.auto_compact(input, context)
     }
 
     /// One turn on the engine with nothing drawn (`-p --output-format
@@ -114,8 +142,11 @@ impl LiveCli {
             self.runtime.session_mut().push_message(message)?;
         }
         self.pending_attachments.clear();
+        let compaction = self.after_engine_turn(input, &outcome);
         self.persist_session()?;
-        Ok(turn_summary(&outcome))
+        let mut summary = turn_summary(&outcome);
+        summary.auto_compaction = compaction;
+        Ok(summary)
     }
 
     /// A prompt answered on the engine from a copy of the conversation; the
@@ -178,10 +209,14 @@ impl LiveCli {
             None => GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?,
         };
         let policy = permission_policy(self.permission_mode, &feature_config, &registry)?;
-        let provider = claw_engine::ClawModelProvider::from_model(&self.model)?
+        let provider = engine_provider(&self.model, &self.session.id)?
             .with_reasoning_effort(self.reasoning_effort.clone())
-            .with_max_output_tokens(reply_budget(&self.model))
-            .with_image_input(sends_images(&self.model));
+            // `/btw` side questions are answered from the last request.
+            .with_request_observer(Arc::new(
+                |client: &api::ProviderClient, request: &api::MessageRequest| {
+                    remember_for_side_questions(client, request);
+                },
+            ));
         // One CLI executor for the turn, output off (the turn view draws):
         // it repairs tool names, enforces --allowedTools, pages and outlines
         // reads to the model's window, flags repeated calls, runs ToolSearch
@@ -204,6 +239,16 @@ impl LiveCli {
             policy,
         );
         config.allowed_tools.clone_from(&self.allowed_tools);
+        // As the classic loop had them: a turn that edited code is reminded
+        // to check it, a directory's AGENTS.md comes as the model first works
+        // there, and finished background jobs reach the model between steps.
+        config.guards = claw_engine::GuardConfig {
+            verify_on_stop: verify_on_stop_enabled(),
+            context_hints: Some(session_context_hints()),
+            job_notices: true,
+        };
+        // Sub-agents without an explicit model use this session's model.
+        tools::set_default_agent_model(&self.model);
         config.hooks = Some(runtime::HookRunner::from_feature_config(&feature_config));
         config.runtime_tools = mcp_configured;
         config.tool_list = Some(tool_list);
@@ -235,6 +280,38 @@ impl LiveCli {
         }));
         Ok(config)
     }
+}
+
+/// The engine's provider for `model`, set up as claw's turns use it: the
+/// session's client (prompt cache, retry policy), the reply budget, image
+/// support, a local server's thinking budget, and the fallback models.
+pub(crate) fn engine_provider(
+    model: &str,
+    session_id: &str,
+) -> Result<claw_engine::ClawModelProvider, Box<dyn std::error::Error>> {
+    let client = provider_client::turn_client(model, session_id)?;
+    let words_for = session_id.to_string();
+    let mut provider = claw_engine::ClawModelProvider::new(client, model)
+        .with_error_text(Arc::new(move |error: &api::ApiError| {
+            format_user_visible_api_error(&words_for, error)
+        }))
+        .with_max_output_tokens(reply_budget(model))
+        .with_image_input(sends_images(model))
+        .with_extra_body(Arc::new(|model: &str, follows_cut_off: bool| {
+            local_thinking_extra_body(model, follows_cut_off)
+        }));
+    if !fallback_models_for(&api::resolve_model_alias(model)).is_empty() {
+        let primary = model.to_string();
+        let active_primary = primary.clone();
+        provider = provider.with_fallbacks(claw_engine::Fallbacks {
+            active: Arc::new(move || active_fallback(&active_primary, true)),
+            next: Arc::new(move |error: &str, failed: &[String]| {
+                switch_to_fallback(&primary, error, failed, true)
+            }),
+            worthy: Arc::new(is_fallback_worthy),
+        });
+    }
+    Ok(provider)
 }
 
 /// An engine turn as the classic loop reports one: the replies, the tool
@@ -300,6 +377,8 @@ struct TurnView {
     /// Child threads whose driver is running, for the status line.
     live_children: std::collections::BTreeSet<String>,
     root: Option<String>,
+    /// The turn's model, for `/stats`.
+    model: String,
 }
 
 impl TurnView {
@@ -373,6 +452,8 @@ impl TurnView {
                 ) {
                     diff_panel::refresh();
                 }
+                // `/btw` answers that came in while the tool ran.
+                runtime::turn_keys::print_side_answers();
                 render::start_thinking("thinking");
             }
         }
@@ -381,14 +462,17 @@ impl TurnView {
     fn show_root(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::CompletionStarted => {
+                step_stats::begin_step();
                 runtime::turn_keys::begin_model_request();
                 render::start_thinking("thinking");
                 self.streaming = false;
             }
             AgentEvent::ThinkingChunk { text } => {
+                step_stats::mark_first_token();
                 runtime::turn_keys::note_reasoning(text.chars().count());
             }
             AgentEvent::TextChunk { text } => {
+                step_stats::mark_first_token();
                 runtime::turn_keys::note_text(text.chars().count());
                 if !self.streaming {
                     self.streaming = true;
@@ -398,7 +482,22 @@ impl TurnView {
                     Self::write(&rendered);
                 }
             }
-            AgentEvent::CompletionFinished { .. } => self.flush(),
+            AgentEvent::CompletionFinished { usage } => {
+                self.flush();
+                let usage = usage.unwrap_or_default();
+                let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+                step_stats::end_step(
+                    &self.model,
+                    runtime::TokenUsage {
+                        input_tokens: clamp(
+                            usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+                        ),
+                        output_tokens: clamp(usage.output_tokens),
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: clamp(usage.cached_input_tokens),
+                    },
+                );
+            }
             AgentEvent::ToolCall { name, args, .. } if ENGINE_TOOLS.contains(&name.as_str()) => {
                 self.flush();
                 print_foldable(|| format_tool_call_start(name, &args.to_string()));

@@ -1,6 +1,6 @@
 # Infinity engine: multi-threaded asynchronous agents for claw
 
-Status: phases 1–3 and phase 4 steps 1–2 landed (the engine is the default everywhere, `CLAW_ENGINE=legacy` to opt out); step 3 (deleting the classic loop) is left. Started 2026-11-05.
+Status: done. Every turn runs on the engine; the classic loop (`ConversationRuntime::run_turn`) and `CLAW_ENGINE` were removed on 2026-11-06 after its turn guards were ported (phase 4, step 3). Started 2026-11-05.
 
 This document records the decision to move claw's agent loop onto the
 [Infinity runtime](https://github.com/hydro-project/infinity)
@@ -282,9 +282,64 @@ each. A single call goes through untouched.
      Test: `tests/desktop_agent_engine.rs` drives `claw desktop-agent`
      against the mock service on both loops (text, a two-call batch, bash
      approved and denied, the saved session).
-   - Step 3: after a release with `CLAW_ENGINE=legacy` available, delete
-     `ConversationRuntime`'s loop. `runtime` keeps sessions, config,
-     prompt assembly and permissions.
+   - Step 3 (done): *the classic loop's guards on the engine, then the
+     loop deleted.* The classic `drive_turn` checked much of what a model
+     does; the engine had none of it, so it was ported before the loop went:
+     - `claw_engine::guards::TurnGuards`, one per turn, shared by the tool
+       host, the provider wrapper and the control loop, with state per
+       thread. Before a call (`ToolHost::run`, after hooks and the
+       permission check): the repeat guard (`runtime::turn_guards::
+       RepeatGuard`), the failure guard and the broad-search warning. After
+       a call: failure notes, injected-instruction warnings, context hints
+       (`AGENTS.md` of a directory), the unchanged-read note, and finished
+       background jobs (root only). `ToolHost` also enters `TurnAbortScope`
+       (Stop ends shell commands) and `HostExecutionScope` (an approved
+       call may leave the sandbox) around each call.
+     - `claw_engine::reply::reply_stream`, which `ClawPrompt` wraps around
+       every reply: an empty reply is requested once more; a cut-off
+       reply's unfinished last call is dropped; tool calls written as text
+       are run; a looped reply is marked. Infinity's final chunk has no
+       stop reason, so `ClawModelProvider` notes a cut-off (and malformed
+       calls) in a task-local `ReplyFlags`. Text the model should not see
+       again (a loop, tool-call markup) goes into `Rewrites`, applied to
+       later requests and to the turn's messages.
+     - Follow-ups: what the guards want a thread sent after a reply (the
+       continuation of a cut-off reply, quoting the end of its thinking;
+       the cut-off-call note; the verify reminder) is sent by the control
+       loop when the thread's `CompletionFinished` arrives. A thread stuck
+       sending a blocked call gets no more replies and the turn ends with
+       a note (`TurnOutcome::stopped_looping`).
+     - The provider: the session's client (`provider_client::turn_client`:
+       Anthropic prompt cache, short retries with a fallback), a local
+       server's thinking budget (`with_extra_body`, thinking off after a
+       cut-off), the fallback chain (`with_fallbacks`, over the CLI's
+       `active_fallback`/`switch_to_fallback`), claw's wording of provider
+       errors (`with_error_text`), and a request observer that keeps the
+       last request for `/btw`. Sub-agents get the same provider through
+       `subagent::runner(ProviderFactory)`, so a `providerFallbacks` chain
+       no longer needs the classic loop.
+     - After a turn: usage is recorded (`ConversationRuntime::record_usage`)
+       and the session is compacted when the last request filled the
+       context (`auto_compact`, the classic threshold logic).
+     - Also fixed on the way: read-only mode's plan section was missing
+       from engine turns' system prompt; `iterations` counts model calls
+       (Infinity reports one finished completion per slice, and a slice
+       loops over inline tools); `-p --output-format json` really runs on
+       the engine now.
+     - Deleted: `drive_turn` and its helpers, `ApiClient::stream`, the
+       CLI's streaming client (`consume_stream`, stall timeouts,
+       `images_as_text`, the overflow-retry rounds in `live_turn.rs`), the
+       `tools` crate's own sub-agent loop (`ProviderRuntimeClient`,
+       `SubagentToolExecutor`), `HookAbortMonitor`, the post-compaction
+       session-health probe (ROADMAP #38) and `CLAW_ENGINE`.
+       `runtime::ConversationRuntime` keeps the session, its client (for
+       compaction summaries), its tool executor and registry, the
+       permission policy, usage and compaction.
+     - Tests: guard unit tests (`runtime::turn_guards`, `claw_engine::
+       guards`), engine runs for a cut-off reply, a thinking-only reply, a
+       cut-off call, an empty reply, text tool calls, a blocked-call loop
+       and the verify reminder; the mock parity harness and the desktop
+       agent test on the engine.
 
 ## Current limitations
 
@@ -292,5 +347,11 @@ each. A single call goes through untouched.
   started. A stopped turn returns at once and leaves them to finish.
 - Each turn builds a fresh engine, so child threads don't outlive the turn
   that spawned them.
-- `Agent` sub-agents with a `providerFallbacks` chain still run the classic
-  loop.
+- A model that goes silent is not given up on early (the classic client
+  had a post-tool stall timeout): the HTTP idle timeout or Esc ends it.
+- A text-only model gets a placeholder per image, not a `visionModel`
+  description; a 402 naming an affordable reply size is not retried with
+  it; hooks print no progress lines.
+- Infinity compacts its in-memory copy of a long turn at 3/4 of the
+  window; that summary is not kept, so the next turn starts from claw's
+  session (compacted after the turn when it is full).

@@ -13,24 +13,31 @@ use runtime::Session;
 use tools::{GlobalToolRegistry, SubagentRunner, SubagentTurn};
 
 use crate::engine::{Engine, EngineConfig, TurnControl};
+use crate::provider::ClawModelProvider;
 
-/// The runner the CLI installs with [`tools::set_subagent_runner`]: claw's
-/// provider client for the agent's model, the built-in tools, and the
-/// sub-agent permission policy (no one to ask, so calls needing approval
-/// are denied).
+/// Builds the provider for a sub-agent's model; the second argument is the
+/// agent's id (its session, for a prompt cache).
+pub type ProviderFactory =
+    Arc<dyn Fn(&str, &str) -> Result<ClawModelProvider, String> + Send + Sync>;
+
+/// The runner the CLI installs with [`tools::set_subagent_runner`]: the
+/// agent's model through `provider` (claw's client, thinking budget and
+/// fallback chain), the built-in tools, and the sub-agent permission policy
+/// (no one to ask, so calls needing approval are denied).
 #[must_use]
-pub fn runner() -> SubagentRunner {
-    Arc::new(|turn: SubagentTurn| {
+pub fn runner(provider: ProviderFactory) -> SubagentRunner {
+    Arc::new(move |turn: SubagentTurn| {
         let registry = GlobalToolRegistry::builtin();
-        let config = match EngineConfig::for_model(
-            &turn.model,
+        let provider = match provider(&turn.model, &turn.agent_id) {
+            Ok(provider) => provider,
+            Err(error) => return (Err(error), turn.session),
+        };
+        let config = EngineConfig::for_provider(
+            provider,
             turn.system_prompt.join("\n\n"),
             registry,
             tools::subagent_permission_policy(),
-        ) {
-            Ok(config) => config,
-            Err(error) => return (Err(error.to_string()), turn.session),
-        };
+        );
         run_turn(config, turn)
     })
 }
