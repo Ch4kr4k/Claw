@@ -558,6 +558,16 @@ fn side_panel_width_for(cols: usize) -> usize {
     (cols * 2 / 5).max(44)
 }
 
+/// Whether a side panel takes room from the conversation now.
+#[must_use]
+pub fn side_panel_shown() -> bool {
+    shared().is_some_and(|shared| {
+        lock(&shared.state)
+            .panel_width(super::terminal_cols())
+            .is_some()
+    })
+}
+
 /// Columns the conversation gets: the window's width, less the side panel
 /// when one is shown. `None` outside full-screen mode.
 #[must_use]

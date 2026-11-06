@@ -417,20 +417,28 @@ struct TurnView {
     root: Option<String>,
     /// The turn's model, for `/stats`.
     model: String,
+    /// The writer of the reply being streamed. One per reply, as it keeps
+    /// the column and the unfinished word: a new one per chunk put the left
+    /// margin before every chunk (gaps between words) and wrapped mid-word.
+    out: Option<render::MarginWriter<StopThinkingOnWrite<io::Stdout>>>,
 }
 
 impl TurnView {
-    fn write(text: &str) {
-        let mut out = render::MarginWriter::for_stdout(StopThinkingOnWrite(io::stdout()));
+    fn write(&mut self, text: &str) {
+        let out = self.out.get_or_insert_with(|| {
+            render::MarginWriter::for_stdout(StopThinkingOnWrite(io::stdout()))
+        });
         // A failed write to the terminal only loses display, not the turn.
         let _ = write!(out, "{text}").and_then(|()| out.flush());
     }
 
-    /// Writes out the root reply's buffered markdown.
+    /// Writes out the root reply's buffered markdown; what is printed next
+    /// (a tool block, a child's reply) starts a writer of its own.
     fn flush(&mut self) {
         if let Some(rendered) = self.markdown.flush(&TerminalRenderer::new()) {
-            Self::write(&rendered);
+            self.write(&rendered);
         }
+        self.out = None;
     }
 
     fn label(&mut self, thread: &str) -> String {
@@ -520,7 +528,7 @@ impl TurnView {
                     render::stop_thinking();
                 }
                 if let Some(rendered) = self.markdown.push(&TerminalRenderer::new(), text) {
-                    Self::write(&rendered);
+                    self.write(&rendered);
                 }
             }
             AgentEvent::CompletionFinished { usage } => {
@@ -572,7 +580,8 @@ impl TurnView {
                     self.flush();
                     let rendered = TerminalRenderer::new().markdown_to_ansi(text.trim());
                     println!("{TOOL_DIM_STYLE}[{label}]{STYLE_RESET}");
-                    Self::write(&rendered);
+                    self.write(&rendered);
+                    self.out = None;
                     println!();
                 }
             }

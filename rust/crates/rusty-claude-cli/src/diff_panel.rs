@@ -57,11 +57,15 @@ pub(crate) fn output_cols_with_panel() -> Option<usize> {
     if !enabled() {
         return Some(cols);
     }
-    match (screen::conversation_cols(), screen::side_panel_width()) {
-        // No panel yet, but one would fit: leave its room.
-        (Some(conversation), Some(panel)) if conversation == cols && cols > panel + 1 => {
-            Some(cols - panel - 1)
-        }
+    // `cols` is already narrowed by a panel that shows; only when none does
+    // yet, but one would fit, is its room left. (Comparing `cols` with the
+    // conversation's width, as before, was always true, so with the panel
+    // open its width came off twice: a diff drawn 40 columns wide.)
+    if screen::side_panel_shown() {
+        return Some(cols);
+    }
+    match screen::side_panel_width() {
+        Some(panel) if cols > panel + 1 => Some(cols - panel - 1),
         _ => Some(cols),
     }
 }
