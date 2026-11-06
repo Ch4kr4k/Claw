@@ -51,6 +51,10 @@ static INCOGNITO: AtomicBool = AtomicBool::new(false);
 static OUT: Mutex<()> = Mutex::new(());
 /// Stops the running turn; set while a turn runs.
 static CURRENT_ABORT: Mutex<Option<runtime::HookAbortSignal>> = Mutex::new(None);
+/// Set while a turn runs on the engine: tool results are then sent from the
+/// engine's own reports (which include denied calls and hook feedback), not
+/// from the CLI executor.
+static ENGINE_TURN: AtomicBool = AtomicBool::new(false);
 /// Answers to permission requests and questions, read by the turn thread.
 static REPLIES: Mutex<Option<mpsc::Receiver<Reply>>> = Mutex::new(None);
 
@@ -123,7 +127,14 @@ pub(crate) fn emit_tool_call(id: &str, name: &str, input: &str) {
 
 /// A finished tool call, as the user would read it (bash output as plain
 /// text, not the JSON envelope). Results arrive in the order of the calls.
+/// Called by the CLI executor; an engine turn reports results itself.
 pub(crate) fn emit_tool_result(name: &str, output: &str, is_error: bool) {
+    if !ENGINE_TURN.load(Ordering::SeqCst) {
+        send_tool_result(name, output, is_error);
+    }
+}
+
+fn send_tool_result(name: &str, output: &str, is_error: bool) {
     if !is_active() {
         return;
     }
@@ -224,6 +235,11 @@ pub(crate) fn ask_user(input: &Value) -> Result<String, String> {
 /// Asks the app to approve a tool call, honoring "always" answers given
 /// earlier in this session.
 struct DesktopPermissionPrompter;
+
+/// The app's prompter, for engine turns.
+pub(crate) fn prompter() -> Box<dyn runtime::PermissionPrompter + Send> {
+    Box::new(DesktopPermissionPrompter)
+}
 
 impl runtime::PermissionPrompter for DesktopPermissionPrompter {
     fn decide(
@@ -725,11 +741,37 @@ impl LiveCli {
         drain_replies();
         TEXT_SENT.store(false, Ordering::Relaxed);
         emit(&json!({"ev": "turn_start"}));
+        let status = if claw_engine::requested() {
+            self.desktop_engine_attempt(input)
+        } else {
+            self.desktop_classic_attempt(input)
+        };
+        if INCOGNITO.load(Ordering::Relaxed) {
+            // Nothing is saved.
+        } else if let Err(error) = self.persist_session() {
+            emit(
+                &json!({"ev": "error", "message": format!("could not save the session: {error}")}),
+            );
+        }
+        if check_images && status == "done" {
+            if let Some(report) = crate::image_check(self.runtime.session()) {
+                emit(
+                    &json!({"ev": "notice", "text": "Some images in the reply do not load; claw asks for working ones"}),
+                );
+                return self.run_desktop_turn_once(&report, false);
+            }
+        }
+        emit(&json!({"ev": "turn_end", "status": status}));
+        self.emit_context();
+        status
+    }
+
+    /// A turn on the classic loop (`CLAW_ENGINE=legacy`).
+    fn desktop_classic_attempt(&mut self, input: &str) -> &'static str {
         let (mut runtime, monitor) = match self.prepare_turn_runtime(false) {
             Ok(prepared) => prepared,
             Err(error) => {
                 emit(&json!({"ev": "error", "message": error.to_string()}));
-                emit(&json!({"ev": "turn_end", "status": "error"}));
                 return "error";
             }
         };
@@ -744,7 +786,7 @@ impl LiveCli {
         *CURRENT_ABORT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let status = match result {
+        match result {
             Ok(summary) => {
                 if !TEXT_SENT.load(Ordering::Relaxed) {
                     // Providers that do not stream text: send the reply whole.
@@ -785,25 +827,78 @@ impl LiveCli {
                 emit(&json!({"ev": "error", "message": error.to_string()}));
                 "error"
             }
-        };
-        if INCOGNITO.load(Ordering::Relaxed) {
-            // Nothing is saved.
-        } else if let Err(error) = self.persist_session() {
-            emit(
-                &json!({"ev": "error", "message": format!("could not save the session: {error}")}),
-            );
         }
-        if check_images && status == "done" {
-            if let Some(report) = crate::image_check(self.runtime.session()) {
-                emit(
-                    &json!({"ev": "notice", "text": "Some images in the reply do not load; claw asks for working ones"}),
-                );
-                return self.run_desktop_turn_once(&report, false);
+    }
+
+    /// A turn on the Infinity engine: the session's messages seed the root
+    /// thread and what the turn added is appended, as in the REPL.
+    fn desktop_engine_attempt(&mut self, input: &str) -> &'static str {
+        let config = match self.engine_config() {
+            Ok(config) => config,
+            Err(error) => {
+                emit(&json!({"ev": "error", "message": error.to_string()}));
+                return "error";
+            }
+        };
+        let abort = runtime::HookAbortSignal::new();
+        *CURRENT_ABORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort.clone());
+        ENGINE_TURN.store(true, Ordering::SeqCst);
+        let control = claw_engine::TurnControl {
+            abort: Some(abort),
+            queued_prompts: Some(Box::new(runtime::turn_keys::take_queued_for_running_turn)),
+            attachments: crate::repl_commands::attached_images(input),
+            // One root thread id per session keeps a local server's prompt
+            // cache from turn to turn.
+            thread_id: Some(self.session.id.clone()),
+        };
+        let prompt = Self::with_job_notices(input);
+        let history = self.runtime.session().messages.clone();
+        let mut view = EngineView::default();
+        let result = claw_engine::Engine::new(config).run_turn_blocking(
+            &history,
+            &prompt,
+            control,
+            |event| view.show(event),
+        );
+        ENGINE_TURN.store(false, Ordering::SeqCst);
+        *CURRENT_ABORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                emit(&json!({"ev": "error", "message": error.to_string()}));
+                return "error";
+            }
+        };
+        if !TEXT_SENT.load(Ordering::Relaxed) {
+            emit_text(&outcome.summary.final_text);
+        }
+        let added = outcome.messages.len();
+        for message in outcome.messages.iter().cloned() {
+            if let Err(error) = self.runtime.session_mut().push_message(message) {
+                emit(&json!({"ev": "error", "message": error.to_string()}));
             }
         }
-        emit(&json!({"ev": "turn_end", "status": status}));
-        self.emit_context();
-        status
+        if outcome.interrupted {
+            // Keep what the turn did, as the REPL does after Esc.
+            let _ = self
+                .runtime
+                .session_mut()
+                .push_user_text("[Request interrupted by user]");
+            return "stopped";
+        }
+        let messages = &self.runtime.session().messages;
+        crate::learning::after_turn(messages, &messages[messages.len().saturating_sub(added)..]);
+        let usage = crate::live_engine::turn_summary(&outcome).usage;
+        emit(&json!({
+            "ev": "usage",
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+        }));
+        "done"
     }
 
     /// How full the context window is, for the app's status bar.
@@ -814,5 +909,85 @@ impl LiveCli {
             "tokens": tokens,
             "window": known_context_window(&self.model),
         }));
+    }
+}
+
+/// Sends an engine turn's events to the app: the root reply as `text` and
+/// `thinking`, every thread's tool calls and results, and child threads'
+/// replies as `notice`s labelled `[#n]`.
+#[derive(Default)]
+struct EngineView {
+    root: Option<String>,
+    /// Child thread labels (`#1`, `#2`, …) by thread id.
+    labels: std::collections::BTreeMap<String, String>,
+    /// Child replies, sent whole when their completion finishes.
+    child_text: std::collections::BTreeMap<String, String>,
+}
+
+impl EngineView {
+    fn show(&mut self, event: &claw_engine::EngineEvent) {
+        use claw_engine::{AgentEvent, EngineEvent, ToolActivity};
+        match event {
+            EngineEvent::Lifecycle { thread, .. } => {
+                // The first thread to go live is the root.
+                self.root.get_or_insert_with(|| thread.clone());
+            }
+            EngineEvent::Agent {
+                thread,
+                root,
+                event,
+            } => match event {
+                AgentEvent::TextChunk { text } if *root => emit_text(text),
+                AgentEvent::ThinkingChunk { text } if *root => emit_thinking(text),
+                AgentEvent::TextChunk { text } => self
+                    .child_text
+                    .entry(thread.clone())
+                    .or_default()
+                    .push_str(text),
+                AgentEvent::CompletionFinished { .. } if !*root => {
+                    let text = self.child_text.remove(thread).unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        let label = self.label(thread);
+                        emit(
+                            &json!({"ev": "notice", "text": format!("[{label}] {}", text.trim())}),
+                        );
+                    }
+                }
+                AgentEvent::ToolCall { name, args, .. } => self.tool_call(name, args),
+                AgentEvent::Info { text } => emit(&json!({"ev": "info", "text": text})),
+                _ => {}
+            },
+            EngineEvent::Tool(ToolActivity::Started { .. }) => {}
+            EngineEvent::Tool(ToolActivity::Finished {
+                name,
+                output,
+                is_error,
+                ..
+            }) => send_tool_result(name, output, *is_error),
+        }
+    }
+
+    fn label(&mut self, thread: &str) -> String {
+        let next = self.labels.len() + 1;
+        self.labels
+            .entry(thread.to_string())
+            .or_insert_with(|| format!("#{next}"))
+            .clone()
+    }
+
+    /// A call as the app lists it: a batch as its calls; the engine's thread
+    /// tools, which report no result of their own, as done at once.
+    fn tool_call(&self, name: &str, args: &Value) {
+        if name == claw_engine::batch::BATCH_TOOL {
+            for call in claw_engine::batch::unpack_calls(args) {
+                emit_tool_call(&call.id, &call.name, &call.input.to_string());
+            }
+            return;
+        }
+        let id = format!("call-{}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+        emit_tool_call(&id, name, &args.to_string());
+        if crate::live_engine::ENGINE_TOOLS.contains(&name) {
+            send_tool_result(name, "", false);
+        }
     }
 }

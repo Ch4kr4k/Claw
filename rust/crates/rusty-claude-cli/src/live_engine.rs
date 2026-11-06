@@ -17,7 +17,7 @@ use crate::*;
 
 /// The engine's thread tools: they have no claw tool activity, so their
 /// calls are shown when the model makes them.
-const ENGINE_TOOLS: &[&str] = &[
+pub(crate) const ENGINE_TOOLS: &[&str] = &[
     "spawn_thread",
     "report_to_parent",
     "close_thread",
@@ -161,7 +161,7 @@ impl LiveCli {
         Ok(text)
     }
 
-    fn engine_config(&self) -> Result<EngineConfig, Box<dyn std::error::Error>> {
+    pub(crate) fn engine_config(&self) -> Result<EngineConfig, Box<dyn std::error::Error>> {
         let cwd = env::current_dir()?;
         let runtime_config = ConfigLoader::default_for(&cwd).load()?;
         let plugin_registry = &self.runtime.plugin_registry;
@@ -210,11 +210,16 @@ impl LiveCli {
         let resolver = Arc::clone(&cli_executor);
         config.resolve_tool_name =
             Some(Arc::new(move |name: &str| resolver.resolve_tool_name(name)));
-        let prompter: Box<dyn runtime::PermissionPrompter + Send> =
-            Box::new(CliPermissionPrompter::new(self.permission_mode));
+        // The desktop app answers approvals itself (and remembers "always").
+        let prompter: Box<dyn runtime::PermissionPrompter + Send> = if desktop_agent::is_active() {
+            desktop_agent::prompter()
+        } else {
+            Box::new(CliPermissionPrompter::new(self.permission_mode))
+        };
         config.prompter = Some(Arc::new(Mutex::new(prompter)));
         config.executor = Some(Arc::new(move |name: &str, input: &serde_json::Value| {
-            if name == "AskUserQuestion" {
+            // In the desktop app the CLI executor asks through the app.
+            if name == "AskUserQuestion" && !desktop_agent::is_active() {
                 runtime::turn_keys::begin_tool("Waiting for your answer");
                 let answer = ask::ask_user(input);
                 runtime::turn_keys::end_tool();
@@ -234,7 +239,7 @@ impl LiveCli {
 
 /// An engine turn as the classic loop reports one: the replies, the tool
 /// results, completions as iterations, and the usage of the turn.
-fn turn_summary(outcome: &claw_engine::TurnOutcome) -> runtime::TurnSummary {
+pub(crate) fn turn_summary(outcome: &claw_engine::TurnOutcome) -> runtime::TurnSummary {
     let of_role = |role: MessageRole| {
         outcome
             .messages

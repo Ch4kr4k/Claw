@@ -1,6 +1,6 @@
 # Infinity engine: multi-threaded asynchronous agents for claw
 
-Status: phases 1–3 landed; phase 4 step 1 (engine is the default, `CLAW_ENGINE=legacy` to opt out) landed. Started 2026-11-05.
+Status: phases 1–3 and phase 4 steps 1–2 landed (the engine is the default everywhere, `CLAW_ENGINE=legacy` to opt out); step 3 (deleting the classic loop) is left. Started 2026-11-05.
 
 This document records the decision to move claw's agent loop onto the
 [Infinity runtime](https://github.com/hydro-project/infinity)
@@ -267,8 +267,21 @@ each. A single call goes through untouched.
      - `ClawPrompt` yields before each model call, so a thread looping on
        inline tools against an instant model can't starve the turn's
        control task (stop, queued prompts).
-   - Step 2, left: the desktop app's turn (`desktop_agent.rs`) still runs
-     the classic loop; it needs its own event renderer for the engine.
+   - Step 2, part 3 (done): *the desktop app's turn on the engine.*
+     `desktop_agent::desktop_engine_attempt` runs the turn with the same
+     `engine_config` as the REPL, plus the app's `DesktopPermissionPrompter`
+     (and `AskUserQuestion` through the app). `EngineView` turns engine
+     events into the app's JSON lines: root `text` and `thinking`, a
+     `tool_call` per call (a batch is unpacked), `tool_result` from
+     `ToolActivity::Finished`, and child replies as `[#n]` notices. While an
+     engine turn runs, the CLI executor's own `tool_result` events are off,
+     so each result is sent once. Since results come from the engine's
+     report, a declined call now gets its result row too (the classic loop
+     never sent one). The app's Stop sets the turn's abort signal, and
+     messages sent meanwhile reach the root through `queued_prompts`.
+     Test: `tests/desktop_agent_engine.rs` drives `claw desktop-agent`
+     against the mock service on both loops (text, a two-call batch, bash
+     approved and denied, the saved session).
    - Step 3: after a release with `CLAW_ENGINE=legacy` available, delete
      `ConversationRuntime`'s loop. `runtime` keeps sessions, config,
      prompt assembly and permissions.
@@ -279,5 +292,5 @@ each. A single call goes through untouched.
   started. A stopped turn returns at once and leaves them to finish.
 - Each turn builds a fresh engine, so child threads don't outlive the turn
   that spawned them.
-- `Agent` sub-agents with a `providerFallbacks` chain, and the desktop
-  app's turns, still run the classic loop.
+- `Agent` sub-agents with a `providerFallbacks` chain still run the classic
+  loop.
