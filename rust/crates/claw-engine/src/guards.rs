@@ -231,6 +231,9 @@ impl TurnGuards {
                             || CUT_OFF_CONTINUE_PROMPT.to_string(),
                             turn_guards::thinking_cut_off_prompt,
                         ));
+                } else {
+                    // Otherwise the turn ends looking like an empty answer.
+                    eprintln!("\n{}", give_up_notice(report));
                 }
                 return;
             }
@@ -259,6 +262,19 @@ impl TurnGuards {
             .values()
             .find_map(|guards| guards.repeat.stuck().map(ToOwned::to_owned))
     }
+}
+
+/// Said when a turn ends because its replies kept being cut off.
+fn give_up_notice(report: &ReplyReport) -> String {
+    let what = if report.thinking_tail.is_some() {
+        "kept thinking without answering"
+    } else {
+        "kept running into the output-token limit"
+    };
+    format!(
+        "\x1b[2m(the model {what} after {MAX_CUT_OFF_CONTINUATIONS} retries, so the turn \
+         was stopped)\x1b[0m"
+    )
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

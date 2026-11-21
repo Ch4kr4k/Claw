@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::{stream, StreamExt};
 use infinity_provider_protocol::{
-    AssistantContent, CompletionError, CompletionRequest, Message, ModelProvider, ModelStream,
-    StreamChunk, Text, ToolCall, ToolResultContent, UserContent,
+    AssistantContent, CompletionError, CompletionRequest, FinalResponse, Message, ModelProvider,
+    ModelStream, StreamChunk, Text, ToolCall, ToolResultContent, UserContent,
 };
 use runtime::turn_guards::{self, REPETITION_NOTE, THINKING_TAIL_CHARS};
 
@@ -82,6 +82,30 @@ struct Seen {
     calls: Vec<ToolCall>,
     /// Any text, thinking or call came through.
     content: bool,
+    /// Text plus thinking length at the last mid-stream loop check.
+    checked_at: usize,
+    /// The reply was stopped mid-stream: its text or thinking looped.
+    stopped_looping: bool,
+}
+
+/// How often (in characters streamed) a reply is checked for a loop while
+/// it streams. A loop is stopped once it reaches runaway size
+/// ([`turn_guards::RUNAWAY_MIN_CHARS`]) instead of running to the output
+/// limit or the thinking budget (8k tokens: minutes on a local model).
+const LOOP_CHECK_EVERY_CHARS: usize = 2_000;
+
+impl Seen {
+    /// Whether the reply streamed so far is a runaway loop, in its text or
+    /// in its thinking; checked every [`LOOP_CHECK_EVERY_CHARS`].
+    fn is_looping(&mut self) -> bool {
+        let streamed = self.text.len() + self.thinking.len();
+        if streamed < self.checked_at + LOOP_CHECK_EVERY_CHARS {
+            return false;
+        }
+        self.checked_at = streamed;
+        turn_guards::is_runaway_repetition(&self.text)
+            || turn_guards::is_runaway_repetition(&self.thinking)
+    }
 }
 
 /// `inner` checked and packed; see the module docs.
@@ -175,6 +199,17 @@ pub fn reply_stream(inner: ModelStream, context: ReplyContext) -> ModelStream {
                         _ => {}
                     }
                     state.pending.push_back(Ok(chunk));
+                    if state.seen.is_looping() {
+                        // Dropping the stream closes the request, so the
+                        // server stops generating too.
+                        state.inner = Box::pin(stream::empty());
+                        state.seen.stopped_looping = true;
+                        finish(&mut state.seen, &state.context, &mut state.pending);
+                        state
+                            .pending
+                            .push_back(Ok(StreamChunk::Final(FinalResponse { usage: None })));
+                        state.done = true;
+                    }
                 }
                 None => {
                     state.done = true;
@@ -191,7 +226,13 @@ fn finish(
     context: &ReplyContext,
     pending: &mut VecDeque<Result<StreamChunk, CompletionError>>,
 ) {
-    let cut_off = context.flags.cut_off.load(Ordering::Relaxed);
+    // A reply stopped mid-loop ended early, the way a cut-off one does.
+    let cut_off = context.flags.cut_off.load(Ordering::Relaxed) || seen.stopped_looping;
+    if seen.stopped_looping && seen.text.len() < seen.thinking.len() {
+        eprintln!(
+            "\n\x1b[2m(the model's thinking got stuck repeating itself, so it was stopped)\x1b[0m"
+        );
+    }
     let mut calls = std::mem::take(&mut seen.calls);
     // A reply cut off at the token limit ends inside its last tool call.
     let dropped_cut_off_call = cut_off

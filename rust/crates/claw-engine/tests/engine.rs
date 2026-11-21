@@ -805,6 +805,28 @@ fn a_reply_that_only_thinks_is_asked_to_act() {
 }
 
 #[test]
+fn thinking_stuck_in_a_loop_is_stopped_while_it_streams() {
+    let run = run(PermissionMode::ReadOnly, "decide", |request| {
+        let input = last_input(request);
+        if runtime::turn_guards::follows_thinking_cut_off(&input) {
+            assert!(input.contains("stuck repeating"), "loop named: {input}");
+            return text("Decided.");
+        }
+        // Never reached: the loop is stopped before the reply ends.
+        let mut chunks = (0..1_000)
+            .map(|_| StreamChunk::ReasoningDelta {
+                id: None,
+                text: "Wait, let me reconsider whether it is 41 or 42. ".to_string(),
+            })
+            .collect::<Vec<_>>();
+        chunks.push(StreamChunk::Text("Looped answer.".to_string()));
+        chunks
+    });
+    assert_eq!(run.requests.len(), 2);
+    assert_eq!(run.summary.final_text, "Decided.");
+}
+
+#[test]
 fn a_cut_off_tool_call_is_not_run() {
     let run = run(PermissionMode::DangerFullAccess, "write it", |request| {
         if last_input(request).starts_with(runtime::turn_guards::CUT_OFF_TOOL_CALL_RESULT) {

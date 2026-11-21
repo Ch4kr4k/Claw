@@ -850,9 +850,12 @@ local models:
 - A call that keeps failing gets a note to change approach, then is no
   longer run; a broad filesystem search (`find /`) gets one warning.
 - A reply cut off at the output limit, or one that stops with nothing but
-  thinking, is continued (3 times in a row at most); a tool call cut off
+  thinking, is continued (3 times in a row at most, then the turn ends with
+  "the model kept thinking without answering…"); a tool call cut off
   mid-input is not run, and the model is asked to send less per call.
 - A reply stuck repeating itself is stopped and its text not sent back.
+  Thinking or text that loops is stopped while it streams, once the loop
+  reaches about 16k characters, rather than running to the output limit.
 - Tool calls a local server's parser missed, left in the reply text, are
   run (`CLAW_TEXT_TOOL_CALLS=0` turns that off).
 - A turn that edited code and is about to end without running anything is
@@ -1123,7 +1126,10 @@ of smaller local models:
   its reply are moved to the thinking block instead of being shown as the
   answer.
 - **Loops stopped:** a reply stuck repeating one passage is not continued
-  ("the reply got stuck repeating itself"), and its text is not sent back. A
+  ("the reply got stuck repeating itself"), and its text is not sent back.
+  Thinking that loops is cut off as it streams ("the model's thinking got
+  stuck repeating itself"), and the model is asked, with thinking off, to
+  answer or act. A
   call that fails twice the same way gets a note to change approach and is
   not run after four failures; a tool that fails eight times in a row is not
   run again that turn. A call that keeps returning the same result is not
