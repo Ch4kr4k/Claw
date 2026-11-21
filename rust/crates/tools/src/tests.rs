@@ -969,6 +969,49 @@ fn allowed_tools_normalize_to_canonical_snake_case_and_aliases_432() {
 }
 
 #[test]
+fn allowed_tools_accept_mcp_wildcards() {
+    let tool = |name: &str| super::RuntimeToolDefinition {
+        name: name.to_string(),
+        description: None,
+        input_schema: json!({ "type": "object" }),
+        required_permission: runtime::PermissionMode::ReadOnly,
+    };
+    let registry = GlobalToolRegistry::builtin()
+        .with_runtime_tools(vec![
+            tool("mcp__scrolls__list_spaces"),
+            tool("mcp__scrolls__get_page"),
+            tool("mcp__other__echo"),
+        ])
+        .expect("runtime tools should register");
+
+    let all = registry
+        .normalize_allowed_tools(&["read_file,mcp__*".to_string()])
+        .expect("wildcard should parse")
+        .expect("allow-list should be populated");
+    assert!(all.contains("read_file"));
+    assert!(all.contains("mcp__scrolls__list_spaces"));
+    assert!(all.contains("mcp__other__echo"));
+    assert!(!all.contains("bash"));
+
+    let one_server = registry
+        .normalize_allowed_tools(&["mcp__scrolls__*".to_string()])
+        .expect("server wildcard should parse")
+        .expect("allow-list should be populated");
+    assert_eq!(one_server.len(), 2);
+    assert!(!one_server.contains("mcp__other__echo"));
+
+    // No MCP server connected: the wildcard matches nothing, without error.
+    let none = GlobalToolRegistry::builtin()
+        .normalize_allowed_tools(&["mcp__*".to_string()])
+        .expect("an unmatched wildcard is not an error");
+    assert_eq!(none.map(|set| set.len()), Some(0));
+    // Other wildcards are still rejected.
+    assert!(GlobalToolRegistry::builtin()
+        .normalize_allowed_tools(&["read_*".to_string()])
+        .is_err());
+}
+
+#[test]
 fn runtime_tools_extend_registry_definitions_permissions_and_search() {
     let registry = GlobalToolRegistry::builtin()
         .with_runtime_tools(vec![super::RuntimeToolDefinition {

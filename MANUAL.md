@@ -488,7 +488,7 @@ remain read-only; the new editing operations require a live session.
 | `/memory [list\|on\|off]` | Inspect memories or persist the project's automatic-memory preference. `CLAW_AUTO_MEMORY=0` still takes precedence |
 | `/memory edit [project\|user\|auto]` | Edit the project's `CLAUDE.md`, the user's Claw `CLAUDE.md`, or the automatic-memory index, then reload instructions |
 | `/sandbox [status\|on\|off\|toggle]` | Bare `/sandbox` (or `status`) only reports; `on`, `off` or `toggle` change the project's sandbox request. The status report distinguishes requested protection from protection supported and active on this machine |
-| `/mcp enable\|disable\|reconnect [server\|all]` | Update persistent server enablement or reconnect. Refresh rebuilds all runtime connections and tool discovery; existing transport limitations remain, including unsupported remote OAuth transports |
+| `/mcp enable\|disable\|reconnect [server\|all]` | Update persistent server enablement or reconnect. Refresh rebuilds all runtime connections and tool discovery; existing transport limitations remain: Streamable HTTP servers connect, legacy SSE, WebSocket and OAuth-only remote servers do not |
 | `/release-notes` | Display the Claw changelog (`rust/crates/rusty-claude-cli/CHANGELOG.md`) bundled into the binary; does not spend model tokens |
 | `/terminal-setup` | Install Shift+Enter in VS Code/Cursor terminal keybindings, preserving unrelated entries and creating a backup. Existing files must be strict JSON; JSONC comments or conflicting terminal bindings produce an error without changing the file. Other terminal types still need manual setup |
 | `/ide [status\|open [code\|cursor\|zed]]` | Show terminal/workspace information or launch an installed editor on this workspace; no IDE RPC connection is established |
@@ -1426,7 +1426,7 @@ file works as a template.
 | `trustedRoots` | `[path]` ([]) | Folders trusted without asking |
 | `hooks` | `{PreToolUse, PostToolUse, PostToolUseFailure: [command]}` | Commands run around tool calls |
 | `env` | `{NAME: value}` | Environment for claw and its commands |
-| `mcpServers` | `{name: {command, args, env} \| {url}}` | MCP servers |
+| `mcpServers` | `{name: {command, args, env} \| {type: "http", url, headers, headersHelper}}` | MCP servers: local (stdio) or Streamable HTTP; `${VAR}` expands in header values (see `USAGE.md`) |
 | `mcpServerStates` | `{name: bool}` | MCP servers turned off with `/mcp` |
 | `plugins` | `{enabled, externalDirectories, installRoot, registryPath, bundledRoot, maxOutputTokens}` | Plugins |
 | `lspServers` | `{extension: {command, args}}` | Language servers for the Diagnostics tool |

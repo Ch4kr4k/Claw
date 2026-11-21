@@ -10,7 +10,7 @@ Core crate of `claw`: session persistence, permissions, prompt assembly, MCP plu
 |---|---|---|
 | session/conversation | session.rs, session_control.rs, conversation.rs, compact.rs, trident.rs, summary_compression.rs, usage.rs | `Session` (L124), `SessionStore`, `ConversationRuntime` (L125: a session with its client and tools, `auto_compact`, `record_usage`), `ApiClient` (compaction summaries)/`ToolExecutor` traits; `turn_guards.rs` (repeat/failure/verify guards, cut-off prompts) and `text_tool_calls.rs`, used by `claw-engine` |
 | config | config.rs, config_validate.rs, bootstrap.rs | `ConfigLoader` (L412), `default_config_home`, `read_user_setting`/save helpers, type-export heaviest file; MCP server config enums live here |
-| MCP (6-file split) | mcp.rs, mcp_client.rs, mcp_stdio.rs, mcp_server.rs, mcp_tool_bridge.rs, mcp_lifecycle_hardened.rs | `McpServerManager` (L488 in mcp_stdio.rs), JSON-RPC spawn |
+| MCP (7-file split) | mcp.rs, mcp_client.rs, mcp_stdio.rs, mcp_http.rs, mcp_server.rs, mcp_tool_bridge.rs, mcp_lifecycle_hardened.rs | `McpServerManager` (mcp_stdio.rs; each server an `McpConnection`: stdio process or `McpHttpClient`), JSON-RPC spawn; Streamable HTTP client in mcp_http.rs |
 | hooks/plugins | hooks.rs, plugin_lifecycle.rs | `HookRunner` (L155), abort signal, healthcheck, degraded mode |
 | permissions/safety (`bash_command_risk`, `bash_approval_key`, `required_mode_for_input`, `bashApproval`) | permissions.rs, permission_enforcer.rs, policy_engine.rs, approval_tokens.rs, sandbox.rs, bash_validation.rs, trust_resolver.rs | `PermissionEnforcer` (L27), `GreenLevel`, lane decisions |
 | tools/execution | bash.rs, file_ops.rs, lsp_client.rs | `execute_bash`, `*_in_workspace` file op variants |
@@ -27,7 +27,7 @@ Largest files by line count: config.rs (3894), mcp_stdio.rs (2969), lane_events.
 
 - One file per module, flat layout. No subdirectories.
 - Most modules are private `mod x` with selective `pub use`. 21 modules are `pub mod`, so consumers use both the re-export and the qualified path.
-- Deps kept minimal: serde, tokio, glob, regex, sha2, walkdir + internal plugins/telemetry. No reqwest, no async-trait. Remote/SSE done by hand.
+- Deps kept minimal: serde, tokio, glob, regex, sha2, walkdir + internal plugins/telemetry. No async-trait. reqwest only in mcp_http.rs (MCP Streamable HTTP needs HTTPS); other remote/SSE work is done by hand.
 - Inline `#[cfg(test)]` tests per file. session.rs has two test modules.
 - `pub(crate) test_env_lock()` mutex in lib.rs serializes env-mutating tests. Use it when touching env vars.
 - trust_resolver.rs is `#[cfg(test)]`-gated yet pub-used: test-only API surface.
@@ -45,7 +45,7 @@ Largest files by line count: config.rs (3894), mcp_stdio.rs (2969), lane_events.
 ## ANTI-PATTERNS
 
 - Don't extend whole-file `#![allow(...)]` blocks. They exist as legacy tolerance in worker_boot.rs, mcp_tool_bridge.rs, lsp_client.rs, stale_branch.rs, stale_base.rs, recovery_recipes.rs, mcp_lifecycle_hardened.rs, session_control.rs. Adding new ones is not acceptable.
-- Don't add reqwest or async-trait as deps. Remote calls go through the manual SSE/proxy layer in remote.rs and sse.rs.
+- Don't add async-trait, and don't use reqwest outside mcp_http.rs. Other remote calls go through the manual SSE/proxy layer in remote.rs and sse.rs.
 - Don't create subdirectories under src/. The flat module layout is intentional.
 - Don't bypass `*_in_workspace` variants for file ops when running inside a workspace context. The unchecked versions exist for bootstrap and out-of-workspace scenarios only.
 - Don't add new `pub mod` exports without reason. Prefer private mod + selective `pub use` from lib.rs.

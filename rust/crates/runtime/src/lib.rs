@@ -28,6 +28,7 @@ pub mod line_diff;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
+mod mcp_http;
 pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
@@ -148,6 +149,7 @@ pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
+pub use mcp_http::McpHttpClient;
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,

@@ -683,6 +683,14 @@ edits update live state; rebuilding the runtime reloads permission rules, memory
 plugins, and MCP discovery. MCP enablement uses the boolean map `mcpServerStates`:
 project-local `true` can override inherited `false`, unlike additive array settings.
 Disabled servers are filtered before transport construction and tool discovery.
+`McpServerManager` (`runtime/src/mcp_stdio.rs`) holds each enabled server as an
+`McpConnection`: a spawned stdio process, or an `McpHttpClient`
+(`runtime/src/mcp_http.rs`, Streamable HTTP: one POST per JSON-RPC message,
+JSON or SSE answers, `Mcp-Session-Id` echoed, headers expanded at connect time
+and marked sensitive). Discovery, the tool index and `tools/call` are shared;
+legacy SSE, WebSocket and SDK servers are listed as unsupported. MCP tools are
+deferred behind `ToolSearch`, which the engine always registers, even when
+`--allowedTools` does not name it.
 
 Artifacts stay under `.claw/artifacts`; attachment resolves canonical paths to
 reject traversal and symlink escape, enforces a 1 MiB UTF-8 limit, and persists the

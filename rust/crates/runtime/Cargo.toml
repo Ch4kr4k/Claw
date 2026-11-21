@@ -11,6 +11,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 glob = "0.3"
 plugins = { path = "../plugins" }
 regex = "1"
+# Only for the MCP Streamable HTTP transport (mcp_http.rs).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 telemetry = { path = "../telemetry" }
@@ -24,6 +26,7 @@ rustix = { version = "1", features = ["stdio", "process"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["net"] }
 
 [lints]
 workspace = true

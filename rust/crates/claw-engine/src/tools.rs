@@ -328,8 +328,15 @@ impl ClawTool {
         host: &Arc<ToolHost>,
         allowed: Option<&std::collections::BTreeSet<String>>,
     ) -> Vec<Box<dyn Tool<ChannelSender>>> {
+        // ToolSearch only describes tools, and deferring offers it even when
+        // the allowed list does not name it (as claw's executor allows it).
+        let allowed = allowed.map(|allowed| {
+            let mut allowed = allowed.clone();
+            allowed.insert("tool_search".to_string());
+            allowed
+        });
         host.registry
-            .definitions(allowed)
+            .definitions(allowed.as_ref())
             .into_iter()
             // MCP tools need the session's MCP state, which only a front
             // end's executor holds.
@@ -481,5 +488,32 @@ impl Tool<ChannelSender> for ClawTool {
             let _ = sender.send_to_input_queue(message, id.as_str()).await;
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use runtime::{PermissionMode, PermissionPolicy};
+    use tools::GlobalToolRegistry;
+
+    use super::{ClawTool, ToolHost};
+
+    #[test]
+    fn an_allowed_list_keeps_tool_search_so_deferred_tools_can_load() {
+        let host = Arc::new(ToolHost::new(
+            GlobalToolRegistry::builtin(),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+        ));
+        let allowed = BTreeSet::from(["read_file".to_string()]);
+        let names = ClawTool::all(&host, Some(&allowed))
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"read_file".to_string()), "{names:?}");
+        assert!(names.contains(&"ToolSearch".to_string()), "{names:?}");
+        assert!(!names.contains(&"bash".to_string()), "{names:?}");
     }
 }

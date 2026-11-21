@@ -201,11 +201,28 @@ impl GlobalToolRegistry {
         }
 
         let mut allowed = BTreeSet::new();
+        let mut saw_wildcard = false;
         for value in values {
             for token in value
                 .split(|ch: char| ch == ',' || ch.is_whitespace())
                 .filter(|token| !token.is_empty())
             {
+                // `mcp__*` allows every MCP tool, `mcp__<server>__*` one
+                // server's. A server that is down matches nothing; no error.
+                if let Some(prefix) = token.strip_suffix("__*") {
+                    // Canonicalizing trims the trailing `__`; put it back.
+                    let prefix = format!("{}__", canonical_allowed_tool_name(prefix));
+                    if prefix.starts_with("mcp__") {
+                        saw_wildcard = true;
+                        allowed.extend(
+                            canonical_names
+                                .iter()
+                                .filter(|name| name.starts_with(&prefix))
+                                .cloned(),
+                        );
+                        continue;
+                    }
+                }
                 let canonical = name_map.get(&allowed_tool_lookup_key(token)).ok_or_else(|| {
                     format!(
                         "invalid_tool_name: unsupported tool in --allowedTools: {token}\nAvailable: {}\nAliases: {}\nHint: Use canonical snake_case tool names from Available or aliases from Aliases.",
@@ -217,7 +234,7 @@ impl GlobalToolRegistry {
             }
         }
 
-        if allowed.is_empty() {
+        if allowed.is_empty() && !saw_wildcard {
             return Err(format!(
                 "--allowedTools was provided with no usable tool names (got `{}`). Omit the flag to allow all tools.",
                 values.join(" ")

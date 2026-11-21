@@ -589,6 +589,48 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 
 The list is also the precedence chain: project-local settings override project settings, project settings override the legacy project `.claw.json`, and project files override user files. `claw --output-format json config` includes each discovered file's `precedence_rank`, `wins_for_keys`, and `shadowed_keys` so automation can see which file controls each effective key without reimplementing the merge order.
 
+## MCP servers over HTTP
+
+Besides local (stdio) servers, `mcpServers` takes remote servers that speak
+MCP's Streamable HTTP transport (`"type": "http"`, or any entry with a `url`
+and no `type`):
+
+```json
+{
+  "mcpServers": {
+    "scrolls": {
+      "type": "http",
+      "url": "https://wiki.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${SCROLLS_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+- Every JSON-RPC message is POSTed to `url`; JSON and `text/event-stream`
+  answers both work. No GET listening stream is opened.
+- `${VAR}` and a leading `~` are expanded in `url` and in header values, so
+  tokens can stay in the environment. Header values never appear in errors,
+  `claw mcp show` (it lists header keys only) or logs.
+- `headersHelper` is a shell command whose stdout is a JSON object of string
+  headers, merged over `headers`. It runs on every connect with
+  `CLAUDE_CODE_MCP_SERVER_NAME` and `CLAUDE_CODE_MCP_SERVER_URL` set, and
+  has 10 seconds.
+- A session id the server assigns (`Mcp-Session-Id`) is sent back on every
+  request, with the negotiated `MCP-Protocol-Version`; claw ends the session
+  with a DELETE on exit. Stateless servers need neither.
+- HTTP 401/403 is reported as "authentication failed for MCP server" with
+  the server's name, and is not retried. Network errors and timeouts mark the server
+  failed, as for a stdio server; the rest of the session keeps working.
+- Tool calls time out after 60 seconds.
+- `"type": "sse"` (the older HTTP+SSE transport) and `"type": "ws"` are not
+  supported yet and are reported as such.
+
+MCP tools are deferred: the model sees them by name in `ToolSearch` and
+loads them before calling. `--allowedTools` takes `mcp__*` (every MCP tool)
+or `mcp__<server>__*` (one server's); the launcher's core tool list includes
+`mcp__*`.
+
 ## MCP server validation
 
 `claw mcp --output-format json` loads valid `mcpServers` entries even when sibling entries are malformed. The JSON list envelope distinguishes the total configured entries from the valid and invalid subsets:

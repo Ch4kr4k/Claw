@@ -5674,6 +5674,7 @@ fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
         r#"{
               "mcpServers": {
                 "remote": {
+                  "type": "sse",
                   "url": "https://example.test/mcp"
                 }
               }
@@ -5708,7 +5709,7 @@ fn build_runtime_plugin_state_surfaces_unsupported_mcp_servers_structurally() {
     );
     assert_eq!(
         search_json["mcp_degraded"]["failed_servers"][0]["error"]["context"]["transport"],
-        "http"
+        "sse"
     );
 
     let _ = fs::remove_dir_all(config_home);

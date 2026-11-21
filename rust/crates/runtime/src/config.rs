@@ -2475,7 +2475,7 @@ fn parse_optional_oauth_config(
 
 /// #92: expand `${VAR}` environment variable references and `~/` home directory
 /// prefix in a config string value. Returns the expanded string.
-fn expand_config_value(value: &str) -> String {
+pub(crate) fn expand_config_value(value: &str) -> String {
     // Expand ${VAR} and $VAR references from the environment
     let mut result = String::with_capacity(value.len());
     let mut chars = value.chars().peekable();
